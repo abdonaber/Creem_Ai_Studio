@@ -8,14 +8,14 @@ export const userRouter = Router();
 userRouter.use(authenticate);
 
 // Get Profile
-userRouter.get('/profile', (req: Request, res: Response, next: NextFunction) => {
+userRouter.get('/profile', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const user = db.findUserById(req.user!.userId);
+    const user = await db.findUserById(req.user!.userId);
     if (!user) throw new AppError('User not found', 404, 'NOT_FOUND');
 
     const { passwordHash: _, ...safeUser } = user;
-    const wallet = db.getOrCreateWallet(user.id);
-    const driver = user.role === 'DRIVER' ? db.findDriverByUserId(user.id) : null;
+    const wallet = await db.getOrCreateWallet(user.id);
+    const driver = user.role === 'DRIVER' ? await db.findDriverByUserId(user.id) : null;
 
     res.json({
       success: true,
@@ -31,10 +31,10 @@ userRouter.get('/profile', (req: Request, res: Response, next: NextFunction) => 
 });
 
 // Update Profile
-userRouter.put('/profile', (req: Request, res: Response, next: NextFunction) => {
+userRouter.put('/profile', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { name, phone, avatarUrl } = req.body;
-    const updated = db.updateUser(req.user!.userId, {
+    const updated = await db.updateUser(req.user!.userId, {
       ...(name ? { name: String(name).trim() } : {}),
       ...(phone ? { phone: String(phone).trim() } : {}),
       ...(avatarUrl ? { avatarUrl: String(avatarUrl) } : {}),
@@ -50,13 +50,24 @@ userRouter.put('/profile', (req: Request, res: Response, next: NextFunction) => 
 });
 
 // Get Notifications
-userRouter.get('/notifications', (req: Request, res: Response) => {
-  const notifications = db.getUserNotifications(req.user!.userId);
-  res.json({ success: true, data: notifications });
+userRouter.get('/notifications', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const notifications = await db.getNotificationsForUser(req.user!.userId);
+    res.json({ success: true, data: notifications });
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Mark Notification as read
-userRouter.put('/notifications/:id/read', (req: Request, res: Response) => {
-  const success = db.markNotificationAsRead(req.params.id, req.user!.userId);
-  res.json({ success });
+userRouter.put('/notifications/:id/read', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const notif = await db.findNotificationById(req.params.id);
+    if (notif && notif.userId === req.user!.userId) {
+      await db.markNotificationRead(req.params.id);
+    }
+    res.json({ success: true });
+  } catch (err) {
+    next(err);
+  }
 });

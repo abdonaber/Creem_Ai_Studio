@@ -14,7 +14,7 @@ interface AuthenticatedSocket extends Socket {
 export function initSocketIO(server: any): SocketIOServer {
   io = new SocketIOServer(server, {
     cors: {
-      origin: config.corsOrigin,
+      origin: config.corsOrigin === '*' ? true : config.corsOrigin,
       credentials: true,
     },
     pingInterval: 10000,
@@ -22,7 +22,7 @@ export function initSocketIO(server: any): SocketIOServer {
   });
 
   // Handshake authentication middleware
-  io.use((socket: AuthenticatedSocket, next) => {
+  io.use(async (socket: AuthenticatedSocket, next) => {
     try {
       const token =
         socket.handshake.auth?.token ||
@@ -33,7 +33,7 @@ export function initSocketIO(server: any): SocketIOServer {
       }
 
       const decoded = jwt.verify(token, config.jwtSecret) as AuthPayload;
-      const user = db.findUserById(decoded.userId);
+      const user = await db.findUserById(decoded.userId);
       if (!user || user.status === 'SUSPENDED') {
         return next(new Error('Unauthorized or account suspended'));
       }
@@ -45,7 +45,7 @@ export function initSocketIO(server: any): SocketIOServer {
       };
 
       next();
-    } catch (err) {
+    } catch {
       next(new Error('Invalid token'));
     }
   });
@@ -70,26 +70,29 @@ export function initSocketIO(server: any): SocketIOServer {
     }
 
     // Join Ride Room (with IDOR authorization verification)
-    socket.on('ride:join', (data: { rideId: string }) => {
-      const ride = db.findRideById(data.rideId);
-      if (!ride) {
-        socket.emit('error', { message: 'Ride not found' });
-        return;
+    socket.on('ride:join', async (data: { rideId: string }) => {
+      try {
+        const ride = await db.findRideById(data.rideId);
+        if (!ride) {
+          socket.emit('error', { message: 'Ride not found' });
+          return;
+        }
+
+        // Check access permission
+        const isRider = ride.riderId === user.userId;
+        const driver = await db.findDriverByUserId(user.userId);
+        const isDriver = driver && ride.driverId === driver.id;
+        const isAdmin = user.role === 'ADMIN';
+
+        if (!isRider && !isDriver && !isAdmin) {
+          socket.emit('error', { message: 'Unauthorized to join ride room' });
+          return;
+        }
+
+        socket.join(`ride:${data.rideId}`);
+      } catch (err: any) {
+        socket.emit('error', { message: err.message });
       }
-
-      // Check access permission
-      const isRider = ride.riderId === user.userId;
-      const driver = db.findDriverByUserId(user.userId);
-      const isDriver = driver && ride.driverId === driver.id;
-      const isAdmin = user.role === 'ADMIN';
-
-      if (!isRider && !isDriver && !isAdmin) {
-        socket.emit('error', { message: 'Unauthorized to join ride room' });
-        return;
-      }
-
-      socket.join(`ride:${data.rideId}`);
-      console.log(`[Socket] user ${user.userId} joined room ride:${data.rideId}`);
     });
 
     // Leave Ride Room
@@ -98,18 +101,18 @@ export function initSocketIO(server: any): SocketIOServer {
     });
 
     // Driver Location Update (Driver only, strictly authenticated)
-    socket.on('driver:location_update', (data: { lat: number; lng: number; heading?: number }) => {
+    socket.on('driver:location_update', async (data: { lat: number; lng: number; heading?: number }) => {
       if (user.role !== 'DRIVER') {
         socket.emit('error', { message: 'Only drivers can publish location updates' });
         return;
       }
 
-      const driver = db.findDriverByUserId(user.userId);
+      const driver = await db.findDriverByUserId(user.userId);
       if (!driver || driver.approvalStatus !== 'APPROVED' || !driver.isOnline) {
         return;
       }
 
-      // Payload sanity check
+      // Payload coordinate bounds check
       if (
         typeof data.lat !== 'number' ||
         typeof data.lng !== 'number' ||
@@ -128,20 +131,21 @@ export function initSocketIO(server: any): SocketIOServer {
         updatedAt: new Date().toISOString(),
       };
 
-      db.updateDriver(driver.id, { currentLocation: updatedLoc });
+      await db.updateDriver(driver.id, { currentLocation: updatedLoc });
 
       // If driver is currently on an active ride, update and broadcast to the ride room
-      const activeRides = db.getRidesByDriverId(driver.id).filter((r) =>
+      const allDriverRides = await db.getRidesByDriverId(driver.id);
+      const activeRides = allDriverRides.filter((r) =>
         ['DRIVER_ASSIGNED', 'DRIVER_ARRIVING', 'DRIVER_ARRIVED', 'RIDE_STARTED'].includes(r.status)
       );
 
-      activeRides.forEach((ride) => {
-        db.updateRide(ride.id, { currentDriverLocation: { lat: data.lat, lng: data.lng } });
+      for (const ride of activeRides) {
+        await db.updateRide(ride.id, { currentDriverLocation: { lat: data.lat, lng: data.lng } });
         io?.to(`ride:${ride.id}`).emit('driver:moved', {
           rideId: ride.id,
           location: updatedLoc,
         });
-      });
+      }
 
       // Broadcast to admins for live fleet map
       io?.to('role:admins').emit('driver:fleet_location', {
@@ -151,13 +155,13 @@ export function initSocketIO(server: any): SocketIOServer {
     });
 
     // In-Ride Chat Messaging
-    socket.on('chat:send_message', (data: { rideId: string; content: string }) => {
+    socket.on('chat:send_message', async (data: { rideId: string; content: string }) => {
       if (!data.content || !data.content.trim()) return;
 
-      const ride = db.findRideById(data.rideId);
+      const ride = await db.findRideById(data.rideId);
       if (!ride) return;
 
-      const driver = db.findDriverByUserId(user.userId);
+      const driver = await db.findDriverByUserId(user.userId);
       const isRider = ride.riderId === user.userId;
       const isDriver = driver && ride.driverId === driver.id;
 
@@ -166,10 +170,14 @@ export function initSocketIO(server: any): SocketIOServer {
         return;
       }
 
-      const senderUser = db.findUserById(user.userId);
-      const recipientId = isRider
-        ? db.findDriverById(ride.driverId || '')?.userId || ''
-        : ride.riderId;
+      const senderUser = await db.findUserById(user.userId);
+      let recipientId = '';
+      if (isRider && ride.driverId) {
+        const assignedDriver = await db.findDriverById(ride.driverId);
+        recipientId = assignedDriver?.userId || '';
+      } else {
+        recipientId = ride.riderId;
+      }
 
       const message: IMessage = {
         id: 'msg_' + Math.random().toString(36).substring(2, 9),
@@ -177,12 +185,12 @@ export function initSocketIO(server: any): SocketIOServer {
         senderId: user.userId,
         senderName: senderUser?.name || 'User',
         recipientId,
-        content: data.content.trim().slice(0, 500), // Max length 500 chars
+        content: data.content.trim().slice(0, 1000),
         createdAt: new Date().toISOString(),
         read: false,
       };
 
-      db.addMessage(message);
+      await db.createMessage(message);
 
       // Broadcast to ride room
       io?.to(`ride:${ride.id}`).emit('chat:message_received', message);

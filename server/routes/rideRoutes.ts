@@ -4,6 +4,7 @@ import { db } from '../db/store';
 import { AppError } from '../middleware/errorHandler';
 import { FareService } from '../services/fareService';
 import { DispatchService } from '../services/dispatchService';
+import { PaymentService } from '../services/paymentService';
 import { IRide, RideStatus, VehicleCategory } from '../types';
 import { io } from '../socket/socketHandler';
 
@@ -53,7 +54,7 @@ rideRouter.post('/estimate', (req: Request, res: Response, next: NextFunction) =
 });
 
 // Request Ride
-rideRouter.post('/request', (req: Request, res: Response, next: NextFunction) => {
+rideRouter.post('/request', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { pickup, destination, vehicleCategory = 'STANDARD', paymentMethod = 'WALLET' } = req.body;
 
@@ -62,11 +63,8 @@ rideRouter.post('/request', (req: Request, res: Response, next: NextFunction) =>
     }
 
     // Check if user already has an ongoing active ride
-    const userRides = db.getRidesByRiderId(req.user!.userId);
-    const activeRide = userRides.find((r) =>
-      ['REQUESTED', 'SEARCHING_DRIVER', 'DRIVER_ASSIGNED', 'DRIVER_ARRIVING', 'DRIVER_ARRIVED', 'RIDE_STARTED'].includes(r.status)
-    );
-    if (activeRide) {
+    const existingActive = await db.findActiveRideForUser(req.user!.userId);
+    if (existingActive) {
       throw new AppError('You already have an active ride in progress', 400, 'ACTIVE_RIDE_EXISTS');
     }
 
@@ -103,11 +101,11 @@ rideRouter.post('/request', (req: Request, res: Response, next: NextFunction) =>
       updatedAt: new Date().toISOString(),
     };
 
-    db.createRide(ride);
-    db.logAudit(req.user!.userId, 'RIDE_REQUESTED', { rideId: ride.id, fare: fare.total });
+    await db.createRide(ride);
+    await db.logAudit(req.user!.userId, 'RIDE_REQUESTED', { rideId: ride.id, fare: fare.total });
 
     // Initiate dispatch
-    DispatchService.dispatchRide(ride);
+    await DispatchService.dispatchRide(ride);
 
     res.status(201).json({ success: true, data: ride });
   } catch (err) {
@@ -116,77 +114,82 @@ rideRouter.post('/request', (req: Request, res: Response, next: NextFunction) =>
 });
 
 // Get Active Ride for current User or Driver
-rideRouter.get('/active', (req: Request, res: Response) => {
-  const userId = req.user!.userId;
-  let activeRide: IRide | undefined;
+rideRouter.get('/active', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const userId = req.user!.userId;
+    let activeRide: IRide | null = null;
 
-  if (req.user!.role === 'DRIVER') {
-    const driver = db.findDriverByUserId(userId);
-    if (driver) {
-      const driverRides = db.getRidesByDriverId(driver.id);
-      activeRide = driverRides.find((r) =>
-        ['DRIVER_ASSIGNED', 'DRIVER_ARRIVING', 'DRIVER_ARRIVED', 'RIDE_STARTED'].includes(r.status)
-      );
+    if (req.user!.role === 'DRIVER') {
+      const driver = await db.findDriverByUserId(userId);
+      if (driver) {
+        const driverRides = await db.getRidesByDriverId(driver.id);
+        activeRide =
+          driverRides.find((r) =>
+            ['DRIVER_ASSIGNED', 'DRIVER_ARRIVING', 'DRIVER_ARRIVED', 'RIDE_STARTED'].includes(
+              r.status
+            )
+          ) || null;
+      }
+    } else {
+      activeRide = await db.findActiveRideForUser(userId);
     }
-  } else {
-    const userRides = db.getRidesByRiderId(userId);
-    activeRide = userRides.find((r) =>
-      ['REQUESTED', 'SEARCHING_DRIVER', 'DRIVER_ASSIGNED', 'DRIVER_ARRIVING', 'DRIVER_ARRIVED', 'RIDE_STARTED'].includes(r.status)
-    );
-  }
 
-  if (!activeRide) {
-    res.json({ success: true, data: null });
-    return;
-  }
+    if (!activeRide) {
+      res.json({ success: true, data: null });
+      return;
+    }
 
-  // Enrich with driver details if assigned
-  let driverDetails = null;
-  if (activeRide.driverId) {
-    const driver = db.findDriverById(activeRide.driverId);
-    if (driver) {
-      const driverUser = db.findUserById(driver.userId);
-      driverDetails = {
-        id: driver.id,
-        name: driverUser?.name,
-        phone: driverUser?.phone,
-        avatarUrl: driverUser?.avatarUrl,
-        rating: driver.rating,
-        vehicle: driver.vehicle,
-        currentLocation: driver.currentLocation,
+    // Enrich with driver details if assigned
+    let driverDetails = null;
+    if (activeRide.driverId) {
+      const driver = await db.findDriverById(activeRide.driverId);
+      if (driver) {
+        const driverUser = await db.findUserById(driver.userId);
+        const vehicle = await db.findVehicleByDriverId(driver.id);
+        driverDetails = {
+          id: driver.id,
+          name: driverUser?.name,
+          phone: driverUser?.phone,
+          avatarUrl: driverUser?.avatarUrl,
+          rating: driver.rating,
+          vehicle: vehicle || driver.vehicle,
+          currentLocation: driver.currentLocation,
+        };
+      }
+    }
+
+    // Enrich with rider details if driver
+    let riderDetails = null;
+    const rider = await db.findUserById(activeRide.riderId);
+    if (rider) {
+      riderDetails = {
+        id: rider.id,
+        name: rider.name,
+        phone: rider.phone,
+        avatarUrl: rider.avatarUrl,
       };
     }
-  }
 
-  // Enrich with rider details if driver
-  let riderDetails = null;
-  const rider = db.findUserById(activeRide.riderId);
-  if (rider) {
-    riderDetails = {
-      id: rider.id,
-      name: rider.name,
-      phone: rider.phone,
-      avatarUrl: rider.avatarUrl,
-    };
+    res.json({
+      success: true,
+      data: {
+        ...activeRide,
+        driver: driverDetails,
+        rider: riderDetails,
+      },
+    });
+  } catch (err) {
+    next(err);
   }
-
-  res.json({
-    success: true,
-    data: {
-      ...activeRide,
-      driver: driverDetails,
-      rider: riderDetails,
-    },
-  });
 });
 
 // Get Ride by ID (with IDOR Protection)
-rideRouter.get('/:id', (req: Request, res: Response, next: NextFunction) => {
+rideRouter.get('/:id', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const ride = db.findRideById(req.params.id);
+    const ride = await db.findRideById(req.params.id);
     if (!ride) throw new AppError('Ride not found', 404, 'NOT_FOUND');
 
-    const driver = db.findDriverByUserId(req.user!.userId);
+    const driver = await db.findDriverByUserId(req.user!.userId);
     const isRider = ride.riderId === req.user!.userId;
     const isDriver = driver && ride.driverId === driver.id;
     const isAdmin = req.user!.role === 'ADMIN';
@@ -203,19 +206,19 @@ rideRouter.get('/:id', (req: Request, res: Response, next: NextFunction) => {
 });
 
 // Accept Ride (Driver only with concurrency race protection)
-rideRouter.post('/:id/accept', (req: Request, res: Response, next: NextFunction) => {
+rideRouter.post('/:id/accept', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const driver = db.findDriverByUserId(req.user!.userId);
+    const driver = await db.findDriverByUserId(req.user!.userId);
     if (!driver || driver.approvalStatus !== 'APPROVED') {
       throw new AppError('Only approved drivers can accept rides', 403, 'FORBIDDEN');
     }
 
-    const result = db.atomicAcceptRide(req.params.id, driver.id);
+    const result = await db.atomicAcceptRide(req.params.id, driver.id);
     if (!result.success || !result.ride) {
       throw new AppError(result.message, 409, 'RACE_CONDITION_LOST');
     }
 
-    DispatchService.notifyDriverAssigned(result.ride, driver);
+    await DispatchService.notifyDriverAssigned(result.ride, driver);
 
     res.json({ success: true, data: result.ride });
   } catch (err) {
@@ -224,13 +227,13 @@ rideRouter.post('/:id/accept', (req: Request, res: Response, next: NextFunction)
 });
 
 // Transition Ride Status (State Machine Enforcement)
-rideRouter.post('/:id/transition', (req: Request, res: Response, next: NextFunction) => {
+rideRouter.post('/:id/transition', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { status } = req.body as { status: RideStatus };
-    const ride = db.findRideById(req.params.id);
+    const ride = await db.findRideById(req.params.id);
     if (!ride) throw new AppError('Ride not found', 404, 'NOT_FOUND');
 
-    const driver = db.findDriverByUserId(req.user!.userId);
+    const driver = await db.findDriverByUserId(req.user!.userId);
     const isDriver = driver && ride.driverId === driver.id;
     const isAdmin = req.user!.role === 'ADMIN';
 
@@ -263,7 +266,7 @@ rideRouter.post('/:id/transition', (req: Request, res: Response, next: NextFunct
       additionalUpdates.finalFare = ride.estimatedFare;
     }
 
-    const transitionResult = db.atomicTransitionRide(
+    const transitionResult = await db.atomicTransitionRide(
       req.params.id,
       status,
       allowed,
@@ -271,7 +274,25 @@ rideRouter.post('/:id/transition', (req: Request, res: Response, next: NextFunct
     );
 
     if (!transitionResult.success || !transitionResult.ride) {
-      throw new AppError(transitionResult.error || 'Illegal state transition', 400, 'ILLEGAL_TRANSITION');
+      throw new AppError(
+        transitionResult.error || 'Illegal state transition',
+        400,
+        'ILLEGAL_TRANSITION'
+      );
+    }
+
+    // If ride is completed, automatically process payment
+    if (status === 'RIDE_COMPLETED') {
+      try {
+        await PaymentService.processRidePayment(
+          ride.id,
+          ride.riderId,
+          ride.finalFare || ride.estimatedFare,
+          ride.paymentMethod
+        );
+      } catch (payErr: any) {
+        console.warn(`[Payment] Auto-settlement note for ride ${ride.id}:`, payErr.message);
+      }
     }
 
     // Broadcast update via Socket.IO
@@ -290,13 +311,13 @@ rideRouter.post('/:id/transition', (req: Request, res: Response, next: NextFunct
 });
 
 // Cancel Ride
-rideRouter.post('/:id/cancel', (req: Request, res: Response, next: NextFunction) => {
+rideRouter.post('/:id/cancel', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { reason } = req.body;
-    const ride = db.findRideById(req.params.id);
+    const ride = await db.findRideById(req.params.id);
     if (!ride) throw new AppError('Ride not found', 404, 'NOT_FOUND');
 
-    const driver = db.findDriverByUserId(req.user!.userId);
+    const driver = await db.findDriverByUserId(req.user!.userId);
     const isRider = ride.riderId === req.user!.userId;
     const isDriver = driver && ride.driverId === driver.id;
     const isAdmin = req.user!.role === 'ADMIN';
@@ -311,7 +332,7 @@ rideRouter.post('/:id/cancel', (req: Request, res: Response, next: NextFunction)
 
     const cancelledBy = isRider ? 'RIDER' : isDriver ? 'DRIVER' : 'SYSTEM';
 
-    const updated = db.updateRide(ride.id, {
+    const updated = await db.updateRide(ride.id, {
       status: 'CANCELLED',
       cancellationReason: reason || 'Cancelled by user',
       cancelledBy,
@@ -333,24 +354,33 @@ rideRouter.post('/:id/cancel', (req: Request, res: Response, next: NextFunction)
 });
 
 // Rate Ride
-rideRouter.post('/:id/rate', (req: Request, res: Response, next: NextFunction) => {
+rideRouter.post('/:id/rate', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { stars, comment } = req.body;
     if (!stars || stars < 1 || stars > 5) {
       throw new AppError('Rating must be between 1 and 5 stars', 400, 'INVALID_RATING');
     }
 
-    const ride = db.findRideById(req.params.id);
+    const ride = await db.findRideById(req.params.id);
     if (!ride) throw new AppError('Ride not found', 404, 'NOT_FOUND');
 
     if (ride.riderId !== req.user!.userId) {
       throw new AppError('Only the rider can submit rating for this ride', 403, 'FORBIDDEN');
     }
 
-    const driver = ride.driverId ? db.findDriverById(ride.driverId) : null;
+    if (ride.status !== 'RIDE_COMPLETED') {
+      throw new AppError('Can only rate completed rides', 400, 'RIDE_NOT_COMPLETED');
+    }
+
+    const existingRating = await db.findRatingByRideAndFromUser(ride.id, req.user!.userId);
+    if (existingRating) {
+      throw new AppError('You have already submitted a rating for this ride.', 400, 'ALREADY_RATED');
+    }
+
+    const driver = ride.driverId ? await db.findDriverById(ride.driverId) : null;
     const toUserId = driver ? driver.userId : '';
 
-    const rating = db.addRating({
+    const rating = await db.createRating({
       id: 'rat_' + Math.random().toString(36).substring(2, 9),
       rideId: ride.id,
       fromUserId: req.user!.userId,
@@ -362,9 +392,9 @@ rideRouter.post('/:id/rate', (req: Request, res: Response, next: NextFunction) =
 
     // Recalculate driver rating average
     if (driver) {
-      const allRatings = db.getUserRatings(driver.userId);
+      const allRatings = await db.getRatingsForUser(driver.userId);
       const avg = allRatings.reduce((acc, curr) => acc + curr.stars, 0) / allRatings.length;
-      db.updateDriver(driver.id, {
+      await db.updateDriver(driver.id, {
         rating: Math.round(avg * 10) / 10,
         totalRides: (driver.totalRides || 0) + 1,
       });
@@ -377,11 +407,18 @@ rideRouter.post('/:id/rate', (req: Request, res: Response, next: NextFunction) =
 });
 
 // List rides for current user
-rideRouter.get('/', (req: Request, res: Response) => {
-  const rides =
-    req.user!.role === 'DRIVER'
-      ? db.getRidesByDriverId(db.findDriverByUserId(req.user!.userId)?.id || '')
-      : db.getRidesByRiderId(req.user!.userId);
+rideRouter.get('/', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    let rides: IRide[];
+    if (req.user!.role === 'DRIVER') {
+      const driver = await db.findDriverByUserId(req.user!.userId);
+      rides = driver ? await db.getRidesByDriverId(driver.id) : [];
+    } else {
+      rides = await db.getRidesByRiderId(req.user!.userId);
+    }
 
-  res.json({ success: true, data: rides });
+    res.json({ success: true, data: rides });
+  } catch (err) {
+    next(err);
+  }
 });

@@ -4,10 +4,7 @@ import { db } from '../server/db/store';
 
 describe('Authentication & Security Audit Tests', () => {
   beforeEach(() => {
-    db.users.clear();
-    db.wallets.clear();
-    db.transactions.clear();
-    db.refreshTokens.clear();
+    db.clearAll();
   });
 
   it('registers a user securely with hashed password and initialized wallet', async () => {
@@ -25,9 +22,9 @@ describe('Authentication & Security Audit Tests', () => {
     expect(reg.accessToken).toBeDefined();
     expect(reg.refreshToken).toBeDefined();
 
-    // Verify wallet was created with initial promotional balance
-    const wallet = db.getOrCreateWallet(reg.user.id);
-    expect(wallet.balance).toBe(100);
+    // Verify wallet was created with initial 0 balance
+    const wallet = await db.getOrCreateWallet(reg.user.id);
+    expect(wallet.balance).toBe(0);
   });
 
   it('authenticates user with valid credentials and rejects incorrect password', async () => {
@@ -62,27 +59,25 @@ describe('Authentication & Security Audit Tests', () => {
       role: 'RIDER',
     });
 
-    const rotated = AuthService.rotateRefreshToken(reg.refreshToken);
+    const rotated = await AuthService.rotateRefreshToken(reg.refreshToken);
     expect(rotated.accessToken).toBeDefined();
     expect(rotated.refreshToken).toBeDefined();
     expect(rotated.refreshToken).not.toBe(reg.refreshToken);
 
     // Old token must now be rejected
-    expect(() => AuthService.rotateRefreshToken(reg.refreshToken)).toThrow();
+    await expect(AuthService.rotateRefreshToken(reg.refreshToken)).rejects.toThrow();
   });
 
-  it('wallet safety: prevents debit exceeding balance', () => {
+  it('wallet safety: prevents debit exceeding balance', async () => {
     const userId = 'usr_wallet_test';
-    const wallet = db.getOrCreateWallet(userId);
+    const wallet = await db.getOrCreateWallet(userId);
     wallet.balance = 50;
 
-    const debitOk = db.debitWallet(userId, 30, 'Trip Payment');
-    expect(debitOk.success).toBe(true);
-    expect(wallet.balance).toBe(20);
+    const debitOk = await db.debitWallet(userId, 30, 'Trip Payment');
+    expect(debitOk.wallet.balance).toBe(20);
 
-    const debitTooMuch = db.debitWallet(userId, 50, 'Excessive Payment');
-    expect(debitTooMuch.success).toBe(false);
-    expect(debitTooMuch.error).toContain('Insufficient');
-    expect(wallet.balance).toBe(20); // Unchanged
+    await expect(db.debitWallet(userId, 50, 'Excessive Payment')).rejects.toThrow('INSUFFICIENT_FUNDS');
+    const finalWallet = await db.getOrCreateWallet(userId);
+    expect(finalWallet.balance).toBe(20); // Unchanged
   });
 });

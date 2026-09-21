@@ -8,23 +8,29 @@ export const walletRouter = Router();
 walletRouter.use(authenticate);
 
 // Get Wallet & Transactions
-walletRouter.get('/', (req: Request, res: Response) => {
-  const wallet = db.getOrCreateWallet(req.user!.userId);
-  const transactions = db.getWalletTransactions(req.user!.userId);
+walletRouter.get('/', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const wallet = await db.getOrCreateWallet(req.user!.userId);
+    const transactions = await db.getTransactionsForUser(req.user!.userId);
 
-  res.json({
-    success: true,
-    data: {
-      wallet,
-      transactions,
-    },
-  });
+    res.json({
+      success: true,
+      data: {
+        wallet,
+        transactions,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Top up Wallet Balance
-walletRouter.post('/topup', (req: Request, res: Response, next: NextFunction) => {
+walletRouter.post('/topup', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { amount, promoCode } = req.body;
+    const idempotencyKey =
+      (req.headers['idempotency-key'] as string) || req.body.idempotencyKey;
     const numAmount = Number(amount);
 
     if (isNaN(numAmount) || numAmount <= 0) {
@@ -36,21 +42,33 @@ walletRouter.post('/topup', (req: Request, res: Response, next: NextFunction) =>
     }
 
     let bonus = 0;
-    if (promoCode === 'CREEMY2026') {
-      bonus = 25; // 25 SAR welcome promo bonus
+    if (promoCode && String(promoCode).toUpperCase() === 'CREEMY2026') {
+      bonus = 25; // 25 SAR welcome promo bonus verified server-side
     }
 
     const totalCredit = numAmount + bonus;
     const reason = bonus > 0 ? `Recharge (+${bonus} SAR Promo Bonus)` : 'Wallet Card Recharge';
 
-    const tx = db.creditWallet(req.user!.userId, totalCredit, reason);
-    db.logAudit(req.user!.userId, 'WALLET_TOPUP', { amount: totalCredit });
+    const result = await db.creditWallet(
+      req.user!.userId,
+      totalCredit,
+      reason,
+      undefined,
+      idempotencyKey
+    );
+
+    await db.logAudit(req.user!.userId, 'WALLET_TOPUP', {
+      amount: totalCredit,
+      bonus,
+      newBalance: result.wallet.balance,
+    });
 
     res.json({
       success: true,
       data: {
-        transaction: tx,
-        newBalance: tx.balanceAfter,
+        wallet: result.wallet,
+        transaction: result.transaction,
+        newBalance: result.wallet.balance,
       },
     });
   } catch (err) {

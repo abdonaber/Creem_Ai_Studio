@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { config } from '../config';
@@ -8,34 +9,38 @@ import { IUser, UserRole, IDriver, IVehicle } from '../types';
 export class AuthService {
   private static readonly SALT_ROUNDS = 10;
 
-  public static async register(data: {
-    name: string;
-    email: string;
-    phone: string;
-    password: string;
-    role?: UserRole;
-    vehicleDetails?: {
-      make: string;
-      model: string;
-      year: number;
-      color: string;
-      plateNumber: string;
-      category?: 'STANDARD' | 'COMFORT' | 'VIP' | 'ECO';
-    };
-    licenseNumber?: string;
-  }): Promise<{ user: Omit<IUser, 'passwordHash'>; accessToken: string; refreshToken: string }> {
-    const existingEmail = db.findUserByEmail(data.email);
+  public static async register(
+    data: {
+      name: string;
+      email: string;
+      phone: string;
+      password: string;
+      role?: UserRole;
+      vehicleDetails?: {
+        make: string;
+        model: string;
+        year: number;
+        color: string;
+        plateNumber: string;
+        category?: 'STANDARD' | 'COMFORT' | 'VIP' | 'ECO';
+      };
+      licenseNumber?: string;
+    },
+    clientInfo?: { ip?: string; userAgent?: string }
+  ): Promise<{ user: Omit<IUser, 'passwordHash'>; accessToken: string; refreshToken: string }> {
+    const existingEmail = await db.findUserByEmail(data.email);
     if (existingEmail) {
       throw new AppError('Email address already registered.', 409, 'EMAIL_EXISTS');
     }
 
-    const existingPhone = db.findUserByPhone(data.phone);
+    const existingPhone = await db.findUserByPhone(data.phone);
     if (existingPhone) {
       throw new AppError('Phone number already registered.', 409, 'PHONE_EXISTS');
     }
 
-    if (!data.password || data.password.length < 6) {
-      throw new AppError('Password must be at least 6 characters long.', 400, 'WEAK_PASSWORD');
+    // Strong password policy
+    if (!data.password || data.password.length < 8) {
+      throw new AppError('Password must be at least 8 characters long.', 400, 'WEAK_PASSWORD');
     }
 
     const passwordHash = await bcrypt.hash(data.password, this.SALT_ROUNDS);
@@ -55,8 +60,8 @@ export class AuthService {
       updatedAt: new Date().toISOString(),
     };
 
-    db.createUser(user);
-    db.getOrCreateWallet(userId); // Init wallet
+    await db.createUser(user);
+    await db.getOrCreateWallet(userId); // Init wallet
 
     // If driver, initialize driver profile and vehicle
     if (role === 'DRIVER') {
@@ -73,13 +78,16 @@ export class AuthService {
         plateNumber: data.vehicleDetails?.plateNumber || `CRM-${Math.floor(1000 + Math.random() * 9000)}`,
         category: data.vehicleDetails?.category || 'STANDARD',
       };
-      db.createVehicle(vehicle);
+      await db.createVehicle(vehicle);
+
+      // In production mode, require admin verification before online approval
+      const approvalStatus = config.appMode === 'production' ? 'PENDING' : 'APPROVED';
 
       const driver: IDriver = {
         id: driverId,
         userId,
-        approvalStatus: 'APPROVED', // Auto-approved in demo/dev for immediate testing
-        isOnline: true,
+        approvalStatus,
+        isOnline: approvalStatus === 'APPROVED',
         currentLocation: {
           lat: 24.7136 + (Math.random() - 0.5) * 0.04,
           lng: 46.6753 + (Math.random() - 0.5) * 0.04,
@@ -96,21 +104,31 @@ export class AuthService {
         },
         earningsTotal: 0,
       };
-      db.createDriver(driver);
+      await db.createDriver(driver);
     }
 
-    db.logAudit(userId, 'USER_REGISTERED', { email: user.email, role });
+    await db.createAuditLog({
+      id: 'aud_' + Math.random().toString(36).substring(2, 9),
+      userId,
+      action: 'USER_REGISTERED',
+      details: { email: user.email, role },
+      ip: clientInfo?.ip,
+      timestamp: new Date().toISOString(),
+    });
 
-    const tokens = this.generateTokens(user);
+    const tokens = await this.generateTokens(user, clientInfo);
     const { passwordHash: _, ...safeUser } = user;
     return { user: safeUser, ...tokens };
   }
 
-  public static async login(credentials: {
-    email: string;
-    password: string;
-  }): Promise<{ user: Omit<IUser, 'passwordHash'>; accessToken: string; refreshToken: string }> {
-    const user = db.findUserByEmail(credentials.email);
+  public static async login(
+    credentials: {
+      email: string;
+      password: string;
+    },
+    clientInfo?: { ip?: string; userAgent?: string }
+  ): Promise<{ user: Omit<IUser, 'passwordHash'>; accessToken: string; refreshToken: string }> {
+    const user = await db.findUserByEmail(credentials.email);
     if (!user) {
       throw new AppError('Invalid email or password.', 401, 'INVALID_CREDENTIALS');
     }
@@ -124,64 +142,137 @@ export class AuthService {
       throw new AppError('Your account has been suspended.', 403, 'ACCOUNT_SUSPENDED');
     }
 
-    const tokens = this.generateTokens(user);
-    db.logAudit(user.id, 'USER_LOGIN', { email: user.email });
+    const tokens = await this.generateTokens(user, clientInfo);
+
+    await db.createAuditLog({
+      id: 'aud_' + Math.random().toString(36).substring(2, 9),
+      userId: user.id,
+      action: 'USER_LOGIN',
+      details: { email: user.email },
+      ip: clientInfo?.ip,
+      timestamp: new Date().toISOString(),
+    });
 
     const { passwordHash: _, ...safeUser } = user;
     return { user: safeUser, ...tokens };
   }
 
-  public static rotateRefreshToken(oldRefreshToken: string): { accessToken: string; refreshToken: string } {
+  public static async rotateRefreshToken(
+    oldRefreshToken: string,
+    clientInfo?: { ip?: string; userAgent?: string }
+  ): Promise<{ accessToken: string; refreshToken: string }> {
     try {
-      const decoded = jwt.verify(oldRefreshToken, config.jwtRefreshSecret) as { userId: string };
-      const savedToken = db.findRefreshToken(oldRefreshToken);
+      const decoded = jwt.verify(oldRefreshToken, config.jwtRefreshSecret) as {
+        userId: string;
+        jti: string;
+      };
 
-      if (!savedToken || savedToken.userId !== decoded.userId) {
-        // Potential token reuse / theft! Revoke all tokens for this user
-        db.revokeAllUserRefreshTokens(decoded.userId);
-        throw new AppError('Session invalidated due to suspicious activity. Please sign in again.', 401, 'TOKEN_REUSED');
+      if (!decoded.jti || !decoded.userId) {
+        throw new AppError('Malformed refresh token.', 401, 'INVALID_REFRESH_TOKEN');
       }
 
-      // Invalidate old token
-      db.revokeRefreshToken(oldRefreshToken);
+      const session = await db.findRefreshSessionByJti(decoded.jti);
 
-      const user = db.findUserById(decoded.userId);
+      if (!session || session.revoked) {
+        // TOKEN REUSE ATTACK DETECTED!
+        // Immediately revoke all sessions for this user across all devices
+        await db.revokeAllSessionsForUser(decoded.userId, 'REPLAY_ATTACK_DETECTED');
+        await db.createAuditLog({
+          id: 'aud_' + Math.random().toString(36).substring(2, 9),
+          userId: decoded.userId,
+          action: 'SECURITY_ALERT_TOKEN_REPLAY',
+          details: { jti: decoded.jti, reason: 'Attempted reuse of rotated/revoked token' },
+          ip: clientInfo?.ip,
+          timestamp: new Date().toISOString(),
+        });
+
+        throw new AppError(
+          'Security alert: Session invalidated due to suspicious activity. Please sign in again.',
+          401,
+          'TOKEN_REUSED'
+        );
+      }
+
+      // Invalidate the consumed refresh token session
+      await db.revokeRefreshSession(decoded.jti, 'ROTATED');
+
+      const user = await db.findUserById(decoded.userId);
       if (!user) {
         throw new AppError('User not found.', 401, 'USER_NOT_FOUND');
       }
 
-      return this.generateTokens(user);
+      if (user.status === 'SUSPENDED') {
+        throw new AppError('Account is suspended.', 403, 'ACCOUNT_SUSPENDED');
+      }
+
+      return await this.generateTokens(user, clientInfo);
     } catch (error) {
       if (error instanceof AppError) throw error;
       throw new AppError('Invalid or expired refresh token.', 401, 'INVALID_REFRESH_TOKEN');
     }
   }
 
-  public static logout(refreshToken?: string, userId?: string): void {
+  public static async logout(refreshToken?: string, userId?: string): Promise<void> {
     if (refreshToken) {
-      db.revokeRefreshToken(refreshToken);
+      try {
+        const decoded = jwt.decode(refreshToken) as { jti?: string } | null;
+        if (decoded?.jti) {
+          await db.revokeRefreshSession(decoded.jti, 'USER_LOGOUT');
+        }
+      } catch {
+        // ignore
+      }
     }
     if (userId) {
-      db.logAudit(userId, 'USER_LOGOUT', {});
+      await db.createAuditLog({
+        id: 'aud_' + Math.random().toString(36).substring(2, 9),
+        userId,
+        action: 'USER_LOGOUT',
+        details: {},
+        timestamp: new Date().toISOString(),
+      });
     }
   }
 
-  private static generateTokens(user: IUser): { accessToken: string; refreshToken: string } {
+  public static async logoutAll(userId: string): Promise<void> {
+    await db.revokeAllSessionsForUser(userId, 'USER_LOGOUT_ALL');
+    await db.createAuditLog({
+      id: 'aud_' + Math.random().toString(36).substring(2, 9),
+      userId,
+      action: 'USER_LOGOUT_ALL_SESSIONS',
+      details: {},
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  private static async generateTokens(
+    user: IUser,
+    clientInfo?: { ip?: string; userAgent?: string }
+  ): Promise<{ accessToken: string; refreshToken: string }> {
     const accessToken = jwt.sign(
       { userId: user.id, email: user.email, role: user.role },
       config.jwtSecret,
       { expiresIn: '15m' }
     );
 
+    const jti = crypto.randomBytes(16).toString('hex');
     const refreshToken = jwt.sign(
-      { userId: user.id, jti: Math.random().toString(36).substring(2) + Date.now().toString(36) },
+      { userId: user.id, jti },
       config.jwtRefreshSecret,
       { expiresIn: '7d' }
     );
 
-    // Save refresh token with 7 days expiration in ms
-    const expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000;
-    db.saveRefreshToken(refreshToken, user.id, expiresAt);
+    const tokenHash = crypto.createHash('sha256').update(refreshToken).digest('hex');
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+
+    await db.createRefreshSession({
+      userId: user.id,
+      jti,
+      tokenHash,
+      expiresAt,
+      ip: clientInfo?.ip,
+      userAgent: clientInfo?.userAgent,
+    });
 
     return { accessToken, refreshToken };
   }

@@ -100,7 +100,7 @@ export interface IWallet {
   userId: string;
   balance: number;
   currency: string;
-  createdAt: string;
+  createdAt?: string;
   updatedAt: string;
 }
 
@@ -155,4 +155,20 @@ export interface IAuditLog {
   details: Record<string, unknown>;
   ip?: string;
   timestamp: string;
+}
+
+export interface IPayment {
+  id: string;
+  rideId: string;
+  userId: string;
+  amount: number;
+  currency: string;
+  status: PaymentStatus;
+  paymentMethod: PaymentMethod;
+  stripePaymentIntentId?: string;
+  stripeClientSecret?: string;
+  idempotencyKey?: string;
+  refundAmount?: number;
+  metadata?: Record<string, any>;
+  createdAt: string;
 }

@@ -20,7 +20,7 @@ declare global {
   }
 }
 
-export function authenticate(req: Request, res: Response, next: NextFunction): void {
+export async function authenticate(req: Request, res: Response, next: NextFunction): Promise<void> {
   try {
     const authHeader = req.headers.authorization;
     let token: string | undefined;
@@ -38,7 +38,7 @@ export function authenticate(req: Request, res: Response, next: NextFunction): v
     const decoded = jwt.verify(token, config.jwtSecret) as AuthPayload;
 
     // Verify user exists and is active in DB
-    const user = db.findUserById(decoded.userId);
+    const user = await db.findUserById(decoded.userId);
     if (!user) {
       throw new AppError('User not found or account deleted.', 401, 'USER_NOT_FOUND');
     }

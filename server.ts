@@ -3,6 +3,7 @@ import path from 'path';
 import express from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
+import helmet from 'helmet';
 import { createServer as createViteServer } from 'vite';
 
 import { config } from './server/config';
@@ -20,10 +21,17 @@ import { walletRouter } from './server/routes/walletRoutes';
 import { paymentRouter } from './server/routes/paymentRoutes';
 import { chatRouter } from './server/routes/chatRoutes';
 import { adminRouter } from './server/routes/adminRoutes';
+import { notificationRouter } from './server/routes/notificationRoutes';
 
 export const app = express();
 
 // 1. Global Security & Parsing Middlewares
+app.use(
+  helmet({
+    contentSecurityPolicy: false, // Allows Vite inline scripts and styles in development & preview iframe
+    crossOriginEmbedderPolicy: false,
+  })
+);
 app.use(
   cors({
     origin: config.corsOrigin === '*' ? true : config.corsOrigin,
@@ -69,6 +77,7 @@ app.use('/api/v1/wallet', walletRouter);
 app.use('/api/v1/payments', paymentRouter);
 app.use('/api/v1/chat', chatRouter);
 app.use('/api/v1/admin', adminRouter);
+app.use('/api/v1/notifications', notificationRouter);
 
 // 4. Centralized Error Handler (must be mounted after API routes)
 app.use(errorHandler);

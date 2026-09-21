@@ -29,6 +29,7 @@ export async function apiRequest<T>(
   const response = await fetch(`${API_BASE}${endpoint}`, {
     ...options,
     headers,
+    credentials: 'include',
   });
 
   const json = await response.json().catch(() => ({}));
@@ -40,12 +41,17 @@ export async function apiRequest<T>(
         const refreshRes = await fetch(`${API_BASE}/auth/refresh`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
         });
         const refreshJson = await refreshRes.json();
         if (refreshJson.success && refreshJson.data?.accessToken) {
           localStorage.setItem('creemy_token', refreshJson.data.accessToken);
           headers['Authorization'] = `Bearer ${refreshJson.data.accessToken}`;
-          const retryRes = await fetch(`${API_BASE}${endpoint}`, { ...options, headers });
+          const retryRes = await fetch(`${API_BASE}${endpoint}`, {
+            ...options,
+            headers,
+            credentials: 'include',
+          });
           const retryJson = await retryRes.json();
           if (retryRes.ok) return retryJson.data ?? retryJson;
         }

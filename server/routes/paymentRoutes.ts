@@ -29,15 +29,18 @@ paymentRouter.post('/process', authenticate, async (req: Request, res: Response,
 });
 
 // Secure Payment Gateway Webhook
-paymentRouter.post('/webhook', (req: Request, res: Response, next: NextFunction) => {
+paymentRouter.post('/webhook', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const sigHeader = req.headers['stripe-signature'] || req.headers['x-webhook-signature'] || '';
     const signature = Array.isArray(sigHeader) ? sigHeader[0] : sigHeader;
     const eventIdHeader = req.headers['x-event-id'] || '';
-    const eventId = (req.body && req.body.id) || (Array.isArray(eventIdHeader) ? eventIdHeader[0] : eventIdHeader) || `evt_${Date.now()}`;
+    const eventId =
+      (req.body && req.body.id) ||
+      (Array.isArray(eventIdHeader) ? eventIdHeader[0] : eventIdHeader) ||
+      `evt_${Date.now()}`;
     const rawPayload = JSON.stringify(req.body);
 
-    const verified = PaymentService.handleWebhook(rawPayload, signature, eventId);
+    const verified = await PaymentService.handleWebhook(rawPayload, signature, eventId);
     res.json({ received: true, verified });
   } catch (err) {
     next(err);

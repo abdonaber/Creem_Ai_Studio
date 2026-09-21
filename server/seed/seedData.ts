@@ -3,8 +3,9 @@ import { db } from '../db/store';
 import { IUser, IDriver, IVehicle, IRide } from '../types';
 
 export async function seedInitialData(): Promise<void> {
-  // If already seeded, skip
-  if (db.users.size > 0) return;
+  // If already seeded in DB or memory, skip
+  const existingUsers = await db.getAllUsers();
+  if (existingUsers.length > 0) return;
 
   const defaultPasswordHash = await bcrypt.hash('CreemY@2026', 10);
 
@@ -21,8 +22,8 @@ export async function seedInitialData(): Promise<void> {
     createdAt: new Date(Date.now() - 30 * 86400000).toISOString(),
     updatedAt: new Date().toISOString(),
   };
-  db.createUser(admin);
-  db.getOrCreateWallet(admin.id);
+  await db.createUser(admin);
+  await db.getOrCreateWallet(admin.id);
 
   // 2. Rider User
   const rider: IUser = {
@@ -37,9 +38,8 @@ export async function seedInitialData(): Promise<void> {
     createdAt: new Date(Date.now() - 20 * 86400000).toISOString(),
     updatedAt: new Date().toISOString(),
   };
-  db.createUser(rider);
-  const riderWallet = db.getOrCreateWallet(rider.id);
-  riderWallet.balance = 250; // 250 SAR initial balance
+  await db.createUser(rider);
+  await db.creditWallet(rider.id, 250, 'Initial Welcome Balance');
 
   // 3. Driver User (Primary)
   const driverUser: IUser = {
@@ -54,9 +54,8 @@ export async function seedInitialData(): Promise<void> {
     createdAt: new Date(Date.now() - 15 * 86400000).toISOString(),
     updatedAt: new Date().toISOString(),
   };
-  db.createUser(driverUser);
-  const driverWallet = db.getOrCreateWallet(driverUser.id);
-  driverWallet.balance = 1420;
+  await db.createUser(driverUser);
+  await db.creditWallet(driverUser.id, 1420, 'Initial Driver Earnings Balance');
 
   const driverVehicle: IVehicle = {
     id: 'veh_driver',
@@ -68,7 +67,7 @@ export async function seedInitialData(): Promise<void> {
     plateNumber: 'ك ر م 2026',
     category: 'VIP',
   };
-  db.createVehicle(driverVehicle);
+  await db.createVehicle(driverVehicle);
 
   const primaryDriver: IDriver = {
     id: 'drv_faisal',
@@ -76,117 +75,136 @@ export async function seedInitialData(): Promise<void> {
     approvalStatus: 'APPROVED',
     isOnline: true,
     currentLocation: {
-      lat: 24.7136, // Riyadh Center / Olaya
+      lat: 24.7136,
       lng: 46.6753,
       heading: 45,
       updatedAt: new Date().toISOString(),
     },
-    vehicle: driverVehicle,
-    rating: 4.95,
-    totalRides: 184,
-    licenseNumber: 'LIC-892401',
+    rating: 4.9,
+    totalRides: 142,
+    licenseNumber: 'SA-DL-9823145',
     documents: {
-      licensePhoto: 'https://images.unsplash.com/photo-1544620347-c4fd4a3d5957?w=300',
-      vehicleRegistration: 'https://images.unsplash.com/photo-1549399542-7e3f8b79c341?w=300',
+      licensePhoto: 'https://creemy.app/docs/license_sample.pdf',
+      idCardPhoto: 'https://creemy.app/docs/national_id_sample.pdf',
+      vehicleRegistration: 'https://creemy.app/docs/insurance_sample.pdf',
     },
-    earningsTotal: 4850,
+    vehicle: driverVehicle,
+    earningsTotal: 4890,
   };
-  db.createDriver(primaryDriver);
+  await db.createDriver(primaryDriver);
 
-  // 4. Additional Fleet Drivers for Riyadh City
-  const sampleDrivers = [
+  // 4. Secondary Online Drivers in Riyadh for realistic fleet coverage
+  const secondaryDriversData = [
     {
-      name: 'كابتن طارق الحربي',
-      email: 'tariq@creemy.app',
-      phone: '+966500000004',
-      lat: 24.721,
-      lng: 46.668,
+      user: {
+        id: 'usr_drv_2',
+        name: 'كابتن طارق الدوسري',
+        email: 'tariq.driver@creemy.app',
+        phone: '+966500000004',
+        role: 'DRIVER' as const,
+        status: 'ACTIVE' as const,
+        avatarUrl: 'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?w=150',
+      },
+      driverId: 'drv_tariq',
       category: 'STANDARD' as const,
-      make: 'Hyundai',
-      model: 'Sonata',
-      color: 'White',
-      plate: 'أ ب ج 1122',
-      rating: 4.88,
-    },
-    {
-      name: 'كابتن ماجد الدوسري',
-      email: 'majed@creemy.app',
-      phone: '+966500000005',
-      lat: 24.708,
-      lng: 46.685,
-      category: 'COMFORT' as const,
       make: 'Toyota',
       model: 'Camry Hybrid',
-      color: 'Silver',
-      plate: 'د هـ و 3344',
-      rating: 4.92,
+      year: 2023,
+      plateNumber: 'ط ر ق 1122',
+      color: 'White Pearl',
+      lat: 24.7219,
+      lng: 46.6621,
+      rating: 4.8,
     },
     {
-      name: 'كابتن عمر الشهري',
-      email: 'omar@creemy.app',
-      phone: '+966500000006',
-      lat: 24.735,
-      lng: 46.689,
+      user: {
+        id: 'usr_drv_3',
+        name: 'كابتن عمر الحربي',
+        email: 'omar.driver@creemy.app',
+        phone: '+966500000005',
+        role: 'DRIVER' as const,
+        status: 'ACTIVE' as const,
+        avatarUrl: 'https://images.unsplash.com/photo-1472099645785-5658abf4ff4e?w=150',
+      },
+      driverId: 'drv_omar',
+      category: 'COMFORT' as const,
+      make: 'Hyundai',
+      model: 'Azera',
+      year: 2024,
+      plateNumber: 'ع م ر 5566',
+      color: 'Midnight Black',
+      lat: 24.6985,
+      lng: 46.6894,
+      rating: 4.95,
+    },
+    {
+      user: {
+        id: 'usr_drv_4',
+        name: 'كابتن ماجد الشمري',
+        email: 'majed.driver@creemy.app',
+        phone: '+966500000006',
+        role: 'DRIVER' as const,
+        status: 'ACTIVE' as const,
+        avatarUrl: 'https://images.unsplash.com/photo-1519085360753-af0119f7cbe7?w=150',
+      },
+      driverId: 'drv_majed',
       category: 'ECO' as const,
-      make: 'Nissan',
-      model: 'Sunny',
-      color: 'Dark Grey',
-      plate: 'س ع ص 5566',
-      rating: 4.81,
+      make: 'Toyota',
+      model: 'Yaris',
+      year: 2023,
+      plateNumber: 'م ج د 7788',
+      color: 'Silver',
+      lat: 24.7315,
+      lng: 46.6912,
+      rating: 4.7,
     },
   ];
 
-  sampleDrivers.forEach((d, idx) => {
-    const uid = `usr_fleet_${idx + 1}`;
-    const did = `drv_fleet_${idx + 1}`;
-    const vid = `veh_fleet_${idx + 1}`;
-
+  for (const item of secondaryDriversData) {
     const u: IUser = {
-      id: uid,
-      name: d.name,
-      email: d.email,
-      phone: d.phone,
+      ...item.user,
       passwordHash: defaultPasswordHash,
-      role: 'DRIVER',
-      status: 'ACTIVE',
-      avatarUrl: `https://api.dicebear.com/7.x/bottts/svg?seed=${uid}`,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
-    db.createUser(u);
+    await db.createUser(u);
+    await db.getOrCreateWallet(u.id);
 
-    const v: IVehicle = {
-      id: vid,
-      driverId: did,
-      make: d.make,
-      model: d.model,
-      year: 2023,
-      color: d.color,
-      plateNumber: d.plate,
-      category: d.category,
+    const veh: IVehicle = {
+      id: `veh_${item.driverId}`,
+      driverId: item.driverId,
+      make: item.make,
+      model: item.model,
+      year: item.year,
+      color: item.color,
+      plateNumber: item.plateNumber,
+      category: item.category,
     };
-    db.createVehicle(v);
+    await db.createVehicle(veh);
 
     const drv: IDriver = {
-      id: did,
-      userId: uid,
+      id: item.driverId,
+      userId: u.id,
       approvalStatus: 'APPROVED',
       isOnline: true,
       currentLocation: {
-        lat: d.lat,
-        lng: d.lng,
-        heading: Math.floor(Math.random() * 360),
+        lat: item.lat,
+        lng: item.lng,
+        heading: 90,
         updatedAt: new Date().toISOString(),
       },
-      vehicle: v,
-      rating: d.rating,
-      totalRides: 60 + idx * 25,
-      licenseNumber: `LIC-77${idx}921`,
-      documents: {},
-      earningsTotal: 1200 + idx * 800,
+      rating: item.rating,
+      totalRides: 89,
+      licenseNumber: `SA-DL-${Math.floor(1000000 + Math.random() * 9000000)}`,
+      documents: {
+        licensePhoto: 'https://creemy.app/docs/license_sample.pdf',
+        idCardPhoto: 'https://creemy.app/docs/national_id_sample.pdf',
+      },
+      vehicle: veh,
+      earningsTotal: 2300,
     };
-    db.createDriver(drv);
-  });
+    await db.createDriver(drv);
+  }
 
   // 5. Sample Past Rides for History
   const samplePastRide: IRide = {
@@ -216,11 +234,13 @@ export async function seedInitialData(): Promise<void> {
     createdAt: new Date(Date.now() - 3600000 * 4.2).toISOString(),
     updatedAt: new Date(Date.now() - 3600000 * 3.7).toISOString(),
   };
-  db.createRide(samplePastRide);
+  await db.createRide(samplePastRide);
 
-  db.logAudit(undefined, 'SYSTEM_BOOTSTRAP_SEEDED', {
-    driversCount: db.drivers.size,
-    usersCount: db.users.size,
+  const allDrivers = await db.getAllDrivers();
+  const allUsers = await db.getAllUsers();
+  await db.logAudit(undefined, 'SYSTEM_BOOTSTRAP_SEEDED', {
+    driversCount: allDrivers.length,
+    usersCount: allUsers.length,
   });
 
   console.log('[Seed] CreemY demo ecosystem initialized with Rider, Driver, and Admin.');

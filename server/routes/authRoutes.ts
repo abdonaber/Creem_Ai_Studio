@@ -3,6 +3,7 @@ import { AuthService } from '../services/authService';
 import { authenticate } from '../middleware/auth';
 import { rateLimit } from '../middleware/rateLimiter';
 import { db } from '../db/store';
+import { config } from '../config';
 
 export const authRouter = Router();
 
@@ -12,14 +13,19 @@ authRouter.post(
   rateLimit({ windowMs: 15 * 60 * 1000, max: 20 }),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const result = await AuthService.register(req.body);
+      const clientInfo = {
+        ip: req.ip || req.socket.remoteAddress,
+        userAgent: req.get('user-agent'),
+      };
+
+      const result = await AuthService.register(req.body, clientInfo);
 
       // Set refresh token in HttpOnly secure cookie
       res.cookie('creemy_refresh_token', result.refreshToken, {
         httpOnly: true,
-        secure: process.env.NODE_ENV === 'production',
+        secure: config.isProduction,
         sameSite: 'lax',
-        maxAge: 7 * 24 * 60 * 60 * 1000,
+        maxAge: config.cookieMaxAgeMs,
       });
 
       res.status(201).json({
@@ -41,13 +47,18 @@ authRouter.post(
   rateLimit({ windowMs: 15 * 60 * 1000, max: 30 }),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const result = await AuthService.login(req.body);
+      const clientInfo = {
+        ip: req.ip || req.socket.remoteAddress,
+        userAgent: req.get('user-agent'),
+      };
+
+      const result = await AuthService.login(req.body, clientInfo);
 
       res.cookie('creemy_refresh_token', result.refreshToken, {
         httpOnly: true,
-        secure: process.env.NODE_ENV === 'production',
+        secure: config.isProduction,
         sameSite: 'lax',
-        maxAge: 7 * 24 * 60 * 60 * 1000,
+        maxAge: config.cookieMaxAgeMs,
       });
 
       res.json({
@@ -64,65 +75,94 @@ authRouter.post(
 );
 
 // Refresh Token Rotation
-authRouter.post('/refresh', (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const refreshToken =
-      req.cookies?.creemy_refresh_token || req.body?.refreshToken;
+authRouter.post(
+  '/refresh',
+  rateLimit({ windowMs: 15 * 60 * 1000, max: 60 }),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const refreshToken =
+        req.cookies?.creemy_refresh_token || req.body?.refreshToken;
 
-    if (!refreshToken) {
-      res.status(401).json({ success: false, error: 'Refresh token required' });
-      return;
+      if (!refreshToken) {
+        res.status(401).json({ success: false, error: 'Refresh token required' });
+        return;
+      }
+
+      const clientInfo = {
+        ip: req.ip || req.socket.remoteAddress,
+        userAgent: req.get('user-agent'),
+      };
+
+      const tokens = await AuthService.rotateRefreshToken(refreshToken, clientInfo);
+
+      res.cookie('creemy_refresh_token', tokens.refreshToken, {
+        httpOnly: true,
+        secure: config.isProduction,
+        sameSite: 'lax',
+        maxAge: config.cookieMaxAgeMs,
+      });
+
+      res.json({
+        success: true,
+        data: {
+          accessToken: tokens.accessToken,
+        },
+      });
+    } catch (err) {
+      next(err);
     }
+  }
+);
 
-    const tokens = AuthService.rotateRefreshToken(refreshToken);
+// Logout Current Device
+authRouter.post('/logout', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const refreshToken = req.cookies?.creemy_refresh_token || req.body?.refreshToken;
+    await AuthService.logout(refreshToken, req.user?.userId);
 
-    res.cookie('creemy_refresh_token', tokens.refreshToken, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
-      maxAge: 7 * 24 * 60 * 60 * 1000,
-    });
-
-    res.json({
-      success: true,
-      data: {
-        accessToken: tokens.accessToken,
-      },
-    });
+    res.clearCookie('creemy_refresh_token');
+    res.json({ success: true, message: 'Logged out successfully' });
   } catch (err) {
     next(err);
   }
 });
 
-// Logout
-authRouter.post('/logout', authenticate, (req: Request, res: Response) => {
-  const refreshToken = req.cookies?.creemy_refresh_token || req.body?.refreshToken;
-  AuthService.logout(refreshToken, req.user?.userId);
+// Logout All Devices (Revoke all active refresh sessions)
+authRouter.post('/logout-all', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    await AuthService.logoutAll(req.user!.userId);
 
-  res.clearCookie('creemy_refresh_token');
-  res.json({ success: true, message: 'Logged out successfully' });
+    res.clearCookie('creemy_refresh_token');
+    res.json({ success: true, message: 'All active sessions have been terminated.' });
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Current Authenticated User (Me)
-authRouter.get('/me', authenticate, (req: Request, res: Response) => {
-  const user = db.findUserById(req.user!.userId);
-  if (!user) {
-    res.status(404).json({ success: false, error: 'User not found' });
-    return;
+authRouter.get('/me', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const user = await db.findUserById(req.user!.userId);
+    if (!user) {
+      res.status(404).json({ success: false, error: 'User not found' });
+      return;
+    }
+
+    const driver = user.role === 'DRIVER' ? await db.findDriverByUserId(user.id) : undefined;
+    const wallet = await db.getOrCreateWallet(user.id);
+
+    const { passwordHash: _, ...safeUser } = user;
+
+    res.json({
+      success: true,
+      data: {
+        user: safeUser,
+        driver,
+        walletBalance: wallet.balance,
+        currency: wallet.currency,
+      },
+    });
+  } catch (err) {
+    next(err);
   }
-
-  const driver = user.role === 'DRIVER' ? db.findDriverByUserId(user.id) : undefined;
-  const wallet = db.getOrCreateWallet(user.id);
-
-  const { passwordHash: _, ...safeUser } = user;
-
-  res.json({
-    success: true,
-    data: {
-      user: safeUser,
-      driver,
-      walletBalance: wallet.balance,
-      currency: wallet.currency,
-    },
-  });
 });

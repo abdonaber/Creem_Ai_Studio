@@ -9,12 +9,12 @@ driverRouter.use(authenticate);
 driverRouter.use(requireRole('DRIVER', 'ADMIN'));
 
 // Driver Profile & Vehicle
-driverRouter.get('/me', (req: Request, res: Response, next: NextFunction) => {
+driverRouter.get('/me', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const driver = db.findDriverByUserId(req.user!.userId);
+    const driver = await db.findDriverByUserId(req.user!.userId);
     if (!driver) throw new AppError('Driver profile not found', 404, 'NOT_FOUND');
 
-    const vehicle = db.findVehicleByDriverId(driver.id);
+    const vehicle = await db.findVehicleByDriverId(driver.id);
     res.json({
       success: true,
       data: {
@@ -28,9 +28,9 @@ driverRouter.get('/me', (req: Request, res: Response, next: NextFunction) => {
 });
 
 // Toggle Online/Offline
-driverRouter.put('/status', (req: Request, res: Response, next: NextFunction) => {
+driverRouter.put('/status', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const driver = db.findDriverByUserId(req.user!.userId);
+    const driver = await db.findDriverByUserId(req.user!.userId);
     if (!driver) throw new AppError('Driver profile not found', 404, 'NOT_FOUND');
 
     if (driver.approvalStatus !== 'APPROVED') {
@@ -38,7 +38,7 @@ driverRouter.put('/status', (req: Request, res: Response, next: NextFunction) =>
     }
 
     const { isOnline } = req.body;
-    const updated = db.updateDriver(driver.id, { isOnline: Boolean(isOnline) });
+    const updated = await db.updateDriver(driver.id, { isOnline: Boolean(isOnline) });
 
     res.json({ success: true, data: updated });
   } catch (err) {
@@ -46,25 +46,32 @@ driverRouter.put('/status', (req: Request, res: Response, next: NextFunction) =>
   }
 });
 
-// Driver Location Update (HTTP fallback for WebSockets)
-driverRouter.put('/location', (req: Request, res: Response, next: NextFunction) => {
+// Driver Location Update (Validated GPS with coordinate bounds)
+driverRouter.put('/location', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const driver = db.findDriverByUserId(req.user!.userId);
+    const driver = await db.findDriverByUserId(req.user!.userId);
     if (!driver) throw new AppError('Driver profile not found', 404, 'NOT_FOUND');
 
     const { lat, lng, heading } = req.body;
-    if (typeof lat !== 'number' || typeof lng !== 'number') {
-      throw new AppError('Invalid coordinates', 400, 'INVALID_INPUT');
+    if (
+      typeof lat !== 'number' ||
+      typeof lng !== 'number' ||
+      lat < -90 ||
+      lat > 90 ||
+      lng < -180 ||
+      lng > 180
+    ) {
+      throw new AppError('Valid geographic coordinates required (-90<=lat<=90, -180<=lng<=180)', 400, 'INVALID_INPUT');
     }
 
     const updatedLoc = {
       lat,
       lng,
-      heading: heading || 0,
+      heading: typeof heading === 'number' ? heading : 0,
       updatedAt: new Date().toISOString(),
     };
 
-    const updated = db.updateDriver(driver.id, { currentLocation: updatedLoc });
+    const updated = await db.updateDriver(driver.id, { currentLocation: updatedLoc });
     res.json({ success: true, data: updated });
   } catch (err) {
     next(err);
@@ -72,12 +79,12 @@ driverRouter.put('/location', (req: Request, res: Response, next: NextFunction) 
 });
 
 // Driver Ride History
-driverRouter.get('/rides', (req: Request, res: Response, next: NextFunction) => {
+driverRouter.get('/rides', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const driver = db.findDriverByUserId(req.user!.userId);
+    const driver = await db.findDriverByUserId(req.user!.userId);
     if (!driver) throw new AppError('Driver profile not found', 404, 'NOT_FOUND');
 
-    const rides = db.getRidesByDriverId(driver.id);
+    const rides = await db.getRidesByDriverId(driver.id);
     res.json({ success: true, data: rides });
   } catch (err) {
     next(err);
@@ -85,19 +92,19 @@ driverRouter.get('/rides', (req: Request, res: Response, next: NextFunction) => 
 });
 
 // Update vehicle or documents (Onboarding)
-driverRouter.put('/onboarding', (req: Request, res: Response, next: NextFunction) => {
+driverRouter.put('/onboarding', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const driver = db.findDriverByUserId(req.user!.userId);
+    const driver = await db.findDriverByUserId(req.user!.userId);
     if (!driver) throw new AppError('Driver not found', 404, 'NOT_FOUND');
 
     const { vehicle, documents, licenseNumber } = req.body;
 
     if (vehicle) {
-      let v = db.findVehicleByDriverId(driver.id);
+      let v = await db.findVehicleByDriverId(driver.id);
       if (v) {
-        Object.assign(v, vehicle);
+        await db.updateVehicle(v.id, vehicle);
       } else {
-        v = db.createVehicle({
+        await db.createVehicle({
           id: 'veh_' + Math.random().toString(36).substring(2, 9),
           driverId: driver.id,
           make: vehicle.make || 'Toyota',
@@ -108,10 +115,9 @@ driverRouter.put('/onboarding', (req: Request, res: Response, next: NextFunction
           category: vehicle.category || 'STANDARD',
         });
       }
-      db.updateDriver(driver.id, { vehicle: v });
     }
 
-    const updated = db.updateDriver(driver.id, {
+    const updated = await db.updateDriver(driver.id, {
       ...(documents ? { documents: { ...driver.documents, ...documents } } : {}),
       ...(licenseNumber ? { licenseNumber } : {}),
     });
