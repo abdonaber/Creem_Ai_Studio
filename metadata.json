@@ -1,0 +1,6 @@
+{
+  "name": "CreemY - Smart Ride-Hailing Platform",
+  "description": "منصة نقل ذكية متكاملة ومستقلة لإدارة وتتبع الرحلات، والسائقين، والركاب، والمحفظة والمدفوعات والمحادثات المباشرة بلوحة تحكم وتحليلات متقدمة.",
+  "requestFramePermissions": ["geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
