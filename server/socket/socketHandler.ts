@@ -1,5 +1,7 @@
 import { Server as SocketIOServer, Socket } from 'socket.io';
 import jwt from 'jsonwebtoken';
+import Redis from 'ioredis';
+import { createAdapter } from '@socket.io/redis-adapter';
 import { config } from '../config';
 import { db } from '../db/store';
 import { AuthPayload } from '../middleware/auth';
@@ -20,6 +22,18 @@ export function initSocketIO(server: any): SocketIOServer {
     pingInterval: 10000,
     pingTimeout: 5000,
   });
+
+  // Attach Redis adapter for horizontal scaling if Redis is configured
+  if (config.redisUrl) {
+    try {
+      const pubClient = new Redis(config.redisUrl);
+      const subClient = pubClient.duplicate();
+      io.adapter(createAdapter(pubClient, subClient));
+      console.log('[Socket.IO] Attached Redis adapter for multi-instance scaling.');
+    } catch (err: any) {
+      console.warn('[Socket.IO] Failed to attach Redis adapter:', err.message);
+    }
+  }
 
   // Handshake authentication middleware
   io.use(async (socket: AuthenticatedSocket, next) => {

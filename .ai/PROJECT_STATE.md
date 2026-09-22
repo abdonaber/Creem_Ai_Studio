@@ -17,7 +17,7 @@ CreemY is a modern, high-grade full-stack Ride-Hailing platform inspired by mode
    - `chat`: Real-time ride-scoped encrypted messaging between rider and driver.
    - `notifications`: Multi-channel in-app notifications with read status.
    - `admin`: Super-admin dashboard with live active rides, driver approvals, revenue analytics, audit logs.
-   - `maps`: Leaflet & OpenStreetMap interactive tiles, driver movement simulation, route polyline, distance/duration engine.
+   - `maps`: Leaflet & OpenStreetMap interactive tiles, real-time device GPS position tracking, route polyline, distance/duration engine.
 
 2. **Storage Layer**:
    - MongoDB + Mongoose Schemas (User, Driver, Vehicle, Ride, Payment, Wallet, WalletTransaction, Rating, Message, Notification, RefreshToken, AuditLog).

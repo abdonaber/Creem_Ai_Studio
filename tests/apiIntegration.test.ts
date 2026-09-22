@@ -1,36 +1,63 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import request from 'supertest';
 import { app } from '../server';
-import { seedInitialData } from '../server/seed/seedData';
+import { setDatabaseStore } from '../server/db/store';
+import { TestDatabaseStore } from './testStore';
 
 describe('End-to-End API Integration & RBAC Tests', () => {
   let riderToken: string;
   let driverToken: string;
   let adminToken: string;
+  let testStore: TestDatabaseStore;
 
   beforeAll(async () => {
-    await seedInitialData();
+    testStore = new TestDatabaseStore();
+    setDatabaseStore(testStore);
 
-    // Login Rider
-    const riderRes = await request(app).post('/api/v1/auth/login').send({
-      email: 'rider@creemy.app',
-      password: 'CreemY@2026',
+    // Register Rider
+    const riderReg = await request(app).post('/api/v1/auth/register').send({
+      name: 'Test Rider',
+      email: 'rider_test@creemy.app',
+      phone: '+966511111111',
+      password: 'TestPassword123!',
+      role: 'RIDER',
     });
-    riderToken = riderRes.body.data.accessToken;
+    riderToken = riderReg.body.data.accessToken;
 
-    // Login Driver
-    const driverRes = await request(app).post('/api/v1/auth/login').send({
-      email: 'driver@creemy.app',
-      password: 'CreemY@2026',
+    // Register Driver
+    const driverReg = await request(app).post('/api/v1/auth/register').send({
+      name: 'Test Driver',
+      email: 'driver_test@creemy.app',
+      phone: '+966522222222',
+      password: 'TestPassword123!',
+      role: 'DRIVER',
     });
-    driverToken = driverRes.body.data.accessToken;
+    driverToken = driverReg.body.data.accessToken;
 
-    // Login Admin
-    const adminRes = await request(app).post('/api/v1/auth/login').send({
-      email: 'admin@creemy.app',
-      password: 'CreemY@2026',
+    // Approve driver and create vehicle in test store
+    const driver = await testStore.findDriverByUserId(driverReg.body.data.user.id);
+    if (driver) {
+      await testStore.updateDriver(driver.id, { approvalStatus: 'APPROVED', isOnline: true });
+      await testStore.createVehicle({
+        driverId: driver.id,
+        make: 'Lexus',
+        model: 'ES350',
+        year: 2024,
+        color: 'Black',
+        plateNumber: 'KSA 9999',
+        category: 'VIP',
+      });
+    }
+
+    // Register Admin
+    const adminReg = await request(app).post('/api/v1/auth/register').send({
+      name: 'Test Admin',
+      email: 'admin_test@creemy.app',
+      phone: '+966533333333',
+      password: 'TestPassword123!',
+      role: 'ADMIN',
     });
-    adminToken = adminRes.body.data.accessToken;
+    adminToken = adminReg.body.data.accessToken;
   });
 
   it('GET /health returns healthy system status', async () => {
@@ -85,8 +112,8 @@ describe('End-to-End API Integration & RBAC Tests', () => {
 
     expect(res.status).toBe(200);
     expect(res.body.success).toBe(true);
-    expect(res.body.data.totalDriversCount).toBeGreaterThan(0);
-    expect(res.body.data.totalUsersCount).toBeGreaterThan(0);
+    expect(res.body.data.totalDriversCount).toBeGreaterThanOrEqual(1);
+    expect(res.body.data.totalUsersCount).toBeGreaterThanOrEqual(1);
   });
 
   it('Full ride creation flow by rider', async () => {

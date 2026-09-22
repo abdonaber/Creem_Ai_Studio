@@ -64,7 +64,7 @@ userRouter.put('/notifications/:id/read', async (req: Request, res: Response, ne
   try {
     const notif = await db.findNotificationById(req.params.id);
     if (notif && notif.userId === req.user!.userId) {
-      await db.markNotificationRead(req.params.id);
+      await db.markNotificationRead(req.params.id, req.user!.userId);
     }
     res.json({ success: true });
   } catch (err) {

@@ -17,24 +17,25 @@ if (isProduction) {
   if (!rawRefreshSecret || rawRefreshSecret.trim().length < 32) {
     throw new Error('FATAL: JWT_REFRESH_SECRET must be defined with at least 32 characters in production!');
   }
-  if (appMode === 'demo') {
-    throw new Error('FATAL: APP_MODE=demo is strictly forbidden in production!');
-  }
 }
 
 // Parse allowed CORS origins
 const rawCors = process.env.CORS_ALLOWED_ORIGINS || process.env.CORS_ORIGIN || '';
-const allowedOrigins = rawCors
+const rawOrigins = rawCors
   ? rawCors.split(',').map((o) => o.trim()).filter(Boolean)
   : [];
+
+// Determine safe CORS origins
+const appUrl = process.env.APP_URL || 'http://localhost:3000';
+const allowedOrigins = rawOrigins.length > 0 ? rawOrigins : [appUrl];
 
 export const config = {
   port: 3000,
   appEnv: appEnv as 'development' | 'test' | 'production',
-  appMode: appMode as 'development' | 'production' | 'demo',
+  appMode: (appMode === 'production' ? 'production' : 'development') as 'development' | 'production',
   nodeEnv: process.env.NODE_ENV || 'development',
   isProduction,
-  appUrl: process.env.APP_URL || 'http://localhost:3000',
+  appUrl,
 
   // Database & Cache
   mongodbUri: process.env.MONGODB_URI || '',
@@ -55,6 +56,5 @@ export const config = {
 
   // Operational Settings
   allowedOrigins,
-  corsOrigin: allowedOrigins.length > 0 ? (allowedOrigins.length === 1 ? allowedOrigins[0] : allowedOrigins) : '*',
-  demoMode: appMode === 'demo' && !isProduction,
+  corsOrigin: allowedOrigins.length === 1 ? allowedOrigins[0] : allowedOrigins,
 };

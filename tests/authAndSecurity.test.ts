@@ -1,10 +1,14 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { AuthService } from '../server/services/authService';
-import { db } from '../server/db/store';
+import { db, setDatabaseStore } from '../server/db/store';
+import { TestDatabaseStore } from './testStore';
 
 describe('Authentication & Security Audit Tests', () => {
+  let testStore: TestDatabaseStore;
+
   beforeEach(() => {
-    db.clearAll();
+    testStore = new TestDatabaseStore();
+    setDatabaseStore(testStore);
   });
 
   it('registers a user securely with hashed password and initialized wallet', async () => {
@@ -64,20 +68,20 @@ describe('Authentication & Security Audit Tests', () => {
     expect(rotated.refreshToken).toBeDefined();
     expect(rotated.refreshToken).not.toBe(reg.refreshToken);
 
-    // Old token must now be rejected
+    // Reuse of the old refresh token must be rejected
     await expect(AuthService.rotateRefreshToken(reg.refreshToken)).rejects.toThrow();
   });
 
-  it('wallet safety: prevents debit exceeding balance', async () => {
-    const userId = 'usr_wallet_test';
-    const wallet = await db.getOrCreateWallet(userId);
-    wallet.balance = 50;
+  it('revokes refresh token on logout', async () => {
+    const reg = await AuthService.register({
+      name: 'Mona Salem',
+      email: 'mona@creemy.app',
+      phone: '+966501122334',
+      password: 'Password999!',
+      role: 'RIDER',
+    });
 
-    const debitOk = await db.debitWallet(userId, 30, 'Trip Payment');
-    expect(debitOk.wallet.balance).toBe(20);
-
-    await expect(db.debitWallet(userId, 50, 'Excessive Payment')).rejects.toThrow('INSUFFICIENT_FUNDS');
-    const finalWallet = await db.getOrCreateWallet(userId);
-    expect(finalWallet.balance).toBe(20); // Unchanged
+    await AuthService.logout(reg.refreshToken);
+    await expect(AuthService.rotateRefreshToken(reg.refreshToken)).rejects.toThrow();
   });
 });

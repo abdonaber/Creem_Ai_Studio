@@ -165,30 +165,38 @@ export const DriverApp: React.FC<DriverAppProps> = ({ onOpenChat }) => {
     }
   };
 
-  // Driver GPS simulation step
-  const simulateMovement = () => {
-    if (!activeRide || !driver?.currentLocation) return;
-    const target =
-      activeRide.status === 'RIDE_STARTED' ? activeRide.destination : activeRide.pickup;
+  // Real device GPS tracking
+  useEffect(() => {
+    if (!isOnline) return;
 
-    const newLat = driver.currentLocation.lat + (target.lat - driver.currentLocation.lat) * 0.25;
-    const newLng = driver.currentLocation.lng + (target.lng - driver.currentLocation.lng) * 0.25;
+    if (typeof navigator !== 'undefined' && 'geolocation' in navigator) {
+      const watchId = navigator.geolocation.watchPosition(
+        (pos) => {
+          const updatedLoc = {
+            lat: pos.coords.latitude,
+            lng: pos.coords.longitude,
+            heading: pos.coords.heading || 0,
+            updatedAt: new Date().toISOString(),
+          };
+          const socket = getSocket();
+          socket.emit('driver:location_update', updatedLoc);
 
-    const updatedLoc = {
-      lat: newLat,
-      lng: newLng,
-      heading: 90,
-      updatedAt: new Date().toISOString(),
-    };
+          setDriver((prev) => (prev ? { ...prev, currentLocation: updatedLoc } : null));
+          if (activeRide) {
+            setActiveRide((prev) => (prev ? { ...prev, currentDriverLocation: updatedLoc } : null));
+          }
+        },
+        (err) => {
+          console.warn('[Driver GPS] Geolocation watch error:', err.message);
+        },
+        { enableHighAccuracy: true, maximumAge: 3000, timeout: 10000 }
+      );
 
-    const socket = getSocket();
-    socket.emit('driver:location_update', updatedLoc);
-
-    setDriver((prev) => (prev ? { ...prev, currentLocation: updatedLoc } : null));
-    if (activeRide) {
-      setActiveRide((prev) => (prev ? { ...prev, currentDriverLocation: updatedLoc } : null));
+      return () => {
+        navigator.geolocation.clearWatch(watchId);
+      };
     }
-  };
+  }, [isOnline, activeRide?.id]);
 
   return (
     <div className="relative h-[calc(100vh-4rem)] w-full flex flex-col md:flex-row overflow-hidden bg-slate-100">
@@ -198,19 +206,19 @@ export const DriverApp: React.FC<DriverAppProps> = ({ onOpenChat }) => {
         <div className="p-5 border-b border-slate-100 flex items-center justify-between bg-slate-900 text-white">
           <div className="flex items-center gap-3">
             <img
-              src="https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150"
+              src={(driver as any)?.userAvatar || 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150'}
               alt="Captain"
               className="h-12 w-12 rounded-2xl object-cover ring-2 ring-emerald-400"
             />
             <div>
-              <h3 className="font-bold text-base leading-tight">كابتن فيصل العتيبي</h3>
+              <h3 className="font-bold text-base leading-tight">{(driver as any)?.userName || 'كابتن معتمد'}</h3>
               <div className="flex items-center gap-2 text-xs text-slate-300 mt-0.5">
                 <span className="flex items-center gap-1 text-amber-400 font-bold">
                   <Star className="h-3 w-3 fill-amber-400" />
-                  {driver?.rating.toFixed(2) || '4.95'}
+                  {driver?.rating.toFixed(2) || '5.00'}
                 </span>
                 <span>•</span>
-                <span>{driver?.totalRides || 184} رحلة منجزة</span>
+                <span>{driver?.totalRides || 0} رحلة منجزة</span>
               </div>
             </div>
           </div>
@@ -302,15 +310,6 @@ export const DriverApp: React.FC<DriverAppProps> = ({ onOpenChat }) => {
                   </div>
                 </div>
               </div>
-
-              {/* GPS Movement Simulator Button for Demo/Testing */}
-              <button
-                onClick={simulateMovement}
-                className="w-full py-2.5 px-4 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl font-medium text-xs flex items-center justify-center gap-2 transition-colors border border-slate-200"
-              >
-                <Navigation className="h-4 w-4 text-emerald-600" />
-                محاكاة تقدم الكابتن على الخريطة (GPS Step)
-              </button>
             </div>
 
             {/* State Machine Action Controls */}

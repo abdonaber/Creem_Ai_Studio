@@ -41,6 +41,10 @@ export interface IDriverDocument extends Document {
     heading?: number;
     updatedAt: Date;
   };
+  location?: {
+    type: 'Point';
+    coordinates: [number, number]; // [lng, lat]
+  };
   rating: number;
   totalRides: number;
   licenseNumber: string;
@@ -69,6 +73,17 @@ export const DriverSchema = new Schema<IDriverDocument>(
       heading: { type: Number, default: 0 },
       updatedAt: { type: Date, default: Date.now },
     },
+    location: {
+      type: {
+        type: String,
+        enum: ['Point'],
+        default: 'Point',
+      },
+      coordinates: {
+        type: [Number], // [lng, lat]
+        default: [46.6753, 24.7136],
+      },
+    },
     rating: { type: Number, default: 5.0 },
     totalRides: { type: Number, default: 0 },
     licenseNumber: { type: String, required: true },
@@ -83,6 +98,7 @@ export const DriverSchema = new Schema<IDriverDocument>(
 );
 
 DriverSchema.index({ isOnline: 1, approvalStatus: 1 });
+DriverSchema.index({ location: '2dsphere' });
 DriverSchema.index({ 'currentLocation.lat': 1, 'currentLocation.lng': 1 });
 
 // 3. Vehicle Schema
@@ -433,6 +449,33 @@ export const RefreshSessionSchema = new Schema<IRefreshSessionDocument>(
 
 RefreshSessionSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 }); // MongoDB TTL auto-cleanup
 
+// 13. WebhookEvent Schema (for persistent webhook deduplication and idempotency)
+export interface IWebhookEventDocument extends Document {
+  eventId: string;
+  source: string;
+  type: string;
+  payload?: Record<string, any>;
+  processedAt: Date;
+  status: 'PROCESSED' | 'FAILED';
+  errorMessage?: string;
+  createdAt: Date;
+}
+
+export const WebhookEventSchema = new Schema<IWebhookEventDocument>(
+  {
+    eventId: { type: String, required: true, unique: true, index: true },
+    source: { type: String, default: 'stripe', index: true },
+    type: { type: String, required: true },
+    payload: Schema.Types.Mixed,
+    processedAt: { type: Date, default: Date.now },
+    status: { type: String, enum: ['PROCESSED', 'FAILED'], default: 'PROCESSED' },
+    errorMessage: String,
+  },
+  { timestamps: true }
+);
+
+WebhookEventSchema.index({ createdAt: 1 }, { expireAfterSeconds: 30 * 24 * 60 * 60 }); // Auto-expire after 30 days
+
 // Export Mongoose Models
 export const UserModel = mongoose.models.User || mongoose.model<IUserDocument>('User', UserSchema);
 export const DriverModel = mongoose.models.Driver || mongoose.model<IDriverDocument>('Driver', DriverSchema);
@@ -449,3 +492,5 @@ export const NotificationModel =
 export const AuditLogModel = mongoose.models.AuditLog || mongoose.model<IAuditLogDocument>('AuditLog', AuditLogSchema);
 export const RefreshSessionModel =
   mongoose.models.RefreshSession || mongoose.model<IRefreshSessionDocument>('RefreshSession', RefreshSessionSchema);
+export const WebhookEventModel =
+  mongoose.models.WebhookEvent || mongoose.model<IWebhookEventDocument>('WebhookEvent', WebhookEventSchema);

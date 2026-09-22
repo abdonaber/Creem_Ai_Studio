@@ -2,12 +2,9 @@ import { config } from '../config';
 import { db } from '../db/store';
 import { AppError } from '../middleware/errorHandler';
 import { StripeService } from './stripeService';
-import { IPayment } from '../types';
 import { io } from '../socket/socketHandler';
 
 export class PaymentService {
-  private static processedWebhooks: Set<string> = new Set();
-
   public static async processRidePayment(
     rideId: string,
     userId: string,
@@ -32,50 +29,14 @@ export class PaymentService {
       return { success: true, paymentStatus: 'SUCCEEDED' };
     }
 
-    const paymentId = 'pay_' + Math.random().toString(36).substring(2, 9);
-
     if (method === 'WALLET') {
       try {
-        const debitResult = await db.debitWallet(
-          ride.riderId,
-          amount,
-          `Payment for ride #${rideId.slice(0, 8)}`,
-          rideId
-        );
-
-        // Credit driver's wallet (80% net earnings after 20% platform commission)
-        if (ride.driverId) {
-          const driver = await db.findDriverById(ride.driverId);
-          if (driver) {
-            const driverEarning = Math.round(amount * 0.8 * 100) / 100;
-            await db.creditWallet(
-              driver.userId,
-              driverEarning,
-              `Earnings for ride #${rideId.slice(0, 8)}`,
-              rideId
-            );
-            await db.updateDriver(driver.id, {
-              earningsTotal: (driver.earningsTotal || 0) + driverEarning,
-            });
-          }
-        }
-
-        await db.updateRide(rideId, {
-          paymentStatus: 'SUCCEEDED',
-          paymentMethod: 'WALLET',
-          finalFare: amount,
-        });
-
-        await db.createPayment({
-          id: paymentId,
+        const settleResult = await db.settleRidePaymentWallet({
           rideId,
-          userId: ride.riderId,
+          riderId: ride.riderId,
+          driverId: ride.driverId,
           amount,
-          currency: 'SAR',
-          status: 'SUCCEEDED',
-          paymentMethod: 'WALLET',
           idempotencyKey,
-          createdAt: new Date().toISOString(),
         });
 
         if (io) {
@@ -90,14 +51,14 @@ export class PaymentService {
         return {
           success: true,
           paymentStatus: 'SUCCEEDED',
-          transactionId: debitResult.transaction?.id,
+          transactionId: settleResult.transactionId,
         };
       } catch (err: any) {
         await db.updateRide(rideId, { paymentStatus: 'FAILED' });
         throw new AppError(
           err.message || 'Insufficient wallet balance. Please top up or pay by cash.',
-          400,
-          'INSUFFICIENT_FUNDS'
+          err.statusCode || 400,
+          err.code || 'INSUFFICIENT_FUNDS'
         );
       }
     } else if (method === 'CASH') {
@@ -112,11 +73,11 @@ export class PaymentService {
               driver.userId,
               platformFee,
               `Platform commission (20%) for cash ride #${rideId.slice(0, 8)}`,
-              rideId
+              rideId,
+              idempotencyKey ? `${idempotencyKey}_commission` : undefined
             );
           } catch {
-            // Driver may carry a negative temporary balance if wallet is empty
-            console.warn(`[Payment] Driver ${driver.id} has insufficient funds for cash commission deduction.`);
+            console.warn(`[Payment] Driver ${driver.id} wallet debit deferred for cash commission.`);
           }
 
           await db.updateDriver(driver.id, {
@@ -131,8 +92,7 @@ export class PaymentService {
         finalFare: amount,
       });
 
-      await db.createPayment({
-        id: paymentId,
+      const payment = await db.createPayment({
         rideId,
         userId: ride.riderId,
         amount,
@@ -140,7 +100,6 @@ export class PaymentService {
         status: 'SUCCEEDED',
         paymentMethod: 'CASH',
         idempotencyKey,
-        createdAt: new Date().toISOString(),
       });
 
       if (io) {
@@ -152,7 +111,7 @@ export class PaymentService {
         });
       }
 
-      return { success: true, paymentStatus: 'SUCCEEDED' };
+      return { success: true, paymentStatus: 'SUCCEEDED', transactionId: payment.id };
     } else {
       // Credit card via Stripe
       const intent = await StripeService.createPaymentIntent({
@@ -170,8 +129,7 @@ export class PaymentService {
         finalFare: amount,
       });
 
-      await db.createPayment({
-        id: paymentId,
+      const payment = await db.createPayment({
         rideId,
         userId: ride.riderId,
         amount,
@@ -181,7 +139,6 @@ export class PaymentService {
         stripePaymentIntentId: intent.intentId,
         stripeClientSecret: intent.clientSecret,
         idempotencyKey,
-        createdAt: new Date().toISOString(),
       });
 
       return {
@@ -198,59 +155,74 @@ export class PaymentService {
     signature: string,
     eventId?: string
   ): Promise<boolean> {
-    if (eventId && this.processedWebhooks.has(eventId)) {
-      console.warn(`[Payment] Duplicate webhook detected: ${eventId}`);
-      return true;
+    if (!signature) {
+      throw new AppError('Missing webhook signature.', 400, 'INVALID_SIGNATURE');
     }
 
-    if (config.stripeSecretKey && config.stripeWebhookSecret) {
-      const event = StripeService.constructWebhookEvent(payload, signature);
+    // Persistent deduplication check
+    if (eventId) {
+      const alreadyProcessed = await db.isWebhookProcessed(eventId);
+      if (alreadyProcessed) {
+        console.warn(`[Payment] Duplicate webhook detected and safely skipped: ${eventId}`);
+        return true;
+      }
+    }
 
-      if (event.type === 'payment_intent.succeeded') {
-        const paymentIntent = event.data.object as any;
-        const payment = await db.findPaymentByStripeIntent(paymentIntent.id);
-        if (payment) {
-          await db.updatePayment(payment.id, { status: 'SUCCEEDED' });
-          await db.updateRide(payment.rideId, { paymentStatus: 'SUCCEEDED' });
+    const event = StripeService.constructWebhookEvent(payload, signature);
+    const effectiveEventId = eventId || event.id;
 
-          const ride = await db.findRideById(payment.rideId);
-          if (ride?.driverId) {
-            const driver = await db.findDriverById(ride.driverId);
-            if (driver) {
-              const driverEarning = Math.round(payment.amount * 0.8 * 100) / 100;
-              await db.creditWallet(
-                driver.userId,
-                driverEarning,
-                `Earnings for card ride #${payment.rideId.slice(0, 8)}`,
-                payment.rideId
-              );
-              await db.updateDriver(driver.id, {
-                earningsTotal: (driver.earningsTotal || 0) + driverEarning,
-              });
-            }
-          }
+    if (effectiveEventId) {
+      const alreadyProcessed = await db.isWebhookProcessed(effectiveEventId);
+      if (alreadyProcessed) {
+        return true;
+      }
+    }
 
-          if (io) {
-            io.to(`ride:${payment.rideId}`).emit('ride:payment_completed', {
-              rideId: payment.rideId,
-              status: 'SUCCEEDED',
-              method: 'CREDIT_CARD',
-              amount: payment.amount,
+    if (event.type === 'payment_intent.succeeded') {
+      const paymentIntent = event.data.object as any;
+      const payment = await db.findPaymentByStripeIntent(paymentIntent.id);
+      if (payment) {
+        await db.updatePayment(payment.id, { status: 'SUCCEEDED' });
+        await db.updateRide(payment.rideId, { paymentStatus: 'SUCCEEDED' });
+
+        const ride = await db.findRideById(payment.rideId);
+        if (ride?.driverId) {
+          const driver = await db.findDriverById(ride.driverId);
+          if (driver) {
+            const driverEarning = Math.round(payment.amount * 0.8 * 100) / 100;
+            await db.creditWallet(
+              driver.userId,
+              driverEarning,
+              `Earnings for card ride #${payment.rideId.slice(0, 8)}`,
+              payment.rideId
+            );
+            await db.updateDriver(driver.id, {
+              earningsTotal: (driver.earningsTotal || 0) + driverEarning,
             });
           }
         }
+
+        if (io) {
+          io.to(`ride:${payment.rideId}`).emit('ride:payment_completed', {
+            rideId: payment.rideId,
+            status: 'SUCCEEDED',
+            method: 'CREDIT_CARD',
+            amount: payment.amount,
+          });
+        }
       }
-
-      if (eventId) this.processedWebhooks.add(eventId);
-      return true;
     }
 
-    // Sandbox / Test fallback
-    if (!config.isProduction || signature === 'test_valid_signature') {
-      if (eventId) this.processedWebhooks.add(eventId);
-      return true;
+    if (effectiveEventId) {
+      await db.recordProcessedWebhook(
+        effectiveEventId,
+        'stripe',
+        event.type,
+        { id: event.id, type: event.type },
+        'PROCESSED'
+      );
     }
 
-    throw new AppError('Invalid webhook configuration or signature.', 400, 'INVALID_SIGNATURE');
+    return true;
   }
 }

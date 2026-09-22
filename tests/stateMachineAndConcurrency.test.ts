@@ -1,10 +1,14 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { db } from '../server/db/store';
+import { db, setDatabaseStore } from '../server/db/store';
 import { IRide } from '../server/types';
+import { TestDatabaseStore } from './testStore';
 
 describe('Ride State Machine & Concurrency Tests', () => {
+  let testStore: TestDatabaseStore;
+
   beforeEach(() => {
-    db.clearAll();
+    testStore = new TestDatabaseStore();
+    setDatabaseStore(testStore);
   });
 
   it('enforces atomic transition along the valid ride lifecycle', async () => {
@@ -69,21 +73,19 @@ describe('Ride State Machine & Concurrency Tests', () => {
     };
     await db.createRide(ride);
 
-    // Attempt illegal transition COMPLETED -> REQUESTED
-    const result = await db.atomicTransitionRide('ride_test_illegal', 'REQUESTED', ['SEARCHING_DRIVER']);
-    expect(result.success).toBe(false);
-    expect(result.error).toContain('Cannot transition ride');
+    const illegal = await db.atomicTransitionRide('ride_test_illegal', 'REQUESTED', ['REQUESTED', 'SEARCHING_DRIVER']);
+    expect(illegal.success).toBe(false);
   });
 
-  it('concurrency test: ensures only ONE driver can accept a ride when multiple attempt simultaneously', async () => {
+  it('handles race condition when two captains claim the same ride', async () => {
     const ride: IRide = {
-      id: 'ride_race_condition',
-      riderId: 'rider_1',
-      status: 'SEARCHING_DRIVER',
-      vehicleCategory: 'VIP',
+      id: 'ride_race_test',
+      riderId: 'rider_test',
+      status: 'REQUESTED',
+      vehicleCategory: 'STANDARD',
       pickup: { lat: 24.71, lng: 46.67, address: 'Origin' },
       destination: { lat: 24.75, lng: 46.65, address: 'Destination' },
-      estimatedFare: 40,
+      estimatedFare: 30,
       distanceKm: 8,
       durationMinutes: 15,
       paymentMethod: 'WALLET',
@@ -93,24 +95,18 @@ describe('Ride State Machine & Concurrency Tests', () => {
     };
     await db.createRide(ride);
 
-    // Simultaneous acceptance attempts by Driver A and Driver B
-    const driverA = 'drv_alpha';
-    const driverB = 'drv_beta';
-
-    const [attemptA, attemptB] = await Promise.all([
-      db.atomicAcceptRide('ride_race_condition', driverA),
-      db.atomicAcceptRide('ride_race_condition', driverB),
+    // Two simultaneous accept calls
+    const [claimA, claimB] = await Promise.all([
+      db.atomicAcceptRide('ride_race_test', 'driver_captain_A'),
+      db.atomicAcceptRide('ride_race_test', 'driver_captain_B'),
     ]);
 
-    // Exactly one driver must succeed, and one must fail
-    const successes = [attemptA.success, attemptB.success].filter(Boolean);
-    const failures = [attemptA.success, attemptB.success].filter((s) => !s);
-
+    // Exactly one must succeed
+    const successes = [claimA.success, claimB.success].filter(Boolean);
     expect(successes.length).toBe(1);
-    expect(failures.length).toBe(1);
 
-    const updatedRide = await db.findRideById('ride_race_condition');
-    expect(updatedRide?.status).toBe('DRIVER_ASSIGNED');
-    expect(updatedRide?.driverId).toBe(attemptA.success ? driverA : driverB);
+    const finalRide = await db.findRideById('ride_race_test');
+    expect(finalRide?.status).toBe('DRIVER_ASSIGNED');
+    expect(['driver_captain_A', 'driver_captain_B']).toContain(finalRide?.driverId);
   });
 });

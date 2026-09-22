@@ -1,4 +1,4 @@
-import mongoose, { ClientSession } from 'mongoose';
+import mongoose from 'mongoose';
 import { acquireLock, releaseLock } from '../redis/redisClient';
 import {
   UserModel,
@@ -13,6 +13,7 @@ import {
   NotificationModel,
   AuditLogModel,
   RefreshSessionModel,
+  WebhookEventModel,
 } from '../models/mongoSchemas';
 import { isDbConnected } from './connection';
 import {
@@ -29,6 +30,7 @@ import {
   IPayment,
   RideStatus,
 } from '../types';
+import { AppError } from '../middleware/errorHandler';
 
 export interface IRefreshSession {
   id: string;
@@ -43,22 +45,137 @@ export interface IRefreshSession {
   createdAt: string;
 }
 
-export class DatabaseStore {
-  // In-memory fallback caches for development/testing when MongoDB Atlas is connecting
-  private memUsers: Map<string, IUser> = new Map();
-  private memDrivers: Map<string, IDriver> = new Map();
-  private memVehicles: Map<string, IVehicle> = new Map();
-  private memRides: Map<string, IRide> = new Map();
-  private memWallets: Map<string, IWallet> = new Map();
-  private memTransactions: Map<string, IWalletTransaction> = new Map();
-  private memPayments: Map<string, IPayment> = new Map();
-  private memRatings: Map<string, IRating> = new Map();
-  private memMessages: Map<string, IMessage> = new Map();
-  private memNotifications: Map<string, INotification> = new Map();
-  private memAuditLogs: IAuditLog[] = [];
-  private memSessions: Map<string, IRefreshSession> = new Map();
+export interface IDatabaseStore {
+  // User Operations
+  findUserById(id: string): Promise<IUser | null>;
+  findUserByEmail(email: string): Promise<IUser | null>;
+  findUserByPhone(phone: string): Promise<IUser | null>;
+  createUser(user: Partial<IUser>): Promise<IUser>;
+  updateUser(id: string, updates: Partial<IUser>): Promise<IUser | null>;
+  getAllUsers(): Promise<IUser[]>;
 
-  // Helper to map Mongoose doc to domain type
+  // Driver & Vehicle Operations
+  findDriverById(id: string): Promise<IDriver | null>;
+  findDriverByUserId(userId: string): Promise<IDriver | null>;
+  createDriver(driver: Partial<IDriver>): Promise<IDriver>;
+  updateDriver(id: string, updates: Partial<IDriver>): Promise<IDriver | null>;
+  getOnlineApprovedDrivers(): Promise<IDriver[]>;
+  getAllDrivers(): Promise<IDriver[]>;
+  findVehicleByDriverId(driverId: string): Promise<IVehicle | null>;
+  createVehicle(vehicle: Partial<IVehicle>): Promise<IVehicle>;
+  updateVehicle(driverId: string, updates: Partial<IVehicle>): Promise<IVehicle | null>;
+
+  // Ride Operations
+  createRide(ride: Partial<IRide>): Promise<IRide>;
+  findRideById(id: string): Promise<IRide | null>;
+  updateRide(id: string, updates: Partial<IRide>): Promise<IRide | null>;
+  findActiveRideForUser(userId: string): Promise<IRide | null>;
+  getRidesByRiderId(riderId: string): Promise<IRide[]>;
+  getRidesByDriverId(driverId: string): Promise<IRide[]>;
+  getAllRides(): Promise<IRide[]>;
+  atomicTransitionRide(
+    rideId: string,
+    nextStatus: RideStatus,
+    allowedCurrentStatuses: RideStatus[],
+    additionalUpdates?: Partial<IRide>
+  ): Promise<{ success: boolean; ride?: IRide; message?: string }>;
+  atomicAcceptRide(
+    rideId: string,
+    driverId: string
+  ): Promise<{ success: boolean; ride?: IRide; message?: string }>;
+
+  // Wallet & Financial Operations
+  getOrCreateWallet(userId: string): Promise<IWallet>;
+  debitWallet(
+    userId: string,
+    amount: number,
+    description: string,
+    referenceId?: string,
+    idempotencyKey?: string
+  ): Promise<{ wallet: IWallet; transaction: IWalletTransaction }>;
+  creditWallet(
+    userId: string,
+    amount: number,
+    description: string,
+    referenceId?: string,
+    idempotencyKey?: string
+  ): Promise<{ wallet: IWallet; transaction: IWalletTransaction }>;
+  settleRidePaymentWallet(params: {
+    rideId: string;
+    riderId: string;
+    driverId?: string;
+    amount: number;
+    idempotencyKey?: string;
+  }): Promise<{ success: boolean; transactionId: string }>;
+  getTransactionsForUser(userId: string): Promise<IWalletTransaction[]>;
+
+  // Payment Operations
+  createPayment(payment: Partial<IPayment>): Promise<IPayment>;
+  findPaymentById(id: string): Promise<IPayment | null>;
+  findPaymentByRideId(rideId: string): Promise<IPayment | null>;
+  findPaymentByStripeIntent(intentId: string): Promise<IPayment | null>;
+  updatePayment(id: string, updates: Partial<IPayment>): Promise<IPayment | null>;
+
+  // Webhook Deduplication & Idempotency
+  isWebhookProcessed(eventId: string): Promise<boolean>;
+  recordProcessedWebhook(
+    eventId: string,
+    source: string,
+    type: string,
+    payload?: any,
+    status?: 'PROCESSED' | 'FAILED',
+    errorMessage?: string
+  ): Promise<void>;
+
+  // Rating Operations
+  createRating(rating: Partial<IRating>): Promise<IRating>;
+  getRatingsForUser(userId: string): Promise<IRating[]>;
+  findRatingByRideAndFromUser(rideId: string, fromUserId: string): Promise<IRating | null>;
+
+  // Chat Messaging Operations
+  createMessage(msg: Partial<IMessage>): Promise<IMessage>;
+  getMessagesForRide(rideId: string): Promise<IMessage[]>;
+
+  // Notification Operations
+  createNotification(notif: Partial<INotification>): Promise<INotification>;
+  getNotificationsForUser(userId: string): Promise<INotification[]>;
+  findNotificationById(id: string): Promise<INotification | null>;
+  updateNotification(id: string, updates: Partial<INotification>): Promise<INotification | null>;
+  markNotificationRead(id: string, userId: string): Promise<boolean>;
+  markAllNotificationsRead(userId: string): Promise<number>;
+
+  // Audit Logs & Platform Admin
+  logAudit(userId: string, action: string, details?: any, ip?: string): Promise<void>;
+  createAuditLog(log: Partial<IAuditLog>): Promise<IAuditLog>;
+  getAuditLogs(limit?: number): Promise<IAuditLog[]>;
+  getPlatformStats(): Promise<any>;
+
+  // Refresh Sessions (JWT Token Rotation)
+  createRefreshSession(session: {
+    userId: string;
+    jti: string;
+    tokenHash: string;
+    expiresAt: Date;
+    ip?: string;
+    userAgent?: string;
+  }): Promise<IRefreshSession>;
+  findRefreshSessionByJti(jti: string): Promise<IRefreshSession | null>;
+  revokeRefreshSession(jti: string, reason?: string): Promise<void>;
+  revokeAllSessionsForUser(userId: string, reason?: string): Promise<void>;
+}
+
+export class MongoDatabaseStore implements IDatabaseStore {
+  private ensureConnection(): void {
+    if (!isDbConnected()) {
+      throw new AppError(
+        'Database connection is unavailable. Real MongoDB connection is required.',
+        503,
+        'DATABASE_UNAVAILABLE'
+      );
+    }
+  }
+
+  // Domain mappers
   private docToUser(doc: any): IUser {
     if (!doc) return null as any;
     return {
@@ -70,8 +187,8 @@ export class DatabaseStore {
       role: doc.role,
       status: doc.status,
       avatarUrl: doc.avatarUrl,
-      createdAt: doc.createdAt?.toISOString?.() || doc.createdAt,
-      updatedAt: doc.updatedAt?.toISOString?.() || doc.updatedAt,
+      createdAt: doc.createdAt?.toISOString?.() || new Date(doc.createdAt).toISOString(),
+      updatedAt: doc.updatedAt?.toISOString?.() || new Date(doc.updatedAt).toISOString(),
     };
   }
 
@@ -83,16 +200,18 @@ export class DatabaseStore {
       approvalStatus: doc.approvalStatus,
       isOnline: doc.isOnline,
       currentLocation: {
-        lat: doc.currentLocation?.lat,
-        lng: doc.currentLocation?.lng,
+        lat: doc.currentLocation?.lat ?? 24.7136,
+        lng: doc.currentLocation?.lng ?? 46.6753,
         heading: doc.currentLocation?.heading || 0,
-        updatedAt: doc.currentLocation?.updatedAt?.toISOString?.() || doc.currentLocation?.updatedAt,
+        updatedAt:
+          doc.currentLocation?.updatedAt?.toISOString?.() ||
+          new Date(doc.currentLocation?.updatedAt || Date.now()).toISOString(),
       },
-      rating: doc.rating,
-      totalRides: doc.totalRides,
+      rating: doc.rating ?? 5.0,
+      totalRides: doc.totalRides ?? 0,
       licenseNumber: doc.licenseNumber,
       documents: doc.documents,
-      earningsTotal: doc.earningsTotal,
+      earningsTotal: doc.earningsTotal ?? 0,
     };
   }
 
@@ -130,380 +249,229 @@ export class DatabaseStore {
       paymentStatus: doc.paymentStatus,
       cancellationReason: doc.cancellationReason,
       cancelledBy: doc.cancelledBy,
-      startedAt: doc.startedAt?.toISOString?.() || doc.startedAt,
-      completedAt: doc.completedAt?.toISOString?.() || doc.completedAt,
-      createdAt: doc.createdAt?.toISOString?.() || doc.createdAt,
-      updatedAt: doc.updatedAt?.toISOString?.() || doc.updatedAt || new Date().toISOString(),
+      startedAt: doc.startedAt ? new Date(doc.startedAt).toISOString() : undefined,
+      completedAt: doc.completedAt ? new Date(doc.completedAt).toISOString() : undefined,
+      createdAt: doc.createdAt?.toISOString?.() || new Date(doc.createdAt).toISOString(),
+      updatedAt: doc.updatedAt?.toISOString?.() || new Date(doc.updatedAt || Date.now()).toISOString(),
     };
-  }
-
-  public clearAll(): void {
-    this.memUsers.clear();
-    this.memDrivers.clear();
-    this.memVehicles.clear();
-    this.memRides.clear();
-    this.memWallets.clear();
-    this.memTransactions.clear();
-    this.memPayments.clear();
-    this.memRatings.clear();
-    this.memMessages.clear();
-    this.memNotifications.clear();
-    this.memAuditLogs = [];
-    this.memSessions.clear();
   }
 
   // ==========================================
   // USER OPERATIONS
   // ==========================================
-  public async createUser(user: IUser): Promise<IUser> {
-    this.memUsers.set(user.id, { ...user });
-    if (isDbConnected()) {
-      try {
-        const created = await UserModel.create({
-          _id: new mongoose.Types.ObjectId(),
-          name: user.name,
-          email: user.email.toLowerCase(),
-          phone: user.phone,
-          passwordHash: user.passwordHash,
-          role: user.role,
-          status: user.status,
-          avatarUrl: user.avatarUrl,
-        });
-        const mapped = this.docToUser(created);
-        this.memUsers.set(mapped.id, mapped);
-        return mapped;
-      } catch (err) {
-        console.warn('[DB User] Mongo insert error, saved in memory store:', (err as Error).message);
-      }
-    }
-    return user;
-  }
-
   public async findUserById(id: string): Promise<IUser | null> {
-    if (isDbConnected()) {
-      try {
-        if (mongoose.Types.ObjectId.isValid(id)) {
-          const doc = await UserModel.findById(id).lean();
-          if (doc) return this.docToUser(doc);
-        }
-      } catch {
-        // fallback
-      }
-    }
-    return this.memUsers.get(id) || null;
+    this.ensureConnection();
+    const query = mongoose.Types.ObjectId.isValid(id) ? { _id: id } : { id };
+    const doc = await UserModel.findOne(query).lean();
+    return doc ? this.docToUser(doc) : null;
   }
 
   public async findUserByEmail(email: string): Promise<IUser | null> {
-    const cleanEmail = email.toLowerCase().trim();
-    if (isDbConnected()) {
-      try {
-        const doc = await UserModel.findOne({ email: cleanEmail }).lean();
-        if (doc) return this.docToUser(doc);
-      } catch {
-        // fallback
-      }
-    }
-    for (const u of this.memUsers.values()) {
-      if (u.email.toLowerCase().trim() === cleanEmail) return u;
-    }
-    return null;
+    this.ensureConnection();
+    const doc = await UserModel.findOne({ email: email.toLowerCase().trim() }).lean();
+    return doc ? this.docToUser(doc) : null;
   }
 
   public async findUserByPhone(phone: string): Promise<IUser | null> {
-    const cleanPhone = phone.trim();
-    if (isDbConnected()) {
-      try {
-        const doc = await UserModel.findOne({ phone: cleanPhone }).lean();
-        if (doc) return this.docToUser(doc);
-      } catch {
-        // fallback
-      }
-    }
-    for (const u of this.memUsers.values()) {
-      if (u.phone.trim() === cleanPhone) return u;
-    }
-    return null;
+    this.ensureConnection();
+    const doc = await UserModel.findOne({ phone: phone.trim() }).lean();
+    return doc ? this.docToUser(doc) : null;
+  }
+
+  public async createUser(user: Partial<IUser>): Promise<IUser> {
+    this.ensureConnection();
+    const doc = await UserModel.create({
+      _id: new mongoose.Types.ObjectId(),
+      name: user.name,
+      email: user.email?.toLowerCase().trim(),
+      phone: user.phone?.trim(),
+      passwordHash: user.passwordHash,
+      role: user.role || 'RIDER',
+      status: user.status || 'ACTIVE',
+      avatarUrl: user.avatarUrl,
+    });
+    return this.docToUser(doc);
   }
 
   public async updateUser(id: string, updates: Partial<IUser>): Promise<IUser | null> {
-    if (isDbConnected()) {
-      try {
-        if (mongoose.Types.ObjectId.isValid(id)) {
-          const updated = await UserModel.findByIdAndUpdate(id, updates, { new: true }).lean();
-          if (updated) {
-            const mapped = this.docToUser(updated);
-            this.memUsers.set(id, mapped);
-            return mapped;
-          }
-        }
-      } catch {
-        // fallback
-      }
-    }
-    const existing = this.memUsers.get(id);
-    if (!existing) return null;
-    const merged = { ...existing, ...updates, updatedAt: new Date().toISOString() };
-    this.memUsers.set(id, merged);
-    return merged;
+    this.ensureConnection();
+    const query = mongoose.Types.ObjectId.isValid(id) ? { _id: id } : { id };
+    const doc = await UserModel.findOneAndUpdate(
+      query,
+      { $set: updates },
+      { new: true, runValidators: true }
+    ).lean();
+    return doc ? this.docToUser(doc) : null;
   }
 
   public async getAllUsers(): Promise<IUser[]> {
-    if (isDbConnected()) {
-      try {
-        const docs = await UserModel.find().sort({ createdAt: -1 }).lean();
-        return docs.map((d) => this.docToUser(d));
-      } catch {
-        // fallback
-      }
-    }
-    return Array.from(this.memUsers.values());
+    this.ensureConnection();
+    const docs = await UserModel.find().sort({ createdAt: -1 }).lean();
+    return docs.map((d) => this.docToUser(d));
   }
 
   // ==========================================
-  // DRIVER OPERATIONS
+  // DRIVER & VEHICLE OPERATIONS
   // ==========================================
-  public async createDriver(driver: IDriver): Promise<IDriver> {
-    this.memDrivers.set(driver.id, { ...driver });
-    if (isDbConnected()) {
-      try {
-        const created = await DriverModel.create({
-          _id: new mongoose.Types.ObjectId(),
-          userId: driver.userId,
-          approvalStatus: driver.approvalStatus,
-          isOnline: driver.isOnline,
-          currentLocation: driver.currentLocation,
-          rating: driver.rating,
-          totalRides: driver.totalRides,
-          licenseNumber: driver.licenseNumber,
-          documents: driver.documents,
-          earningsTotal: driver.earningsTotal,
-        });
-        const mapped = this.docToDriver(created);
-        this.memDrivers.set(mapped.id, mapped);
-        return mapped;
-      } catch (err) {
-        console.warn('[DB Driver] Mongo insert error:', (err as Error).message);
-      }
-    }
-    return driver;
-  }
-
   public async findDriverById(id: string): Promise<IDriver | null> {
-    if (isDbConnected()) {
-      try {
-        if (mongoose.Types.ObjectId.isValid(id)) {
-          const doc = await DriverModel.findById(id).lean();
-          if (doc) return this.docToDriver(doc);
-        }
-      } catch {
-        // fallback
-      }
-    }
-    return this.memDrivers.get(id) || null;
+    this.ensureConnection();
+    const query = mongoose.Types.ObjectId.isValid(id) ? { _id: id } : { id };
+    const doc = await DriverModel.findOne(query).lean();
+    return doc ? this.docToDriver(doc) : null;
   }
 
   public async findDriverByUserId(userId: string): Promise<IDriver | null> {
-    if (isDbConnected()) {
-      try {
-        const doc = await DriverModel.findOne({ userId }).lean();
-        if (doc) return this.docToDriver(doc);
-      } catch {
-        // fallback
-      }
-    }
-    for (const d of this.memDrivers.values()) {
-      if (d.userId === userId) return d;
-    }
-    return null;
+    this.ensureConnection();
+    const doc = await DriverModel.findOne({ userId }).lean();
+    return doc ? this.docToDriver(doc) : null;
+  }
+
+  public async createDriver(driver: Partial<IDriver>): Promise<IDriver> {
+    this.ensureConnection();
+    const doc = await DriverModel.create({
+      _id: new mongoose.Types.ObjectId(),
+      userId: driver.userId,
+      approvalStatus: driver.approvalStatus || 'PENDING',
+      isOnline: driver.isOnline || false,
+      currentLocation: driver.currentLocation || {
+        lat: 24.7136,
+        lng: 46.6753,
+        heading: 0,
+        updatedAt: new Date(),
+      },
+      location: {
+        type: 'Point',
+        coordinates: [
+          driver.currentLocation?.lng ?? 46.6753,
+          driver.currentLocation?.lat ?? 24.7136,
+        ],
+      },
+      rating: driver.rating || 5.0,
+      totalRides: driver.totalRides || 0,
+      licenseNumber: driver.licenseNumber,
+      documents: driver.documents,
+      earningsTotal: driver.earningsTotal || 0,
+    });
+    return this.docToDriver(doc);
   }
 
   public async updateDriver(id: string, updates: Partial<IDriver>): Promise<IDriver | null> {
-    if (isDbConnected()) {
-      try {
-        if (mongoose.Types.ObjectId.isValid(id)) {
-          const updated = await DriverModel.findByIdAndUpdate(id, updates, { new: true }).lean();
-          if (updated) {
-            const mapped = this.docToDriver(updated);
-            this.memDrivers.set(id, mapped);
-            return mapped;
-          }
-        }
-      } catch {
-        // fallback
-      }
-    }
-    const existing = this.memDrivers.get(id);
-    if (!existing) return null;
-    const merged = { ...existing, ...updates };
-    this.memDrivers.set(id, merged);
-    return merged;
-  }
+    this.ensureConnection();
+    const query = mongoose.Types.ObjectId.isValid(id) ? { _id: id } : { id };
+    const mongoUpdates: any = { ...updates };
 
-  public async getAllDrivers(): Promise<IDriver[]> {
-    if (isDbConnected()) {
-      try {
-        const docs = await DriverModel.find().lean();
-        return docs.map((d) => this.docToDriver(d));
-      } catch {
-        // fallback
-      }
+    if (updates.currentLocation) {
+      mongoUpdates.location = {
+        type: 'Point',
+        coordinates: [updates.currentLocation.lng, updates.currentLocation.lat],
+      };
     }
-    return Array.from(this.memDrivers.values());
+
+    const doc = await DriverModel.findOneAndUpdate(
+      query,
+      { $set: mongoUpdates },
+      { new: true, runValidators: true }
+    ).lean();
+    return doc ? this.docToDriver(doc) : null;
   }
 
   public async getOnlineApprovedDrivers(): Promise<IDriver[]> {
-    if (isDbConnected()) {
-      try {
-        const docs = await DriverModel.find({ isOnline: true, approvalStatus: 'APPROVED' }).lean();
-        return docs.map((d) => this.docToDriver(d));
-      } catch {
-        // fallback
-      }
+    this.ensureConnection();
+    const docs = await DriverModel.find({ isOnline: true, approvalStatus: 'APPROVED' }).lean();
+    const drivers = docs.map((d) => this.docToDriver(d));
+    for (const d of drivers) {
+      const v = await this.findVehicleByDriverId(d.id);
+      if (v) d.vehicle = v;
     }
-    return Array.from(this.memDrivers.values()).filter(
-      (d) => d.isOnline && d.approvalStatus === 'APPROVED'
-    );
+    return drivers;
   }
 
-  // ==========================================
-  // VEHICLE OPERATIONS
-  // ==========================================
-  public async createVehicle(vehicle: IVehicle): Promise<IVehicle> {
-    this.memVehicles.set(vehicle.id, { ...vehicle });
-    if (isDbConnected()) {
-      try {
-        const created = await VehicleModel.create({
-          _id: new mongoose.Types.ObjectId(),
-          driverId: vehicle.driverId,
-          make: vehicle.make,
-          model: vehicle.model,
-          year: vehicle.year,
-          color: vehicle.color,
-          plateNumber: vehicle.plateNumber,
-          category: vehicle.category,
-        });
-        const mapped = this.docToVehicle(created);
-        this.memVehicles.set(mapped.id, mapped);
-        return mapped;
-      } catch (err) {
-        console.warn('[DB Vehicle] Mongo insert error:', (err as Error).message);
-      }
+  public async getAllDrivers(): Promise<IDriver[]> {
+    this.ensureConnection();
+    const docs = await DriverModel.find().lean();
+    const drivers = docs.map((d) => this.docToDriver(d));
+    for (const d of drivers) {
+      const v = await this.findVehicleByDriverId(d.id);
+      if (v) d.vehicle = v;
     }
-    return vehicle;
+    return drivers;
   }
 
   public async findVehicleByDriverId(driverId: string): Promise<IVehicle | null> {
-    if (isDbConnected()) {
-      try {
-        const doc = await VehicleModel.findOne({ driverId }).lean();
-        if (doc) return this.docToVehicle(doc);
-      } catch {
-        // fallback
-      }
-    }
-    for (const v of this.memVehicles.values()) {
-      if (v.driverId === driverId) return v;
-    }
-    return null;
+    this.ensureConnection();
+    const doc = await VehicleModel.findOne({ driverId }).lean();
+    return doc ? this.docToVehicle(doc) : null;
   }
 
-  public async updateVehicle(id: string, updates: Partial<IVehicle>): Promise<IVehicle | null> {
-    if (isDbConnected()) {
-      try {
-        if (mongoose.Types.ObjectId.isValid(id)) {
-          const updated = await VehicleModel.findByIdAndUpdate(id, updates, { new: true }).lean();
-          if (updated) {
-            const mapped = this.docToVehicle(updated);
-            this.memVehicles.set(id, mapped);
-            return mapped;
-          }
-        }
-      } catch {
-        // fallback
-      }
-    }
-    const existing = this.memVehicles.get(id);
-    if (!existing) return null;
-    const merged = { ...existing, ...updates };
-    this.memVehicles.set(id, merged);
-    return merged;
+  public async createVehicle(vehicle: Partial<IVehicle>): Promise<IVehicle> {
+    this.ensureConnection();
+    const doc = await VehicleModel.create({
+      _id: new mongoose.Types.ObjectId(),
+      driverId: vehicle.driverId,
+      make: vehicle.make,
+      model: vehicle.model,
+      year: vehicle.year,
+      color: vehicle.color,
+      plateNumber: vehicle.plateNumber,
+      category: vehicle.category || 'STANDARD',
+    });
+    return this.docToVehicle(doc);
+  }
+
+  public async updateVehicle(driverId: string, updates: Partial<IVehicle>): Promise<IVehicle | null> {
+    this.ensureConnection();
+    const doc = await VehicleModel.findOneAndUpdate(
+      { driverId },
+      { $set: updates },
+      { new: true, runValidators: true }
+    ).lean();
+    return doc ? this.docToVehicle(doc) : null;
   }
 
   // ==========================================
   // RIDE OPERATIONS
   // ==========================================
-  public async createRide(ride: IRide): Promise<IRide> {
-    this.memRides.set(ride.id, { ...ride });
-    if (isDbConnected()) {
-      try {
-        const created = await RideModel.create({
-          _id: new mongoose.Types.ObjectId(),
-          riderId: ride.riderId,
-          driverId: ride.driverId,
-          status: ride.status,
-          vehicleCategory: ride.vehicleCategory,
-          pickup: ride.pickup,
-          destination: ride.destination,
-          currentDriverLocation: ride.currentDriverLocation,
-          estimatedFare: ride.estimatedFare,
-          finalFare: ride.finalFare,
-          tip: ride.tip || 0,
-          distanceKm: ride.distanceKm,
-          durationMinutes: ride.durationMinutes,
-          paymentMethod: ride.paymentMethod,
-          paymentStatus: ride.paymentStatus,
-          cancellationReason: ride.cancellationReason,
-          cancelledBy: ride.cancelledBy,
-          startedAt: ride.startedAt ? new Date(ride.startedAt) : undefined,
-          completedAt: ride.completedAt ? new Date(ride.completedAt) : undefined,
-        });
-        const mapped = this.docToRide(created);
-        this.memRides.set(mapped.id, mapped);
-        return mapped;
-      } catch (err) {
-        console.warn('[DB Ride] Mongo insert error:', (err as Error).message);
-      }
-    }
-    return ride;
+  public async createRide(ride: Partial<IRide>): Promise<IRide> {
+    this.ensureConnection();
+    const doc = await RideModel.create({
+      _id: new mongoose.Types.ObjectId(),
+      riderId: ride.riderId,
+      driverId: ride.driverId,
+      status: ride.status || 'REQUESTED',
+      vehicleCategory: ride.vehicleCategory || 'STANDARD',
+      pickup: ride.pickup,
+      destination: ride.destination,
+      estimatedFare: ride.estimatedFare,
+      finalFare: ride.finalFare,
+      tip: ride.tip || 0,
+      distanceKm: ride.distanceKm,
+      durationMinutes: ride.durationMinutes,
+      paymentMethod: ride.paymentMethod || 'WALLET',
+      paymentStatus: ride.paymentStatus || 'PENDING',
+    });
+    return this.docToRide(doc);
   }
 
   public async findRideById(id: string): Promise<IRide | null> {
-    if (isDbConnected()) {
-      try {
-        if (mongoose.Types.ObjectId.isValid(id)) {
-          const doc = await RideModel.findById(id).lean();
-          if (doc) return this.docToRide(doc);
-        }
-      } catch {
-        // fallback
-      }
-    }
-    return this.memRides.get(id) || null;
+    this.ensureConnection();
+    const query = mongoose.Types.ObjectId.isValid(id) ? { _id: id } : { id };
+    const doc = await RideModel.findOne(query).lean();
+    return doc ? this.docToRide(doc) : null;
   }
 
   public async updateRide(id: string, updates: Partial<IRide>): Promise<IRide | null> {
-    if (isDbConnected()) {
-      try {
-        if (mongoose.Types.ObjectId.isValid(id)) {
-          const updated = await RideModel.findByIdAndUpdate(id, updates, { new: true }).lean();
-          if (updated) {
-            const mapped = this.docToRide(updated);
-            this.memRides.set(id, mapped);
-            return mapped;
-          }
-        }
-      } catch {
-        // fallback
-      }
-    }
-    const existing = this.memRides.get(id);
-    if (!existing) return null;
-    const merged = { ...existing, ...updates };
-    this.memRides.set(id, merged);
-    return merged;
+    this.ensureConnection();
+    const query = mongoose.Types.ObjectId.isValid(id) ? { _id: id } : { id };
+    const doc = await RideModel.findOneAndUpdate(
+      query,
+      { $set: { ...updates, updatedAt: new Date() } },
+      { new: true }
+    ).lean();
+    return doc ? this.docToRide(doc) : null;
   }
 
   public async findActiveRideForUser(userId: string): Promise<IRide | null> {
+    this.ensureConnection();
     const activeStatuses: RideStatus[] = [
       'REQUESTED',
       'SEARCHING_DRIVER',
@@ -513,912 +481,824 @@ export class DatabaseStore {
       'RIDE_STARTED',
     ];
 
-    if (isDbConnected()) {
-      try {
-        const doc = await RideModel.findOne({
-          $or: [{ riderId: userId }, { driverId: userId }],
-          status: { $in: activeStatuses },
-        })
-          .sort({ createdAt: -1 })
-          .lean();
-        if (doc) return this.docToRide(doc);
-      } catch {
-        // fallback
-      }
+    // Check as rider
+    let doc = await RideModel.findOne({
+      riderId: userId,
+      status: { $in: activeStatuses },
+    }).lean();
+
+    if (doc) return this.docToRide(doc);
+
+    // Check as driver
+    const driver = await this.findDriverByUserId(userId);
+    if (driver) {
+      doc = await RideModel.findOne({
+        driverId: driver.id,
+        status: { $in: activeStatuses },
+      }).lean();
+      if (doc) return this.docToRide(doc);
     }
 
-    for (const r of this.memRides.values()) {
-      if ((r.riderId === userId || r.driverId === userId) && activeStatuses.includes(r.status)) {
-        return r;
-      }
-    }
     return null;
   }
 
-  public async findRidesByUser(userId: string): Promise<IRide[]> {
-    if (isDbConnected()) {
-      try {
-        const docs = await RideModel.find({
-          $or: [{ riderId: userId }, { driverId: userId }],
-        })
-          .sort({ createdAt: -1 })
-          .lean();
-        return docs.map((d) => this.docToRide(d));
-      } catch {
-        // fallback
-      }
-    }
-    return Array.from(this.memRides.values())
-      .filter((r) => r.riderId === userId || r.driverId === userId)
-      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-  }
-
   public async getRidesByRiderId(riderId: string): Promise<IRide[]> {
-    if (isDbConnected()) {
-      try {
-        const docs = await RideModel.find({ riderId })
-          .sort({ createdAt: -1 })
-          .lean();
-        return docs.map((d) => this.docToRide(d));
-      } catch {
-        // fallback
-      }
-    }
-    return Array.from(this.memRides.values())
-      .filter((r) => r.riderId === riderId)
-      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+    this.ensureConnection();
+    const docs = await RideModel.find({ riderId }).sort({ createdAt: -1 }).lean();
+    return docs.map((d) => this.docToRide(d));
   }
 
   public async getRidesByDriverId(driverId: string): Promise<IRide[]> {
-    if (isDbConnected()) {
-      try {
-        const docs = await RideModel.find({ driverId })
-          .sort({ createdAt: -1 })
-          .lean();
-        return docs.map((d) => this.docToRide(d));
-      } catch {
-        // fallback
-      }
-    }
-    return Array.from(this.memRides.values())
-      .filter((r) => r.driverId === driverId)
-      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+    this.ensureConnection();
+    const docs = await RideModel.find({ driverId }).sort({ createdAt: -1 }).lean();
+    return docs.map((d) => this.docToRide(d));
   }
 
-  public async atomicAcceptRide(
-    rideId: string,
-    driverId: string
-  ): Promise<{ success: boolean; ride?: IRide; message: string }> {
-    const lockKey = `ride_accept:${rideId}`;
-    const locked = await acquireLock(lockKey, 10000);
-    if (!locked) {
-      return { success: false, message: 'Another driver is currently accepting this ride.' };
-    }
-
-    try {
-      if (isDbConnected()) {
-        try {
-          if (mongoose.Types.ObjectId.isValid(rideId)) {
-            const updated = await RideModel.findOneAndUpdate(
-              { _id: rideId, status: { $in: ['REQUESTED', 'SEARCHING_DRIVER'] } },
-              { $set: { status: 'DRIVER_ASSIGNED', driverId } },
-              { new: true }
-            ).lean();
-
-            if (!updated) {
-              return { success: false, message: 'Ride is no longer available or was already accepted.' };
-            }
-            const mapped = this.docToRide(updated);
-            this.memRides.set(rideId, mapped);
-            return { success: true, ride: mapped, message: 'Ride accepted successfully.' };
-          }
-        } catch {
-          // fallback
-        }
-      }
-
-      const ride = this.memRides.get(rideId);
-      if (!ride || !['REQUESTED', 'SEARCHING_DRIVER'].includes(ride.status)) {
-        return { success: false, message: 'Ride is no longer available or was already accepted.' };
-      }
-
-      ride.status = 'DRIVER_ASSIGNED';
-      ride.driverId = driverId;
-      ride.updatedAt = new Date().toISOString();
-      this.memRides.set(rideId, ride);
-      return { success: true, ride, message: 'Ride accepted successfully.' };
-    } finally {
-      await releaseLock(lockKey);
-    }
+  public async getAllRides(): Promise<IRide[]> {
+    this.ensureConnection();
+    const docs = await RideModel.find().sort({ createdAt: -1 }).lean();
+    return docs.map((d) => this.docToRide(d));
   }
 
   public async atomicTransitionRide(
     rideId: string,
     nextStatus: RideStatus,
-    allowedPriorStatuses: RideStatus[],
+    allowedCurrentStatuses: RideStatus[],
     additionalUpdates?: Partial<IRide>
-  ): Promise<{ success: boolean; ride?: IRide; error?: string }> {
-    if (isDbConnected()) {
-      try {
-        if (mongoose.Types.ObjectId.isValid(rideId)) {
-          const updated = await RideModel.findOneAndUpdate(
-            { _id: rideId, status: { $in: allowedPriorStatuses } },
-            { $set: { status: nextStatus, ...(additionalUpdates || {}) } },
-            { new: true }
-          ).lean();
+  ): Promise<{ success: boolean; ride?: IRide; message?: string }> {
+    this.ensureConnection();
+    const lockKey = `ride_transition:${rideId}`;
+    const acquired = await acquireLock(lockKey, 5000);
+    if (!acquired) {
+      return { success: false, message: 'Conflict: Ride update is currently being processed by another worker.' };
+    }
 
-          if (!updated) {
-            return { success: false, error: 'Illegal transition: ride is not in expected prior status.' };
-          }
-          const mapped = this.docToRide(updated);
-          this.memRides.set(rideId, mapped);
-          return { success: true, ride: mapped };
-        }
-      } catch {
-        // fallback
+    try {
+      const query = mongoose.Types.ObjectId.isValid(rideId) ? { _id: rideId } : { id: rideId };
+      const updateData: any = { status: nextStatus, updatedAt: new Date(), ...(additionalUpdates || {}) };
+
+      if (nextStatus === 'RIDE_STARTED' && !updateData.startedAt) {
+        updateData.startedAt = new Date();
+      } else if (nextStatus === 'RIDE_COMPLETED' && !updateData.completedAt) {
+        updateData.completedAt = new Date();
       }
-    }
 
-    const ride = this.memRides.get(rideId);
-    if (!ride) {
-      return { success: false, error: 'Ride not found' };
-    }
+      const updatedDoc = await RideModel.findOneAndUpdate(
+        { ...query, status: { $in: allowedCurrentStatuses } },
+        { $set: updateData },
+        { new: true }
+      ).lean();
 
-    if (!allowedPriorStatuses.includes(ride.status)) {
-      return {
-        success: false,
-        error: `Cannot transition ride from '${ride.status}' to '${nextStatus}'.`,
-      };
-    }
+      if (!updatedDoc) {
+        const current = await this.findRideById(rideId);
+        return {
+          success: false,
+          message: `Cannot transition ride from current status '${current?.status}' to '${nextStatus}'.`,
+        };
+      }
 
-    ride.status = nextStatus;
-    if (additionalUpdates) {
-      Object.assign(ride, additionalUpdates);
+      return { success: true, ride: this.docToRide(updatedDoc) };
+    } finally {
+      await releaseLock(lockKey);
     }
-    ride.updatedAt = new Date().toISOString();
-    this.memRides.set(rideId, ride);
-    return { success: true, ride };
   }
 
-  public async logAudit(
-    userId: string | undefined,
-    action: string,
-    details: Record<string, unknown>,
-    ip?: string
-  ): Promise<void> {
-    await this.createAuditLog({
-      id: 'aud_' + Math.random().toString(36).substring(2, 9),
-      userId,
-      action,
-      details,
-      ip,
-      timestamp: new Date().toISOString(),
-    });
-  }
-
-  public async getAllRides(): Promise<IRide[]> {
-    if (isDbConnected()) {
-      try {
-        const docs = await RideModel.find().sort({ createdAt: -1 }).lean();
-        return docs.map((d) => this.docToRide(d));
-      } catch {
-        // fallback
-      }
+  public async atomicAcceptRide(
+    rideId: string,
+    driverId: string
+  ): Promise<{ success: boolean; ride?: IRide; message?: string }> {
+    this.ensureConnection();
+    const lockKey = `ride_claim:${rideId}`;
+    const acquired = await acquireLock(lockKey, 8000);
+    if (!acquired) {
+      return { success: false, message: 'This ride is currently being claimed by another captain.' };
     }
-    return Array.from(this.memRides.values()).sort(
-      (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
-    );
+
+    try {
+      const query = mongoose.Types.ObjectId.isValid(rideId) ? { _id: rideId } : { id: rideId };
+      const updatedDoc = await RideModel.findOneAndUpdate(
+        {
+          ...query,
+          status: { $in: ['REQUESTED', 'SEARCHING_DRIVER'] },
+          driverId: { $exists: false },
+        },
+        {
+          $set: {
+            status: 'DRIVER_ASSIGNED',
+            driverId,
+            updatedAt: new Date(),
+          },
+        },
+        { new: true }
+      ).lean();
+
+      if (!updatedDoc) {
+        return { success: false, message: 'Ride has already been accepted by another captain or was cancelled.' };
+      }
+
+      return { success: true, ride: this.docToRide(updatedDoc) };
+    } finally {
+      await releaseLock(lockKey);
+    }
   }
 
   // ==========================================
-  // WALLET & FINANCIAL TRANSACTIONS (ATOMIC)
+  // WALLET & FINANCIAL OPERATIONS
   // ==========================================
   public async getOrCreateWallet(userId: string): Promise<IWallet> {
-    if (isDbConnected()) {
+    this.ensureConnection();
+    let doc = await WalletModel.findOne({ userId }).lean();
+    if (!doc) {
       try {
-        let doc = await WalletModel.findOne({ userId }).lean();
-        if (!doc) {
-          doc = await WalletModel.create({
-            _id: new mongoose.Types.ObjectId(),
-            userId,
-            balance: 0,
-            currency: 'SAR',
-          });
-        }
-        const mapped: IWallet = {
-          id: doc._id?.toString() || doc.id,
-          userId: doc.userId,
-          balance: doc.balance,
-          currency: doc.currency,
-          updatedAt: doc.updatedAt?.toISOString?.() || doc.updatedAt,
-        };
-        this.memWallets.set(userId, mapped);
-        return mapped;
-      } catch {
-        // fallback
-      }
-    }
-
-    const existing = this.memWallets.get(userId);
-    if (existing) return existing;
-
-    const wallet: IWallet = {
-      id: 'wal_' + Math.random().toString(36).substring(2, 9),
-      userId,
-      balance: 0,
-      currency: 'SAR',
-      updatedAt: new Date().toISOString(),
-    };
-    this.memWallets.set(userId, wallet);
-    return wallet;
-  }
-
-  /**
-   * Atomic Credit Wallet: guarantees accurate balance and audit transaction log
-   */
-  public async creditWallet(
-    userId: string,
-    amount: number,
-    reason: string,
-    referenceId?: string,
-    idempotencyKey?: string
-  ): Promise<{ wallet: IWallet; transaction: IWalletTransaction }> {
-    if (amount <= 0) {
-      throw new Error('Credit amount must be positive.');
-    }
-
-    if (isDbConnected()) {
-      try {
-        const walletDoc = await WalletModel.findOneAndUpdate(
-          { userId },
-          { $inc: { balance: amount } },
-          { new: true, upsert: true }
-        ).lean();
-
-        const txDoc = await WalletTransactionModel.create({
+        const created = await WalletModel.create({
           _id: new mongoose.Types.ObjectId(),
-          walletId: walletDoc._id.toString(),
           userId,
-          type: 'CREDIT',
-          amount,
-          balanceAfter: walletDoc.balance,
-          reason,
-          referenceId,
-          idempotencyKey,
+          balance: 0,
+          currency: 'SAR',
         });
-
-        const wallet: IWallet = {
-          id: walletDoc._id.toString(),
-          userId: walletDoc.userId,
-          balance: walletDoc.balance,
-          currency: walletDoc.currency,
-          updatedAt: walletDoc.updatedAt.toISOString(),
-        };
-
-        const transaction: IWalletTransaction = {
-          id: txDoc._id.toString(),
-          walletId: walletDoc._id.toString(),
-          userId,
-          type: 'CREDIT',
-          amount,
-          balanceAfter: walletDoc.balance,
-          reason,
-          referenceId,
-          createdAt: txDoc.createdAt.toISOString(),
-        };
-
-        this.memWallets.set(userId, wallet);
-        this.memTransactions.set(transaction.id, transaction);
-        return { wallet, transaction };
-      } catch (err: any) {
-        if (err.code === 11000 && idempotencyKey) {
-          throw new Error('DUPLICATE_TRANSACTION: Idempotency key already processed.');
-        }
+        doc = created.toObject();
+      } catch {
+        // Race condition: another request created it
+        doc = await WalletModel.findOne({ userId }).lean();
       }
     }
 
-    // Memory atomic operation
-    const wallet = await this.getOrCreateWallet(userId);
-    wallet.balance += amount;
-    wallet.updatedAt = new Date().toISOString();
-
-    const transaction: IWalletTransaction = {
-      id: 'tx_' + Math.random().toString(36).substring(2, 9),
-      walletId: wallet.id,
-      userId,
-      type: 'CREDIT',
-      amount,
-      balanceAfter: wallet.balance,
-      reason,
-      referenceId,
-      createdAt: new Date().toISOString(),
+    return {
+      id: doc!._id.toString(),
+      userId: doc!.userId,
+      balance: doc!.balance,
+      currency: doc!.currency || 'SAR',
+      updatedAt: doc!.updatedAt?.toISOString?.() || new Date(doc!.updatedAt).toISOString(),
     };
-
-    this.memTransactions.set(transaction.id, transaction);
-    this.memWallets.set(userId, wallet);
-    return { wallet, transaction };
   }
 
-  /**
-   * Atomic Debit Wallet: prevents negative balance and double-spending
-   */
   public async debitWallet(
     userId: string,
     amount: number,
-    reason: string,
-    referenceId?: string
+    description: string,
+    referenceId?: string,
+    idempotencyKey?: string
   ): Promise<{ wallet: IWallet; transaction: IWalletTransaction }> {
+    this.ensureConnection();
     if (amount <= 0) {
-      throw new Error('Debit amount must be positive.');
+      throw new AppError('Debit amount must be greater than zero', 400, 'INVALID_AMOUNT');
     }
 
-    if (isDbConnected()) {
-      try {
-        // Atomic query matching balance >= amount
-        const walletDoc = await WalletModel.findOneAndUpdate(
-          { userId, balance: { $gte: amount } },
-          { $inc: { balance: -amount } },
-          { new: true }
-        ).lean();
-
-        if (!walletDoc) {
-          throw new Error('INSUFFICIENT_FUNDS: Wallet balance is insufficient for this debit.');
-        }
-
-        const txDoc = await WalletTransactionModel.create({
-          _id: new mongoose.Types.ObjectId(),
-          walletId: walletDoc._id.toString(),
-          userId,
-          type: 'DEBIT',
-          amount,
-          balanceAfter: walletDoc.balance,
-          reason,
-          referenceId,
-        });
-
-        const wallet: IWallet = {
-          id: walletDoc._id.toString(),
-          userId: walletDoc.userId,
-          balance: walletDoc.balance,
-          currency: walletDoc.currency,
-          updatedAt: walletDoc.updatedAt.toISOString(),
+    // Idempotency verification
+    if (idempotencyKey) {
+      const existingTx = await WalletTransactionModel.findOne({ idempotencyKey }).lean();
+      if (existingTx) {
+        const wallet = await this.getOrCreateWallet(userId);
+        return {
+          wallet,
+          transaction: {
+            id: existingTx._id.toString(),
+            walletId: existingTx.walletId,
+            userId: existingTx.userId,
+            amount: existingTx.amount,
+            type: existingTx.type,
+            balanceAfter: existingTx.balanceAfter,
+            reason: (existingTx as any).reason || (existingTx as any).description || '',
+            referenceId: existingTx.referenceId,
+            createdAt: existingTx.createdAt.toISOString(),
+          },
         };
-
-        const transaction: IWalletTransaction = {
-          id: txDoc._id.toString(),
-          walletId: walletDoc._id.toString(),
-          userId,
-          type: 'DEBIT',
-          amount,
-          balanceAfter: walletDoc.balance,
-          reason,
-          referenceId,
-          createdAt: txDoc.createdAt.toISOString(),
-        };
-
-        this.memWallets.set(userId, wallet);
-        this.memTransactions.set(transaction.id, transaction);
-        return { wallet, transaction };
-      } catch (err: any) {
-        if (err.message.includes('INSUFFICIENT_FUNDS')) throw err;
       }
     }
 
-    // Memory fallback
-    const wallet = await this.getOrCreateWallet(userId);
-    if (wallet.balance < amount) {
-      throw new Error('INSUFFICIENT_FUNDS: Wallet balance is insufficient for this debit.');
+    // Atomic conditional decrement: balance MUST be >= amount
+    const updatedWalletDoc = await WalletModel.findOneAndUpdate(
+      { userId, balance: { $gte: amount } },
+      { $inc: { balance: -amount }, $set: { updatedAt: new Date() } },
+      { new: true }
+    ).lean();
+
+    if (!updatedWalletDoc) {
+      const current = await this.getOrCreateWallet(userId);
+      throw new AppError(
+        `Insufficient wallet balance. Available: ${current.balance.toFixed(2)} SAR, required: ${amount.toFixed(2)} SAR.`,
+        400,
+        'INSUFFICIENT_FUNDS'
+      );
     }
 
-    wallet.balance -= amount;
-    wallet.updatedAt = new Date().toISOString();
-
-    const transaction: IWalletTransaction = {
-      id: 'tx_' + Math.random().toString(36).substring(2, 9),
-      walletId: wallet.id,
+    const txDoc = await WalletTransactionModel.create({
+      _id: new mongoose.Types.ObjectId(),
+      walletId: updatedWalletDoc._id.toString(),
       userId,
-      type: 'DEBIT',
       amount,
-      balanceAfter: wallet.balance,
-      reason,
+      type: 'DEBIT',
+      balanceAfter: updatedWalletDoc.balance,
+      reason: description,
       referenceId,
-      createdAt: new Date().toISOString(),
-    };
+      idempotencyKey,
+    });
 
-    this.memTransactions.set(transaction.id, transaction);
-    this.memWallets.set(userId, wallet);
-    return { wallet, transaction };
+    return {
+      wallet: {
+        id: updatedWalletDoc._id.toString(),
+        userId: updatedWalletDoc.userId,
+        balance: updatedWalletDoc.balance,
+        currency: updatedWalletDoc.currency,
+        updatedAt: updatedWalletDoc.updatedAt.toISOString(),
+      },
+      transaction: {
+        id: txDoc._id.toString(),
+        walletId: txDoc.walletId,
+        userId: txDoc.userId,
+        amount: txDoc.amount,
+        type: txDoc.type,
+        balanceAfter: txDoc.balanceAfter,
+        reason: txDoc.reason,
+        referenceId: txDoc.referenceId,
+        createdAt: txDoc.createdAt.toISOString(),
+      },
+    };
+  }
+
+  public async creditWallet(
+    userId: string,
+    amount: number,
+    description: string,
+    referenceId?: string,
+    idempotencyKey?: string
+  ): Promise<{ wallet: IWallet; transaction: IWalletTransaction }> {
+    this.ensureConnection();
+    if (amount <= 0) {
+      throw new AppError('Credit amount must be greater than zero', 400, 'INVALID_AMOUNT');
+    }
+
+    // Idempotency verification
+    if (idempotencyKey) {
+      const existingTx = await WalletTransactionModel.findOne({ idempotencyKey }).lean();
+      if (existingTx) {
+        const wallet = await this.getOrCreateWallet(userId);
+        return {
+          wallet,
+          transaction: {
+            id: existingTx._id.toString(),
+            walletId: existingTx.walletId,
+            userId: existingTx.userId,
+            amount: existingTx.amount,
+            type: existingTx.type,
+            balanceAfter: existingTx.balanceAfter,
+            reason: (existingTx as any).reason || (existingTx as any).description || '',
+            referenceId: existingTx.referenceId,
+            createdAt: existingTx.createdAt.toISOString(),
+          },
+        };
+      }
+    }
+
+    // Ensure wallet exists, then atomic increment
+    await this.getOrCreateWallet(userId);
+    const updatedWalletDoc = await WalletModel.findOneAndUpdate(
+      { userId },
+      { $inc: { balance: amount }, $set: { updatedAt: new Date() } },
+      { new: true }
+    ).lean();
+
+    const txDoc = await WalletTransactionModel.create({
+      _id: new mongoose.Types.ObjectId(),
+      walletId: updatedWalletDoc!._id.toString(),
+      userId,
+      amount,
+      type: 'CREDIT',
+      balanceAfter: updatedWalletDoc!.balance,
+      reason: description,
+      referenceId,
+      idempotencyKey,
+    });
+
+    return {
+      wallet: {
+        id: updatedWalletDoc!._id.toString(),
+        userId: updatedWalletDoc!.userId,
+        balance: updatedWalletDoc!.balance,
+        currency: updatedWalletDoc!.currency,
+        updatedAt: updatedWalletDoc!.updatedAt.toISOString(),
+      },
+      transaction: {
+        id: txDoc._id.toString(),
+        walletId: txDoc.walletId,
+        userId: txDoc.userId,
+        amount: txDoc.amount,
+        type: txDoc.type,
+        balanceAfter: txDoc.balanceAfter,
+        reason: txDoc.reason,
+        referenceId: txDoc.referenceId,
+        createdAt: txDoc.createdAt.toISOString(),
+      },
+    };
+  }
+
+  public async settleRidePaymentWallet(params: {
+    rideId: string;
+    riderId: string;
+    driverId?: string;
+    amount: number;
+    idempotencyKey?: string;
+  }): Promise<{ success: boolean; transactionId: string }> {
+    this.ensureConnection();
+    const { rideId, riderId, driverId, amount, idempotencyKey } = params;
+
+    // Check idempotency on ride payment first
+    const existingPayment = await PaymentModel.findOne({ rideId, status: 'SUCCEEDED' }).lean();
+    if (existingPayment) {
+      return { success: true, transactionId: existingPayment._id.toString() };
+    }
+
+    // Debit rider
+    const debitResult = await this.debitWallet(
+      riderId,
+      amount,
+      `Payment for ride #${rideId.slice(0, 8)}`,
+      rideId,
+      idempotencyKey ? `${idempotencyKey}_debit` : undefined
+    );
+
+    // Credit driver (80% net earnings after 20% platform commission)
+    if (driverId) {
+      const driver = await this.findDriverById(driverId);
+      if (driver) {
+        const driverEarning = Math.round(amount * 0.8 * 100) / 100;
+        await this.creditWallet(
+          driver.userId,
+          driverEarning,
+          `Net earnings for ride #${rideId.slice(0, 8)} (80%)`,
+          rideId,
+          idempotencyKey ? `${idempotencyKey}_driver_credit` : undefined
+        );
+        await DriverModel.findByIdAndUpdate(driver.id, {
+          $inc: { earningsTotal: driverEarning, totalRides: 1 },
+        });
+      }
+    }
+
+    // Update ride payment status
+    await this.updateRide(rideId, {
+      paymentStatus: 'SUCCEEDED',
+      paymentMethod: 'WALLET',
+      finalFare: amount,
+    });
+
+    // Create payment record
+    const payment = await this.createPayment({
+      rideId,
+      userId: riderId,
+      amount,
+      currency: 'SAR',
+      status: 'SUCCEEDED',
+      paymentMethod: 'WALLET',
+      idempotencyKey,
+    });
+
+    return { success: true, transactionId: payment.id };
   }
 
   public async getTransactionsForUser(userId: string): Promise<IWalletTransaction[]> {
-    if (isDbConnected()) {
-      try {
-        const docs = await WalletTransactionModel.find({ userId })
-          .sort({ createdAt: -1 })
-          .limit(50)
-          .lean();
-        return docs.map((d) => ({
-          id: d._id.toString(),
-          walletId: d.walletId,
-          userId: d.userId,
-          type: d.type as 'CREDIT' | 'DEBIT',
-          amount: d.amount,
-          balanceAfter: d.balanceAfter,
-          reason: d.reason,
-          referenceId: d.referenceId,
-          createdAt: d.createdAt.toISOString(),
-        }));
-      } catch {
-        // fallback
-      }
-    }
-    return Array.from(this.memTransactions.values())
-      .filter((t) => t.userId === userId)
-      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+    this.ensureConnection();
+    const docs = await WalletTransactionModel.find({ userId })
+      .sort({ createdAt: -1 })
+      .lean();
+    return docs.map((d) => ({
+      id: d._id.toString(),
+      walletId: d.walletId,
+      userId: d.userId,
+      amount: d.amount,
+      type: d.type,
+      balanceAfter: d.balanceAfter,
+      reason: (d as any).reason || (d as any).description || '',
+      referenceId: d.referenceId,
+      createdAt: d.createdAt.toISOString(),
+    }));
   }
 
   // ==========================================
   // PAYMENT OPERATIONS
   // ==========================================
-  public async createPayment(payment: IPayment): Promise<IPayment> {
-    this.memPayments.set(payment.id, { ...payment });
-    if (isDbConnected()) {
-      try {
-        const created = await PaymentModel.create({
-          _id: new mongoose.Types.ObjectId(),
-          rideId: payment.rideId,
-          userId: payment.userId,
-          amount: payment.amount,
-          currency: payment.currency || 'SAR',
-          status: payment.status,
-          paymentMethod: payment.paymentMethod,
-          stripePaymentIntentId: payment.stripePaymentIntentId,
-          stripeClientSecret: payment.stripeClientSecret,
-          idempotencyKey: payment.idempotencyKey,
-          metadata: payment.metadata,
-        });
-        const mapped: IPayment = {
-          id: created._id.toString(),
-          rideId: created.rideId,
-          userId: created.userId,
-          amount: created.amount,
-          currency: created.currency,
-          status: created.status as any,
-          paymentMethod: created.paymentMethod as any,
-          stripePaymentIntentId: created.stripePaymentIntentId,
-          stripeClientSecret: created.stripeClientSecret,
-          idempotencyKey: created.idempotencyKey,
-          createdAt: created.createdAt.toISOString(),
-        };
-        this.memPayments.set(mapped.id, mapped);
-        return mapped;
-      } catch (err) {
-        console.warn('[DB Payment] Mongo insert error:', (err as Error).message);
-      }
-    }
-    return payment;
+  public async createPayment(payment: Partial<IPayment>): Promise<IPayment> {
+    this.ensureConnection();
+    const doc = await PaymentModel.create({
+      _id: new mongoose.Types.ObjectId(),
+      rideId: payment.rideId,
+      userId: payment.userId,
+      amount: payment.amount,
+      currency: payment.currency || 'SAR',
+      status: payment.status || 'PENDING',
+      paymentMethod: payment.paymentMethod || 'WALLET',
+      stripePaymentIntentId: payment.stripePaymentIntentId,
+      stripeClientSecret: payment.stripeClientSecret,
+      idempotencyKey: payment.idempotencyKey,
+    });
+    return {
+      id: doc._id.toString(),
+      rideId: doc.rideId,
+      userId: doc.userId,
+      amount: doc.amount,
+      currency: doc.currency,
+      status: doc.status,
+      paymentMethod: doc.paymentMethod,
+      stripePaymentIntentId: doc.stripePaymentIntentId,
+      stripeClientSecret: doc.stripeClientSecret,
+      idempotencyKey: doc.idempotencyKey,
+      createdAt: doc.createdAt.toISOString(),
+    };
   }
 
   public async findPaymentById(id: string): Promise<IPayment | null> {
-    if (isDbConnected()) {
-      try {
-        if (mongoose.Types.ObjectId.isValid(id)) {
-          const doc = await PaymentModel.findById(id).lean();
-          if (doc) {
-            return {
-              id: doc._id.toString(),
-              rideId: doc.rideId,
-              userId: doc.userId,
-              amount: doc.amount,
-              currency: doc.currency,
-              status: doc.status as any,
-              paymentMethod: doc.paymentMethod as any,
-              stripePaymentIntentId: doc.stripePaymentIntentId,
-              stripeClientSecret: doc.stripeClientSecret,
-              idempotencyKey: doc.idempotencyKey,
-              createdAt: doc.createdAt.toISOString(),
-            };
-          }
-        }
-      } catch {
-        // fallback
-      }
-    }
-    return this.memPayments.get(id) || null;
+    this.ensureConnection();
+    const query = mongoose.Types.ObjectId.isValid(id) ? { _id: id } : { id };
+    const doc = await PaymentModel.findOne(query).lean();
+    if (!doc) return null;
+    return {
+      id: doc._id.toString(),
+      rideId: doc.rideId,
+      userId: doc.userId,
+      amount: doc.amount,
+      currency: doc.currency,
+      status: doc.status,
+      paymentMethod: doc.paymentMethod,
+      stripePaymentIntentId: doc.stripePaymentIntentId,
+      stripeClientSecret: doc.stripeClientSecret,
+      idempotencyKey: doc.idempotencyKey,
+      createdAt: doc.createdAt.toISOString(),
+    };
+  }
+
+  public async findPaymentByRideId(rideId: string): Promise<IPayment | null> {
+    this.ensureConnection();
+    const doc = await PaymentModel.findOne({ rideId }).sort({ createdAt: -1 }).lean();
+    if (!doc) return null;
+    return {
+      id: doc._id.toString(),
+      rideId: doc.rideId,
+      userId: doc.userId,
+      amount: doc.amount,
+      currency: doc.currency,
+      status: doc.status,
+      paymentMethod: doc.paymentMethod,
+      stripePaymentIntentId: doc.stripePaymentIntentId,
+      stripeClientSecret: doc.stripeClientSecret,
+      idempotencyKey: doc.idempotencyKey,
+      createdAt: doc.createdAt.toISOString(),
+    };
   }
 
   public async findPaymentByStripeIntent(intentId: string): Promise<IPayment | null> {
-    if (isDbConnected()) {
-      try {
-        const doc = await PaymentModel.findOne({ stripePaymentIntentId: intentId }).lean();
-        if (doc) {
-          return {
-            id: doc._id.toString(),
-            rideId: doc.rideId,
-            userId: doc.userId,
-            amount: doc.amount,
-            currency: doc.currency,
-            status: doc.status as any,
-            paymentMethod: doc.paymentMethod as any,
-            stripePaymentIntentId: doc.stripePaymentIntentId,
-            stripeClientSecret: doc.stripeClientSecret,
-            idempotencyKey: doc.idempotencyKey,
-            createdAt: doc.createdAt.toISOString(),
-          };
-        }
-      } catch {
-        // fallback
-      }
-    }
-    for (const p of this.memPayments.values()) {
-      if (p.stripePaymentIntentId === intentId) return p;
-    }
-    return null;
+    this.ensureConnection();
+    const doc = await PaymentModel.findOne({ stripePaymentIntentId: intentId }).lean();
+    if (!doc) return null;
+    return {
+      id: doc._id.toString(),
+      rideId: doc.rideId,
+      userId: doc.userId,
+      amount: doc.amount,
+      currency: doc.currency,
+      status: doc.status,
+      paymentMethod: doc.paymentMethod,
+      stripePaymentIntentId: doc.stripePaymentIntentId,
+      stripeClientSecret: doc.stripeClientSecret,
+      idempotencyKey: doc.idempotencyKey,
+      createdAt: doc.createdAt.toISOString(),
+    };
   }
 
   public async updatePayment(id: string, updates: Partial<IPayment>): Promise<IPayment | null> {
-    if (isDbConnected()) {
-      try {
-        if (mongoose.Types.ObjectId.isValid(id)) {
-          const updated = await PaymentModel.findByIdAndUpdate(id, updates, { new: true }).lean();
-          if (updated) {
-            const mapped: IPayment = {
-              id: updated._id.toString(),
-              rideId: updated.rideId,
-              userId: updated.userId,
-              amount: updated.amount,
-              currency: updated.currency,
-              status: updated.status as any,
-              paymentMethod: updated.paymentMethod as any,
-              stripePaymentIntentId: updated.stripePaymentIntentId,
-              stripeClientSecret: updated.stripeClientSecret,
-              idempotencyKey: updated.idempotencyKey,
-              createdAt: updated.createdAt.toISOString(),
-            };
-            this.memPayments.set(id, mapped);
-            return mapped;
-          }
-        }
-      } catch {
-        // fallback
-      }
-    }
-    const existing = this.memPayments.get(id);
-    if (!existing) return null;
-    const merged = { ...existing, ...updates };
-    this.memPayments.set(id, merged);
-    return merged;
+    this.ensureConnection();
+    const query = mongoose.Types.ObjectId.isValid(id) ? { _id: id } : { id };
+    const doc = await PaymentModel.findOneAndUpdate(query, { $set: updates }, { new: true }).lean();
+    if (!doc) return null;
+    return {
+      id: doc._id.toString(),
+      rideId: doc.rideId,
+      userId: doc.userId,
+      amount: doc.amount,
+      currency: doc.currency,
+      status: doc.status,
+      paymentMethod: doc.paymentMethod,
+      stripePaymentIntentId: doc.stripePaymentIntentId,
+      stripeClientSecret: doc.stripeClientSecret,
+      idempotencyKey: doc.idempotencyKey,
+      createdAt: doc.createdAt.toISOString(),
+    };
+  }
+
+  // ==========================================
+  // WEBHOOK IDEMPOTENCY & AUDITING
+  // ==========================================
+  public async isWebhookProcessed(eventId: string): Promise<boolean> {
+    this.ensureConnection();
+    const count = await WebhookEventModel.countDocuments({ eventId, status: 'PROCESSED' });
+    return count > 0;
+  }
+
+  public async recordProcessedWebhook(
+    eventId: string,
+    source: string,
+    type: string,
+    payload?: any,
+    status: 'PROCESSED' | 'FAILED' = 'PROCESSED',
+    errorMessage?: string
+  ): Promise<void> {
+    this.ensureConnection();
+    await WebhookEventModel.updateOne(
+      { eventId },
+      {
+        $set: {
+          eventId,
+          source,
+          type,
+          payload,
+          status,
+          errorMessage,
+          processedAt: new Date(),
+        },
+      },
+      { upsert: true }
+    );
   }
 
   // ==========================================
   // RATING OPERATIONS
   // ==========================================
-  public async createRating(rating: IRating): Promise<IRating> {
-    this.memRatings.set(rating.id, { ...rating });
-    if (isDbConnected()) {
-      try {
-        const created = await RatingModel.create({
-          _id: new mongoose.Types.ObjectId(),
-          rideId: rating.rideId,
-          fromUserId: rating.fromUserId,
-          toUserId: rating.toUserId,
-          stars: rating.stars,
-          comment: rating.comment,
-        });
-        const mapped: IRating = {
-          id: created._id.toString(),
-          rideId: created.rideId,
-          fromUserId: created.fromUserId,
-          toUserId: created.toUserId,
-          stars: created.stars,
-          comment: created.comment,
-          createdAt: created.createdAt.toISOString(),
-        };
-        this.memRatings.set(mapped.id, mapped);
-        return mapped;
-      } catch (err) {
-        console.warn('[DB Rating] Mongo insert error:', (err as Error).message);
-      }
+  public async createRating(rating: Partial<IRating>): Promise<IRating> {
+    this.ensureConnection();
+    const stars = rating.stars ?? (rating as any).score ?? 5;
+    const doc = await RatingModel.create({
+      _id: new mongoose.Types.ObjectId(),
+      rideId: rating.rideId,
+      fromUserId: rating.fromUserId,
+      toUserId: rating.toUserId,
+      stars,
+      comment: rating.comment,
+    });
+
+    // Recalculate target driver rating if applicable
+    const targetDriver = await this.findDriverByUserId(rating.toUserId!);
+    if (targetDriver) {
+      const allRatings = await RatingModel.find({ toUserId: rating.toUserId }).lean();
+      const avg = allRatings.reduce((sum, r) => sum + (r.stars || (r as any).score || 5), 0) / allRatings.length;
+      await this.updateDriver(targetDriver.id, { rating: Math.round(avg * 10) / 10 });
     }
-    return rating;
+
+    return {
+      id: doc._id.toString(),
+      rideId: doc.rideId,
+      fromUserId: doc.fromUserId,
+      toUserId: doc.toUserId,
+      stars: doc.stars,
+      comment: doc.comment,
+      createdAt: doc.createdAt.toISOString(),
+    };
   }
 
-  public async getRatingsForUser(toUserId: string): Promise<IRating[]> {
-    if (isDbConnected()) {
-      try {
-        const docs = await RatingModel.find({ toUserId }).lean();
-        return docs.map((d) => ({
-          id: d._id.toString(),
-          rideId: d.rideId,
-          fromUserId: d.fromUserId,
-          toUserId: d.toUserId,
-          stars: d.stars,
-          comment: d.comment,
-          createdAt: d.createdAt.toISOString(),
-        }));
-      } catch {
-        // fallback
-      }
-    }
-    return Array.from(this.memRatings.values()).filter((r) => r.toUserId === toUserId);
+  public async getRatingsForUser(userId: string): Promise<IRating[]> {
+    this.ensureConnection();
+    const docs = await RatingModel.find({ toUserId: userId }).sort({ createdAt: -1 }).lean();
+    return docs.map((d) => ({
+      id: d._id.toString(),
+      rideId: d.rideId,
+      fromUserId: d.fromUserId,
+      toUserId: d.toUserId,
+      stars: d.stars ?? (d as any).score ?? 5,
+      comment: d.comment,
+      createdAt: d.createdAt.toISOString(),
+    }));
   }
 
   public async findRatingByRideAndFromUser(rideId: string, fromUserId: string): Promise<IRating | null> {
-    if (isDbConnected()) {
-      try {
-        const doc = await RatingModel.findOne({ rideId, fromUserId }).lean();
-        if (doc) {
-          return {
-            id: doc._id.toString(),
-            rideId: doc.rideId,
-            fromUserId: doc.fromUserId,
-            toUserId: doc.toUserId,
-            stars: doc.stars,
-            comment: doc.comment,
-            createdAt: doc.createdAt.toISOString(),
-          };
-        }
-      } catch {
-        // fallback
-      }
-    }
-    for (const r of this.memRatings.values()) {
-      if (r.rideId === rideId && r.fromUserId === fromUserId) return r;
-    }
-    return null;
+    this.ensureConnection();
+    const doc = await RatingModel.findOne({ rideId, fromUserId }).lean();
+    if (!doc) return null;
+    return {
+      id: doc._id.toString(),
+      rideId: doc.rideId,
+      fromUserId: doc.fromUserId,
+      toUserId: doc.toUserId,
+      stars: doc.stars ?? (doc as any).score ?? 5,
+      comment: doc.comment,
+      createdAt: doc.createdAt.toISOString(),
+    };
   }
 
   // ==========================================
-  // CHAT / MESSAGE OPERATIONS
+  // CHAT MESSAGES
   // ==========================================
-  public async createMessage(msg: IMessage): Promise<IMessage> {
-    this.memMessages.set(msg.id, { ...msg });
-    if (isDbConnected()) {
-      try {
-        const created = await MessageModel.create({
-          _id: new mongoose.Types.ObjectId(),
-          rideId: msg.rideId,
-          senderId: msg.senderId,
-          senderName: msg.senderName,
-          recipientId: msg.recipientId,
-          content: msg.content,
-          read: msg.read || false,
-        });
-        const mapped: IMessage = {
-          id: created._id.toString(),
-          rideId: created.rideId,
-          senderId: created.senderId,
-          senderName: created.senderName,
-          recipientId: created.recipientId,
-          content: created.content,
-          read: created.read,
-          createdAt: created.createdAt.toISOString(),
-        };
-        this.memMessages.set(mapped.id, mapped);
-        return mapped;
-      } catch (err) {
-        console.warn('[DB Message] Mongo insert error:', (err as Error).message);
-      }
-    }
-    return msg;
+  public async createMessage(msg: Partial<IMessage>): Promise<IMessage> {
+    this.ensureConnection();
+    const doc = await MessageModel.create({
+      _id: new mongoose.Types.ObjectId(),
+      rideId: msg.rideId,
+      senderId: msg.senderId,
+      senderName: msg.senderName,
+      recipientId: msg.recipientId,
+      content: msg.content,
+      read: false,
+    });
+    return {
+      id: doc._id.toString(),
+      rideId: doc.rideId,
+      senderId: doc.senderId,
+      senderName: doc.senderName,
+      recipientId: doc.recipientId,
+      content: doc.content,
+      createdAt: doc.createdAt.toISOString(),
+      read: doc.read,
+    };
   }
 
-  public async getMessagesForRide(rideId: string, limit: number = 100): Promise<IMessage[]> {
-    if (isDbConnected()) {
-      try {
-        const docs = await MessageModel.find({ rideId })
-          .sort({ createdAt: 1 })
-          .limit(limit)
-          .lean();
-        return docs.map((d) => ({
-          id: d._id.toString(),
-          rideId: d.rideId,
-          senderId: d.senderId,
-          senderName: d.senderName,
-          recipientId: d.recipientId,
-          content: d.content,
-          read: d.read,
-          createdAt: d.createdAt.toISOString(),
-        }));
-      } catch {
-        // fallback
-      }
-    }
-    return Array.from(this.memMessages.values())
-      .filter((m) => m.rideId === rideId)
-      .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+  public async getMessagesForRide(rideId: string): Promise<IMessage[]> {
+    this.ensureConnection();
+    const docs = await MessageModel.find({ rideId }).sort({ createdAt: 1 }).lean();
+    return docs.map((d) => ({
+      id: d._id.toString(),
+      rideId: d.rideId,
+      senderId: d.senderId,
+      senderName: d.senderName,
+      recipientId: d.recipientId,
+      content: d.content,
+      createdAt: d.createdAt.toISOString(),
+      read: d.read,
+    }));
   }
 
   // ==========================================
-  // NOTIFICATIONS OPERATIONS
+  // NOTIFICATIONS
   // ==========================================
-  public async createNotification(notif: INotification): Promise<INotification> {
-    this.memNotifications.set(notif.id, { ...notif });
-    if (isDbConnected()) {
-      try {
-        const created = await NotificationModel.create({
-          _id: new mongoose.Types.ObjectId(),
-          userId: notif.userId,
-          title: notif.title,
-          body: notif.body,
-          type: notif.type,
-          metadata: notif.metadata,
-          read: notif.read,
-        });
-        const mapped: INotification = {
-          id: created._id.toString(),
-          userId: created.userId,
-          title: created.title,
-          body: created.body,
-          type: created.type as any,
-          metadata: created.metadata,
-          read: created.read,
-          createdAt: created.createdAt.toISOString(),
-        };
-        this.memNotifications.set(mapped.id, mapped);
-        return mapped;
-      } catch (err) {
-        console.warn('[DB Notification] Mongo insert error:', (err as Error).message);
-      }
-    }
-    return notif;
+  public async createNotification(notif: Partial<INotification>): Promise<INotification> {
+    this.ensureConnection();
+    const body = notif.body || (notif as any).message || '';
+    const metadata = notif.metadata || (notif as any).data;
+    const doc = await NotificationModel.create({
+      _id: new mongoose.Types.ObjectId(),
+      userId: notif.userId,
+      title: notif.title,
+      body,
+      type: notif.type || 'SYSTEM',
+      read: false,
+      metadata,
+    });
+    return {
+      id: doc._id.toString(),
+      userId: doc.userId,
+      title: doc.title,
+      body: doc.body,
+      type: doc.type,
+      read: doc.read,
+      createdAt: doc.createdAt.toISOString(),
+      metadata: doc.metadata,
+    };
   }
 
   public async getNotificationsForUser(userId: string): Promise<INotification[]> {
-    if (isDbConnected()) {
-      try {
-        const docs = await NotificationModel.find({ userId })
-          .sort({ createdAt: -1 })
-          .limit(50)
-          .lean();
-        return docs.map((d) => ({
-          id: d._id.toString(),
-          userId: d.userId,
-          title: d.title,
-          body: d.body,
-          type: d.type as any,
-          metadata: d.metadata,
-          read: d.read,
-          createdAt: d.createdAt.toISOString(),
-        }));
-      } catch {
-        // fallback
-      }
-    }
-    return Array.from(this.memNotifications.values())
-      .filter((n) => n.userId === userId)
-      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+    this.ensureConnection();
+    const docs = await NotificationModel.find({ userId }).sort({ createdAt: -1 }).limit(50).lean();
+    return docs.map((d) => ({
+      id: d._id.toString(),
+      userId: d.userId,
+      title: d.title,
+      body: d.body || (d as any).message || '',
+      type: d.type,
+      read: d.read,
+      createdAt: d.createdAt.toISOString(),
+      metadata: d.metadata || (d as any).data,
+    }));
   }
 
   public async findNotificationById(id: string): Promise<INotification | null> {
-    if (isDbConnected()) {
-      try {
-        if (mongoose.Types.ObjectId.isValid(id)) {
-          const doc = await NotificationModel.findById(id).lean();
-          if (doc) {
-            return {
-              id: doc._id.toString(),
-              userId: doc.userId,
-              title: doc.title,
-              body: doc.body,
-              type: doc.type as any,
-              metadata: doc.metadata,
-              read: doc.read,
-              createdAt: doc.createdAt.toISOString(),
-            };
-          }
-        }
-      } catch {
-        // fallback
-      }
-    }
-    return this.memNotifications.get(id) || null;
+    this.ensureConnection();
+    const query = mongoose.Types.ObjectId.isValid(id) ? { _id: id } : { id };
+    const doc = await NotificationModel.findOne(query).lean();
+    if (!doc) return null;
+    return {
+      id: doc._id.toString(),
+      userId: doc.userId,
+      title: doc.title,
+      body: doc.body || (doc as any).message || '',
+      type: doc.type,
+      read: doc.read,
+      createdAt: doc.createdAt.toISOString(),
+      metadata: doc.metadata || (doc as any).data,
+    };
   }
 
   public async updateNotification(id: string, updates: Partial<INotification>): Promise<INotification | null> {
-    if (isDbConnected()) {
-      try {
-        if (mongoose.Types.ObjectId.isValid(id)) {
-          const updated = await NotificationModel.findByIdAndUpdate(id, updates, { new: true }).lean();
-          if (updated) {
-            const mapped: INotification = {
-              id: updated._id.toString(),
-              userId: updated.userId,
-              title: updated.title,
-              body: updated.body,
-              type: updated.type as any,
-              metadata: updated.metadata,
-              read: updated.read,
-              createdAt: updated.createdAt.toISOString(),
-            };
-            this.memNotifications.set(id, mapped);
-            return mapped;
-          }
-        }
-      } catch {
-        // fallback
-      }
-    }
-    const notif = this.memNotifications.get(id);
-    if (!notif) return null;
-    const merged = { ...notif, ...updates };
-    this.memNotifications.set(id, merged);
-    return merged;
+    this.ensureConnection();
+    const query = mongoose.Types.ObjectId.isValid(id) ? { _id: id } : { id };
+    const doc = await NotificationModel.findOneAndUpdate(query, { $set: updates }, { new: true }).lean();
+    if (!doc) return null;
+    return {
+      id: doc._id.toString(),
+      userId: doc.userId,
+      title: doc.title,
+      body: doc.body || (doc as any).message || '',
+      type: doc.type,
+      read: doc.read,
+      createdAt: doc.createdAt.toISOString(),
+      metadata: doc.metadata || (doc as any).data,
+    };
   }
 
-  public async markNotificationRead(id: string): Promise<void> {
-    if (isDbConnected()) {
-      try {
-        if (mongoose.Types.ObjectId.isValid(id)) {
-          await NotificationModel.findByIdAndUpdate(id, { read: true });
-        }
-      } catch {
-        // fallback
-      }
-    }
-    const notif = this.memNotifications.get(id);
-    if (notif) {
-      notif.read = true;
-      this.memNotifications.set(id, notif);
-    }
+  public async markNotificationRead(id: string, userId: string): Promise<boolean> {
+    this.ensureConnection();
+    const query = mongoose.Types.ObjectId.isValid(id) ? { _id: id } : { id };
+    const res = await NotificationModel.updateOne({ ...query, userId }, { $set: { read: true } });
+    return res.modifiedCount > 0;
   }
 
-  public async markAllNotificationsRead(userId: string): Promise<void> {
-    if (isDbConnected()) {
-      try {
-        await NotificationModel.updateMany({ userId }, { read: true });
-      } catch {
-        // fallback
-      }
-    }
-    for (const notif of this.memNotifications.values()) {
-      if (notif.userId === userId) {
-        notif.read = true;
-      }
-    }
+  public async markAllNotificationsRead(userId: string): Promise<number> {
+    this.ensureConnection();
+    const res = await NotificationModel.updateMany({ userId, read: false }, { $set: { read: true } });
+    return res.modifiedCount;
   }
 
   // ==========================================
-  // AUDIT LOG OPERATIONS
+  // AUDIT LOGS & PLATFORM ADMIN
   // ==========================================
-  public async createAuditLog(log: IAuditLog): Promise<IAuditLog> {
-    this.memAuditLogs.unshift({ ...log });
-    if (isDbConnected()) {
-      try {
-        await AuditLogModel.create({
-          userId: log.userId,
-          action: log.action,
-          details: log.details,
-          ip: log.ip,
-          timestamp: new Date(log.timestamp),
-        });
-      } catch (err) {
-        console.warn('[DB AuditLog] Mongo insert error:', (err as Error).message);
-      }
-    }
-    return log;
+  public async logAudit(userId: string, action: string, details?: any, ip?: string): Promise<void> {
+    this.ensureConnection();
+    await AuditLogModel.create({
+      _id: new mongoose.Types.ObjectId(),
+      userId,
+      action,
+      details,
+      ip,
+      timestamp: new Date(),
+    });
+  }
+
+  public async createAuditLog(log: Partial<IAuditLog>): Promise<IAuditLog> {
+    this.ensureConnection();
+    const doc = await AuditLogModel.create({
+      _id: new mongoose.Types.ObjectId(),
+      userId: log.userId,
+      action: log.action,
+      details: log.details,
+      ip: log.ip,
+      timestamp: new Date(),
+    });
+    return {
+      id: doc._id.toString(),
+      userId: doc.userId,
+      action: doc.action,
+      details: doc.details,
+      ip: doc.ip,
+      timestamp: doc.timestamp.toISOString(),
+    };
   }
 
   public async getAuditLogs(limit: number = 100): Promise<IAuditLog[]> {
-    if (isDbConnected()) {
-      try {
-        const docs = await AuditLogModel.find()
-          .sort({ timestamp: -1 })
-          .limit(limit)
-          .lean();
-        return docs.map((d) => ({
-          id: d._id.toString(),
-          userId: d.userId,
-          action: d.action,
-          details: d.details,
-          ip: d.ip,
-          timestamp: d.timestamp.toISOString(),
-        }));
-      } catch {
-        // fallback
-      }
-    }
-    return this.memAuditLogs.slice(0, limit);
+    this.ensureConnection();
+    const docs = await AuditLogModel.find().sort({ timestamp: -1 }).limit(limit).lean();
+    return docs.map((d) => ({
+      id: d._id.toString(),
+      userId: d.userId,
+      action: d.action,
+      details: d.details,
+      ip: d.ip,
+      timestamp: d.timestamp.toISOString(),
+    }));
+  }
+
+  public async getPlatformStats(): Promise<any> {
+    this.ensureConnection();
+    const [
+      totalUsers,
+      totalDrivers,
+      onlineDrivers,
+      pendingDrivers,
+      totalRides,
+      completedRides,
+      activeRides,
+      payments,
+    ] = await Promise.all([
+      UserModel.countDocuments(),
+      DriverModel.countDocuments(),
+      DriverModel.countDocuments({ isOnline: true, approvalStatus: 'APPROVED' }),
+      DriverModel.countDocuments({ approvalStatus: 'PENDING' }),
+      RideModel.countDocuments(),
+      RideModel.countDocuments({ status: 'RIDE_COMPLETED' }),
+      RideModel.countDocuments({
+        status: { $in: ['SEARCHING_DRIVER', 'DRIVER_ASSIGNED', 'DRIVER_ARRIVING', 'DRIVER_ARRIVED', 'RIDE_STARTED'] },
+      }),
+      PaymentModel.find({ status: 'SUCCEEDED' }).lean(),
+    ]);
+
+    const totalGMV = payments.reduce((acc, p) => acc + (p.amount || 0), 0);
+    const platformNetRevenue = Math.round(totalGMV * 0.2 * 100) / 100;
+
+    return {
+      totalUsers,
+      totalDrivers,
+      onlineDrivers,
+      pendingDrivers,
+      totalRides,
+      completedRides,
+      activeRides,
+      totalGMV: Math.round(totalGMV * 100) / 100,
+      platformNetRevenue,
+    };
   }
 
   // ==========================================
@@ -1432,101 +1312,69 @@ export class DatabaseStore {
     ip?: string;
     userAgent?: string;
   }): Promise<IRefreshSession> {
-    const entry: IRefreshSession = {
-      id: 'ses_' + Math.random().toString(36).substring(2, 9),
+    this.ensureConnection();
+    const created = await RefreshSessionModel.create({
+      _id: new mongoose.Types.ObjectId(),
       userId: session.userId,
       jti: session.jti,
       tokenHash: session.tokenHash,
-      revoked: false,
-      expiresAt: session.expiresAt.toISOString(),
+      expiresAt: session.expiresAt,
       ip: session.ip,
       userAgent: session.userAgent,
-      createdAt: new Date().toISOString(),
+    });
+    return {
+      id: created._id.toString(),
+      userId: created.userId,
+      jti: created.jti,
+      tokenHash: created.tokenHash,
+      revoked: created.revoked,
+      revokedReason: created.revokedReason,
+      expiresAt: created.expiresAt.toISOString(),
+      ip: created.ip,
+      userAgent: created.userAgent,
+      createdAt: created.createdAt.toISOString(),
     };
-    this.memSessions.set(session.jti, entry);
-
-    if (isDbConnected()) {
-      try {
-        const created = await RefreshSessionModel.create({
-          _id: new mongoose.Types.ObjectId(),
-          userId: session.userId,
-          jti: session.jti,
-          tokenHash: session.tokenHash,
-          expiresAt: session.expiresAt,
-          ip: session.ip,
-          userAgent: session.userAgent,
-        });
-        entry.id = created._id.toString();
-        this.memSessions.set(session.jti, entry);
-      } catch (err) {
-        console.warn('[DB Session] Mongo insert error:', (err as Error).message);
-      }
-    }
-    return entry;
   }
 
   public async findRefreshSessionByJti(jti: string): Promise<IRefreshSession | null> {
-    if (isDbConnected()) {
-      try {
-        const doc = await RefreshSessionModel.findOne({ jti }).lean();
-        if (doc) {
-          return {
-            id: doc._id.toString(),
-            userId: doc.userId,
-            jti: doc.jti,
-            tokenHash: doc.tokenHash,
-            revoked: doc.revoked,
-            revokedReason: doc.revokedReason,
-            expiresAt: doc.expiresAt.toISOString(),
-            ip: doc.ip,
-            userAgent: doc.userAgent,
-            createdAt: doc.createdAt.toISOString(),
-          };
-        }
-      } catch {
-        // fallback
-      }
-    }
-    return this.memSessions.get(jti) || null;
+    this.ensureConnection();
+    const doc = await RefreshSessionModel.findOne({ jti }).lean();
+    if (!doc) return null;
+    return {
+      id: doc._id.toString(),
+      userId: doc.userId,
+      jti: doc.jti,
+      tokenHash: doc.tokenHash,
+      revoked: doc.revoked,
+      revokedReason: doc.revokedReason,
+      expiresAt: doc.expiresAt.toISOString(),
+      ip: doc.ip,
+      userAgent: doc.userAgent,
+      createdAt: doc.createdAt.toISOString(),
+    };
   }
 
   public async revokeRefreshSession(jti: string, reason: string = 'LOGOUT'): Promise<void> {
-    if (isDbConnected()) {
-      try {
-        await RefreshSessionModel.findOneAndUpdate(
-          { jti },
-          { revoked: true, revokedReason: reason }
-        );
-      } catch {
-        // fallback
-      }
-    }
-    const session = this.memSessions.get(jti);
-    if (session) {
-      session.revoked = true;
-      session.revokedReason = reason;
-      this.memSessions.set(jti, session);
-    }
+    this.ensureConnection();
+    await RefreshSessionModel.findOneAndUpdate(
+      { jti },
+      { $set: { revoked: true, revokedReason: reason } }
+    );
   }
 
   public async revokeAllSessionsForUser(userId: string, reason: string = 'LOGOUT_ALL'): Promise<void> {
-    if (isDbConnected()) {
-      try {
-        await RefreshSessionModel.updateMany(
-          { userId },
-          { revoked: true, revokedReason: reason }
-        );
-      } catch {
-        // fallback
-      }
-    }
-    for (const session of this.memSessions.values()) {
-      if (session.userId === userId) {
-        session.revoked = true;
-        session.revokedReason = reason;
-      }
-    }
+    this.ensureConnection();
+    await RefreshSessionModel.updateMany(
+      { userId },
+      { $set: { revoked: true, revokedReason: reason } }
+    );
   }
 }
 
-export const db = new DatabaseStore();
+// In production, instantiate the real MongoDatabaseStore
+export let db: IDatabaseStore = new MongoDatabaseStore();
+
+// Exclusively for isolated test suites to inject a test harness store if needed
+export function setDatabaseStore(store: IDatabaseStore): void {
+  db = store;
+}

@@ -215,7 +215,7 @@ rideRouter.post('/:id/accept', async (req: Request, res: Response, next: NextFun
 
     const result = await db.atomicAcceptRide(req.params.id, driver.id);
     if (!result.success || !result.ride) {
-      throw new AppError(result.message, 409, 'RACE_CONDITION_LOST');
+      throw new AppError(result.message || 'Ride claim failed', 409, 'RACE_CONDITION_LOST');
     }
 
     await DispatchService.notifyDriverAssigned(result.ride, driver);
@@ -275,7 +275,7 @@ rideRouter.post('/:id/transition', async (req: Request, res: Response, next: Nex
 
     if (!transitionResult.success || !transitionResult.ride) {
       throw new AppError(
-        transitionResult.error || 'Illegal state transition',
+        transitionResult.message || 'Illegal state transition',
         400,
         'ILLEGAL_TRANSITION'
       );

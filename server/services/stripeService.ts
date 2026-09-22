@@ -37,16 +37,6 @@ export class StripeService {
     clientSecret: string;
     status: string;
   }> {
-    // In demo or when Stripe is not configured, simulate sandbox intent
-    if (!config.stripeSecretKey || config.demoMode) {
-      const mockId = 'pi_test_' + Math.random().toString(36).substring(2, 12);
-      return {
-        intentId: mockId,
-        clientSecret: `pi_test_${mockId}_secret_test123`,
-        status: 'requires_payment_method',
-      };
-    }
-
     const stripe = getStripe();
     // Stripe amounts are in smallest currency unit (e.g. Halalas for SAR, Cents for USD)
     const amountInSmallestUnit = Math.round(params.amount * 100);
@@ -96,13 +86,6 @@ export class StripeService {
    * Refunds a payment intent
    */
   public static async refundPayment(paymentIntentId: string, amount?: number): Promise<{ refundId: string; status: string }> {
-    if (!config.stripeSecretKey || config.demoMode) {
-      return {
-        refundId: 're_test_' + Math.random().toString(36).substring(2, 10),
-        status: 'succeeded',
-      };
-    }
-
     const stripe = getStripe();
     const refund = await stripe.refunds.create({
       payment_intent: paymentIntentId,

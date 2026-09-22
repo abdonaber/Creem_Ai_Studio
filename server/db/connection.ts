@@ -5,7 +5,10 @@ let isConnected = false;
 
 export async function connectDB(): Promise<boolean> {
   if (!config.mongodbUri) {
-    console.log('[DB] No MONGODB_URI provided. Running in high-performance transactional in-memory store mode for development/demo.');
+    if (config.isProduction) {
+      throw new Error('FATAL: MONGODB_URI environment variable is required in production!');
+    }
+    console.warn('[DB] Warning: MONGODB_URI is not set. Persistent database operations will fail until MongoDB is configured.');
     return false;
   }
 
@@ -14,11 +17,15 @@ export async function connectDB(): Promise<boolean> {
       serverSelectionTimeoutMS: 5000,
     });
     isConnected = true;
-    console.log('[DB] Connected successfully to MongoDB Atlas cluster.');
+    console.log('[DB] Connected successfully to MongoDB database.');
     return true;
   } catch (error) {
-    console.warn('[DB] MongoDB connection failed. Falling back to in-memory store:', (error as Error).message);
     isConnected = false;
+    const msg = (error as Error).message;
+    console.error('[DB] MongoDB connection error:', msg);
+    if (config.isProduction) {
+      throw new Error(`FATAL: Failed to connect to MongoDB in production: ${msg}`);
+    }
     return false;
   }
 }

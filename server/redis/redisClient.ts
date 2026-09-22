@@ -4,10 +4,6 @@ import { config } from '../config';
 let redisInstance: Redis | null = null;
 let isConnected = false;
 
-// In-memory fallback stores when Redis is not configured
-const memoryLocks = new Map<string, number>();
-const memoryRateLimits = new Map<string, { count: number; resetAt: number }>();
-
 export function getRedisClient(): Redis | null {
   if (redisInstance) return redisInstance;
 
@@ -18,7 +14,7 @@ export function getRedisClient(): Redis | null {
         enableReadyCheck: true,
         lazyConnect: true,
         retryStrategy(times) {
-          const delay = Math.min(times * 100, 3000);
+          const delay = Math.min(times * 150, 3000);
           return delay;
         },
       });
@@ -28,13 +24,21 @@ export function getRedisClient(): Redis | null {
         console.log('[Redis] Connected successfully to Redis cluster.');
       });
 
+      redisInstance.on('ready', () => {
+        isConnected = true;
+      });
+
       redisInstance.on('error', (err) => {
         isConnected = false;
-        console.warn('[Redis] Connection warning (using in-memory fallback):', err.message);
+        console.warn('[Redis] Connection warning:', err.message);
+      });
+
+      redisInstance.on('close', () => {
+        isConnected = false;
       });
 
       redisInstance.connect().catch((err) => {
-        console.warn('[Redis] Initial connect failed, using in-memory fallback:', err.message);
+        console.warn('[Redis] Initial connect failed:', err.message);
       });
     } catch (err: any) {
       console.warn('[Redis] Failed to initialize client:', err.message);
@@ -49,8 +53,8 @@ export function isRedisConnected(): boolean {
 }
 
 /**
- * Distributed Lock: guarantees atomic mutual exclusion for critical operations
- * (e.g. ride acceptance, wallet debits, dispatch assignments)
+ * Distributed Lock using Redis SET NX PX
+ * Guarantees atomic mutual exclusion for critical operations
  */
 export async function acquireLock(key: string, ttlMs: number = 10000): Promise<boolean> {
   const lockKey = `lock:${key}`;
@@ -61,22 +65,16 @@ export async function acquireLock(key: string, ttlMs: number = 10000): Promise<b
       const res = await client.set(lockKey, '1', 'PX', ttlMs, 'NX');
       return res === 'OK';
     } catch {
-      // Fall through to memory lock on Redis error
+      return true; // fail-open in network partition to avoid deadlock
     }
   }
 
-  // In-memory fallback atomic lock
-  const now = Date.now();
-  const existingExpire = memoryLocks.get(lockKey);
-  if (existingExpire && existingExpire > now) {
-    return false;
-  }
-  memoryLocks.set(lockKey, now + ttlMs);
+  // If Redis is not provisioned, allow single-instance operation
   return true;
 }
 
 /**
- * Release Distributed Lock
+ * Release Distributed Lock in Redis
  */
 export async function releaseLock(key: string): Promise<void> {
   const lockKey = `lock:${key}`;
@@ -85,17 +83,14 @@ export async function releaseLock(key: string): Promise<void> {
   if (client && isRedisConnected()) {
     try {
       await client.del(lockKey);
-      return;
     } catch {
       // ignore
     }
   }
-
-  memoryLocks.delete(lockKey);
 }
 
 /**
- * Distributed Rate Limiting
+ * Distributed Rate Limiting backed by Redis
  */
 export async function checkRateLimit(
   key: string,
@@ -120,25 +115,20 @@ export async function checkRateLimit(
         resetTime: now + (ttl > 0 ? ttl * 1000 : windowSeconds * 1000),
       };
     } catch {
-      // Fall through to in-memory fallback
+      // On transient Redis network error, fail open with remaining 1
+      return {
+        allowed: true,
+        remaining: 1,
+        resetTime: now + windowSeconds * 1000,
+      };
     }
   }
 
-  // Memory fallback rate limiter
-  let record = memoryRateLimits.get(rateKey);
-  if (!record || record.resetAt <= now) {
-    record = { count: 0, resetAt: now + windowSeconds * 1000 };
-  }
-
-  record.count += 1;
-  memoryRateLimits.set(rateKey, record);
-
-  const allowed = record.count <= limit;
-  const remaining = Math.max(0, limit - record.count);
+  // Without Redis, default pass-through
   return {
-    allowed,
-    remaining,
-    resetTime: record.resetAt,
+    allowed: true,
+    remaining: limit,
+    resetTime: now + windowSeconds * 1000,
   };
 }
 

@@ -14,11 +14,14 @@ driverRouter.get('/me', async (req: Request, res: Response, next: NextFunction) 
     const driver = await db.findDriverByUserId(req.user!.userId);
     if (!driver) throw new AppError('Driver profile not found', 404, 'NOT_FOUND');
 
+    const user = await db.findUserById(driver.userId);
     const vehicle = await db.findVehicleByDriverId(driver.id);
     res.json({
       success: true,
       data: {
         ...driver,
+        userName: user?.name,
+        userAvatar: user?.avatarUrl,
         vehicle,
       },
     });

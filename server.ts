@@ -8,7 +8,6 @@ import { createServer as createViteServer } from 'vite';
 
 import { config } from './server/config';
 import { connectDB, isDbConnected, closeDB } from './server/db/connection';
-import { seedInitialData } from './server/seed/seedData';
 import { initSocketIO } from './server/socket/socketHandler';
 import { errorHandler } from './server/middleware/errorHandler';
 
@@ -61,10 +60,16 @@ app.get('/health', (req, res) => {
 });
 
 app.get('/ready', (req, res) => {
+  const dbStatus = isDbConnected();
+  if (!dbStatus && config.isProduction) {
+    return res.status(503).json({
+      status: 'unready',
+      database: 'disconnected',
+    });
+  }
   res.json({
     status: 'ready',
-    database: isDbConnected() ? 'mongodb' : 'memory_store',
-    demoMode: config.demoMode,
+    database: dbStatus ? 'connected' : 'connecting',
   });
 });
 
@@ -83,9 +88,8 @@ app.use('/api/v1/notifications', notificationRouter);
 app.use(errorHandler);
 
 async function startServer() {
-  // Database and Seed Initialization
+  // Database Initialization
   await connectDB();
-  await seedInitialData();
 
   // Vite Middleware or Static Production File Serving
   if (process.env.NODE_ENV !== 'production') {

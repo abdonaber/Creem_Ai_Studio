@@ -2,7 +2,6 @@ import { db } from '../db/store';
 import { FareService } from './fareService';
 import { IRide, IDriver, LocationCoordinate } from '../types';
 import { io } from '../socket/socketHandler';
-import { config } from '../config';
 
 export class DispatchService {
   /**
@@ -114,21 +113,6 @@ export class DispatchService {
           vehicleCategory: ride.vehicleCategory,
         });
       });
-    }
-
-    // In non-production Demo / Simulation mode only, simulate driver acceptance
-    // strictly when config.demoMode is enabled
-    if (config.demoMode && nearby.length > 0) {
-      setTimeout(async () => {
-        const currentRide = await db.findRideById(ride.id);
-        if (currentRide && currentRide.status === 'SEARCHING_DRIVER') {
-          const autoDriver = nearby[0].driver;
-          const acceptResult = await db.atomicAcceptRide(currentRide.id, autoDriver.id);
-          if (acceptResult.success && acceptResult.ride) {
-            await this.notifyDriverAssigned(acceptResult.ride, autoDriver);
-          }
-        }
-      }, 3500);
     }
   }
 

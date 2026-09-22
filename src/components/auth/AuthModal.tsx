@@ -61,12 +61,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     }
   };
 
-  const handleQuickDemo = (demoEmail: string) => {
-    setEmail(demoEmail);
-    setPassword('CreemY@2026');
-    setMode('login');
-  };
-
   return (
     <div className="fixed inset-0 z-50 bg-slate-950/70 backdrop-blur-xs flex items-center justify-center p-4">
       <div className="bg-white w-full max-w-md rounded-3xl p-6 shadow-2xl space-y-5 text-right animate-in fade-in zoom-in-95 duration-200 border border-slate-200 max-h-[90vh] overflow-y-auto">
@@ -80,7 +74,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
               <h3 className="font-bold text-slate-900 text-base">
                 {mode === 'login' ? 'تسجيل الدخول إلى CreemY' : 'إنشاء حساب جديد في CreemY'}
               </h3>
-              <p className="text-xs text-slate-400">منصة النقل الذكية الرائدة</p>
+              <p className="text-xs text-slate-400">منصة النقل الذكية المعتمدة</p>
             </div>
           </div>
           <button
@@ -89,37 +83,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({
           >
             <X className="h-5 w-5" />
           </button>
-        </div>
-
-        {/* Quick Demo Credentials Bar */}
-        <div className="p-3 bg-slate-50 rounded-2xl border border-slate-200/80 space-y-2">
-          <div className="text-[11px] font-bold text-slate-500 flex items-center gap-1">
-            <Sparkles className="h-3 w-3 text-amber-500" />
-            تجربة فورية للحسابات الجاهزة بنقرة واحدة:
-          </div>
-          <div className="grid grid-cols-3 gap-1.5 text-center">
-            <button
-              type="button"
-              onClick={() => handleQuickDemo('rider@creemy.app')}
-              className="py-1.5 px-2 bg-white hover:bg-emerald-50 text-emerald-800 rounded-lg border border-slate-200 text-[11px] font-semibold"
-            >
-              الراكب (سارة)
-            </button>
-            <button
-              type="button"
-              onClick={() => handleQuickDemo('driver@creemy.app')}
-              className="py-1.5 px-2 bg-white hover:bg-amber-50 text-amber-800 rounded-lg border border-slate-200 text-[11px] font-semibold"
-            >
-              الكابتن (فيصل)
-            </button>
-            <button
-              type="button"
-              onClick={() => handleQuickDemo('admin@creemy.app')}
-              className="py-1.5 px-2 bg-white hover:bg-indigo-50 text-indigo-800 rounded-lg border border-slate-200 text-[11px] font-semibold"
-            >
-              المدير (عبدالله)
-            </button>
-          </div>
         </div>
 
         {errorMsg && (

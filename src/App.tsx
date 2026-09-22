@@ -13,7 +13,7 @@ import { AuthModal } from './components/auth/AuthModal';
 
 export const App: React.FC = () => {
   const [currentUser, setCurrentUser] = useState<IUser | null>(null);
-  const [walletBalance, setWalletBalance] = useState<number>(250);
+  const [walletBalance, setWalletBalance] = useState<number>(0);
   const [unreadNotifications, setUnreadNotifications] = useState<number>(0);
   const [socketConnected, setSocketConnected] = useState<boolean>(false);
   const [activeView, setActiveView] = useState<'rider' | 'driver' | 'admin'>('rider');
@@ -46,19 +46,8 @@ export const App: React.FC = () => {
       localStorage.removeItem('creemy_token');
     }
 
-    // Default to Demo Rider for instant reviewer immersion
-    try {
-      const res = await api.post<{ user: IUser; accessToken: string }>('/auth/login', {
-        email: 'rider@creemy.app',
-        password: 'CreemY@2026',
-      });
-      localStorage.setItem('creemy_token', res.accessToken);
-      setCurrentUser(res.user);
-      reconnectSocketWithToken(res.accessToken);
-      setActiveView('rider');
-    } catch (err) {
-      console.error('Auto demo login failed:', err);
-    }
+    // If unauthenticated, show Auth modal for real registration / login
+    setAuthModalOpen(true);
   };
 
   const fetchNotificationCount = async () => {
@@ -100,34 +89,21 @@ export const App: React.FC = () => {
     };
   }, []);
 
-  // One-Click Switch Role Handler
-  const handleSwitchRole = async (targetRole: UserRole) => {
-    let email = 'rider@creemy.app';
-    if (targetRole === 'DRIVER') email = 'driver@creemy.app';
-    else if (targetRole === 'ADMIN') email = 'admin@creemy.app';
-
+  const handleAuthSuccess = async (user: IUser, token: string) => {
+    setCurrentUser(user);
+    reconnectSocketWithToken(token);
     try {
-      const res = await api.post<{ user: IUser; accessToken: string }>('/auth/login', {
-        email,
-        password: 'CreemY@2026',
-      });
-
-      localStorage.setItem('creemy_token', res.accessToken);
-      setCurrentUser(res.user);
-      reconnectSocketWithToken(res.accessToken);
-
-      // Fetch user's wallet
       const me = await api.get<{ walletBalance: number }>('/auth/me');
       setWalletBalance(me.walletBalance);
-
-      if (targetRole === 'DRIVER') setActiveView('driver');
-      else if (targetRole === 'ADMIN') setActiveView('admin');
-      else setActiveView('rider');
-
-      fetchNotificationCount();
-    } catch (err) {
-      console.error('Switch role failed:', err);
+    } catch {
+      setWalletBalance(0);
     }
+
+    if (user.role === 'DRIVER') setActiveView('driver');
+    else if (user.role === 'ADMIN') setActiveView('admin');
+    else setActiveView('rider');
+
+    fetchNotificationCount();
   };
 
   // Logout Handler
@@ -139,6 +115,8 @@ export const App: React.FC = () => {
     }
     localStorage.removeItem('creemy_token');
     setCurrentUser(null);
+    setWalletBalance(0);
+    setActiveView('rider');
     setAuthModalOpen(true);
   };
 
@@ -150,7 +128,6 @@ export const App: React.FC = () => {
         walletBalance={walletBalance}
         unreadNotifications={unreadNotifications}
         socketConnected={socketConnected}
-        onSwitchRole={handleSwitchRole}
         onOpenWallet={() => setWalletModalOpen(true)}
         onOpenNotifications={() => setNotificationsOpen(true)}
         onOpenAuth={() => setAuthModalOpen(true)}
@@ -199,12 +176,7 @@ export const App: React.FC = () => {
       <AuthModal
         isOpen={authModalOpen}
         onClose={() => setAuthModalOpen(false)}
-        onAuthSuccess={(user) => {
-          setCurrentUser(user);
-          if (user.role === 'DRIVER') setActiveView('driver');
-          else if (user.role === 'ADMIN') setActiveView('admin');
-          else setActiveView('rider');
-        }}
+        onAuthSuccess={handleAuthSuccess}
       />
     </div>
   );
