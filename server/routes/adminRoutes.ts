@@ -3,6 +3,7 @@ import { authenticate, requireRole } from '../middleware/auth';
 import { db } from '../db/store';
 import { AppError } from '../middleware/errorHandler';
 import { io } from '../socket/socketHandler';
+import { generateId } from '../utils/id';
 
 export const adminRouter = Router();
 
@@ -120,7 +121,7 @@ adminRouter.put(
       }
 
       await db.createNotification({
-        id: 'notif_' + Math.random().toString(36).substring(2, 9),
+        id: generateId('notif'),
         userId: updated.userId,
         title: status === 'APPROVED' ? 'تمت الموافقة على حسابك! 🎉' : 'تحديث حالة الحساب',
         body:

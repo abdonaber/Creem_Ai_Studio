@@ -5,6 +5,7 @@ import { config } from '../config';
 import { db } from '../db/store';
 import { AppError } from '../middleware/errorHandler';
 import { IUser, UserRole, IDriver, IVehicle } from '../types';
+import { generateId } from '../utils/id';
 
 export class AuthService {
   private static readonly SALT_ROUNDS = 10;
@@ -44,7 +45,7 @@ export class AuthService {
     }
 
     const passwordHash = await bcrypt.hash(data.password, this.SALT_ROUNDS);
-    const userId = 'usr_' + Math.random().toString(36).substring(2, 9);
+    const userId = generateId('usr');
     const role: UserRole = data.role || 'RIDER';
 
     const user: IUser = {
@@ -65,8 +66,10 @@ export class AuthService {
 
     // If driver, initialize driver profile and vehicle
     if (role === 'DRIVER') {
-      const driverId = 'drv_' + Math.random().toString(36).substring(2, 9);
-      const vehicleId = 'veh_' + Math.random().toString(36).substring(2, 9);
+      const driverId = generateId('drv');
+      const vehicleId = generateId('veh');
+      const randomPlateDigits = crypto.randomInt(1000, 9999);
+      const randomLicDigits = crypto.randomInt(100000, 999999);
 
       const vehicle: IVehicle = {
         id: vehicleId,
@@ -75,7 +78,7 @@ export class AuthService {
         model: data.vehicleDetails?.model || 'Camry',
         year: data.vehicleDetails?.year || 2024,
         color: data.vehicleDetails?.color || 'White',
-        plateNumber: data.vehicleDetails?.plateNumber || `CRM-${Math.floor(1000 + Math.random() * 9000)}`,
+        plateNumber: data.vehicleDetails?.plateNumber || `CRM-${randomPlateDigits}`,
         category: data.vehicleDetails?.category || 'STANDARD',
       };
       await db.createVehicle(vehicle);
@@ -89,15 +92,15 @@ export class AuthService {
         approvalStatus,
         isOnline: approvalStatus === 'APPROVED',
         currentLocation: {
-          lat: 24.7136 + (Math.random() - 0.5) * 0.04,
-          lng: 46.6753 + (Math.random() - 0.5) * 0.04,
-          heading: Math.floor(Math.random() * 360),
+          lat: 24.7136,
+          lng: 46.6753,
+          heading: 0,
           updatedAt: new Date().toISOString(),
         },
         vehicle,
         rating: 5.0,
         totalRides: 0,
-        licenseNumber: data.licenseNumber || `LIC-${Math.floor(100000 + Math.random() * 900000)}`,
+        licenseNumber: data.licenseNumber || `LIC-${randomLicDigits}`,
         documents: {
           licensePhoto: 'https://images.unsplash.com/photo-1544620347-c4fd4a3d5957?w=300',
           vehicleRegistration: 'https://images.unsplash.com/photo-1549399542-7e3f8b79c341?w=300',
@@ -108,7 +111,7 @@ export class AuthService {
     }
 
     await db.createAuditLog({
-      id: 'aud_' + Math.random().toString(36).substring(2, 9),
+      id: generateId('aud'),
       userId,
       action: 'USER_REGISTERED',
       details: { email: user.email, role },
@@ -145,7 +148,7 @@ export class AuthService {
     const tokens = await this.generateTokens(user, clientInfo);
 
     await db.createAuditLog({
-      id: 'aud_' + Math.random().toString(36).substring(2, 9),
+      id: generateId('aud'),
       userId: user.id,
       action: 'USER_LOGIN',
       details: { email: user.email },
@@ -178,7 +181,7 @@ export class AuthService {
         // Immediately revoke all sessions for this user across all devices
         await db.revokeAllSessionsForUser(decoded.userId, 'REPLAY_ATTACK_DETECTED');
         await db.createAuditLog({
-          id: 'aud_' + Math.random().toString(36).substring(2, 9),
+          id: generateId('aud'),
           userId: decoded.userId,
           action: 'SECURITY_ALERT_TOKEN_REPLAY',
           details: { jti: decoded.jti, reason: 'Attempted reuse of rotated/revoked token' },
@@ -225,7 +228,7 @@ export class AuthService {
     }
     if (userId) {
       await db.createAuditLog({
-        id: 'aud_' + Math.random().toString(36).substring(2, 9),
+        id: generateId('aud'),
         userId,
         action: 'USER_LOGOUT',
         details: {},
@@ -237,7 +240,7 @@ export class AuthService {
   public static async logoutAll(userId: string): Promise<void> {
     await db.revokeAllSessionsForUser(userId, 'USER_LOGOUT_ALL');
     await db.createAuditLog({
-      id: 'aud_' + Math.random().toString(36).substring(2, 9),
+      id: generateId('aud'),
       userId,
       action: 'USER_LOGOUT_ALL_SESSIONS',
       details: {},

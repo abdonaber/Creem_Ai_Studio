@@ -3,6 +3,7 @@ import { authenticate } from '../middleware/auth';
 import { db } from '../db/store';
 import { AppError } from '../middleware/errorHandler';
 import { io } from '../socket/socketHandler';
+import { generateId } from '../utils/id';
 
 export const chatRouter = Router();
 
@@ -68,7 +69,7 @@ chatRouter.post('/:rideId', async (req: Request, res: Response, next: NextFuncti
     }
 
     const message = await db.createMessage({
-      id: 'msg_' + Math.random().toString(36).substring(2, 9),
+      id: generateId('msg'),
       rideId,
       senderId: req.user!.userId,
       senderName: user?.name || 'مستخدم',

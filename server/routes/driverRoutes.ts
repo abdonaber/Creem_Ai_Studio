@@ -2,6 +2,7 @@ import { Router, Request, Response, NextFunction } from 'express';
 import { authenticate, requireRole } from '../middleware/auth';
 import { db } from '../db/store';
 import { AppError } from '../middleware/errorHandler';
+import { generateId } from '../utils/id';
 
 export const driverRouter = Router();
 
@@ -108,7 +109,7 @@ driverRouter.put('/onboarding', async (req: Request, res: Response, next: NextFu
         await db.updateVehicle(v.id, vehicle);
       } else {
         await db.createVehicle({
-          id: 'veh_' + Math.random().toString(36).substring(2, 9),
+          id: generateId('veh'),
           driverId: driver.id,
           make: vehicle.make || 'Toyota',
           model: vehicle.model || 'Camry',

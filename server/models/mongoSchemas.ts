@@ -48,6 +48,8 @@ export interface IDriverDocument extends Document {
   rating: number;
   totalRides: number;
   licenseNumber: string;
+  isBusy?: boolean;
+  activeRideId?: string;
   documents: {
     licensePhoto?: string;
     vehicleRegistration?: string;
@@ -67,6 +69,8 @@ export const DriverSchema = new Schema<IDriverDocument>(
       default: 'PENDING',
     },
     isOnline: { type: Boolean, default: false },
+    isBusy: { type: Boolean, default: false, index: true },
+    activeRideId: { type: String, default: null },
     currentLocation: {
       lat: { type: Number, default: 24.7136 },
       lng: { type: Number, default: 46.6753 },
@@ -97,7 +101,7 @@ export const DriverSchema = new Schema<IDriverDocument>(
   { timestamps: true }
 );
 
-DriverSchema.index({ isOnline: 1, approvalStatus: 1 });
+DriverSchema.index({ isOnline: 1, approvalStatus: 1, isBusy: 1 });
 DriverSchema.index({ location: '2dsphere' });
 DriverSchema.index({ 'currentLocation.lat': 1, 'currentLocation.lng': 1 });
 
@@ -152,6 +156,20 @@ export interface IRideDocument extends Document {
   paymentStatus: string;
   cancellationReason?: string;
   cancelledBy?: string;
+  stateHistory?: Array<{
+    status: string;
+    timestamp: Date;
+    byUserId?: string;
+    reason?: string;
+  }>;
+  offeredDriverIds?: string[];
+  currentOffer?: {
+    driverId: string;
+    offerId: string;
+    expiresAt: Date;
+  };
+  searchRadiusKm?: number;
+  retryCount?: number;
   startedAt?: Date;
   completedAt?: Date;
   createdAt: Date;
@@ -213,6 +231,22 @@ export const RideSchema = new Schema<IRideDocument>(
     },
     cancellationReason: String,
     cancelledBy: String,
+    stateHistory: [
+      {
+        status: { type: String, required: true },
+        timestamp: { type: Date, default: Date.now },
+        byUserId: String,
+        reason: String,
+      },
+    ],
+    offeredDriverIds: { type: [String], default: [] },
+    currentOffer: {
+      driverId: String,
+      offerId: String,
+      expiresAt: Date,
+    },
+    searchRadiusKm: { type: Number, default: 3 },
+    retryCount: { type: Number, default: 0 },
     startedAt: Date,
     completedAt: Date,
   },
@@ -223,6 +257,39 @@ RideSchema.index({ riderId: 1, createdAt: -1 });
 RideSchema.index({ driverId: 1, createdAt: -1 });
 RideSchema.index({ status: 1 });
 RideSchema.index({ createdAt: -1 });
+RideSchema.index({ status: 1, 'currentOffer.expiresAt': 1 });
+
+// 4b. Ride Offer Schema (Tracks atomic, timed dispatch offers to drivers)
+export interface IRideOfferDocument extends Document {
+  rideId: string;
+  driverId: string;
+  status: 'PENDING' | 'ACCEPTED' | 'REJECTED' | 'EXPIRED';
+  expiresAt: Date;
+  distanceKm: number;
+  estimatedFare: number;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export const RideOfferSchema = new Schema<IRideOfferDocument>(
+  {
+    rideId: { type: String, required: true, index: true },
+    driverId: { type: String, required: true, index: true },
+    status: {
+      type: String,
+      enum: ['PENDING', 'ACCEPTED', 'REJECTED', 'EXPIRED'],
+      default: 'PENDING',
+      index: true,
+    },
+    expiresAt: { type: Date, required: true, index: true },
+    distanceKm: { type: Number, required: true },
+    estimatedFare: { type: Number, required: true },
+  },
+  { timestamps: true }
+);
+
+RideOfferSchema.index({ rideId: 1, driverId: 1 });
+RideOfferSchema.index({ status: 1, expiresAt: 1 });
 
 // 5. Wallet Schema
 export interface IWalletDocument extends Document {
@@ -494,3 +561,5 @@ export const RefreshSessionModel =
   mongoose.models.RefreshSession || mongoose.model<IRefreshSessionDocument>('RefreshSession', RefreshSessionSchema);
 export const WebhookEventModel =
   mongoose.models.WebhookEvent || mongoose.model<IWebhookEventDocument>('WebhookEvent', WebhookEventSchema);
+export const RideOfferModel =
+  mongoose.models.RideOffer || mongoose.model<IRideOfferDocument>('RideOffer', RideOfferSchema);

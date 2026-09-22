@@ -52,6 +52,8 @@ export interface IDriver {
   userId: string;
   approvalStatus: DriverApprovalStatus;
   isOnline: boolean;
+  isBusy?: boolean;
+  activeRideId?: string;
   currentLocation: {
     lat: number;
     lng: number;
@@ -68,6 +70,18 @@ export interface IDriver {
     idCardPhoto?: string;
   };
   earningsTotal: number;
+}
+
+export interface IRideOffer {
+  id: string;
+  rideId: string;
+  driverId: string;
+  status: 'PENDING' | 'ACCEPTED' | 'REJECTED' | 'EXPIRED';
+  expiresAt: string;
+  distanceKm: number;
+  estimatedFare: number;
+  createdAt: string;
+  updatedAt?: string;
 }
 
 export interface IRide {
@@ -88,7 +102,21 @@ export interface IRide {
   paymentStatus: PaymentStatus;
   paymentIntentId?: string;
   cancellationReason?: string;
-  cancelledBy?: 'RIDER' | 'DRIVER' | 'SYSTEM';
+  cancelledBy?: 'RIDER' | 'DRIVER' | 'SYSTEM' | 'ADMIN';
+  stateHistory?: Array<{
+    status: RideStatus;
+    timestamp: string;
+    byUserId?: string;
+    reason?: string;
+  }>;
+  offeredDriverIds?: string[];
+  currentOffer?: {
+    driverId: string;
+    offerId: string;
+    expiresAt: string;
+  };
+  searchRadiusKm?: number;
+  retryCount?: number;
   startedAt?: string;
   completedAt?: string;
   createdAt: string;

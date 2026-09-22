@@ -7,6 +7,7 @@ import { DispatchService } from '../services/dispatchService';
 import { PaymentService } from '../services/paymentService';
 import { IRide, RideStatus, VehicleCategory } from '../types';
 import { io } from '../socket/socketHandler';
+import { generateId } from '../utils/id';
 
 export const rideRouter = Router();
 
@@ -78,7 +79,7 @@ rideRouter.post('/request', async (req: Request, res: Response, next: NextFuncti
     const fare = FareService.calculateFare(distanceKm, durationMinutes, vehicleCategory as VehicleCategory);
 
     const ride: IRide = {
-      id: 'ride_' + Math.random().toString(36).substring(2, 9),
+      id: generateId('ride'),
       riderId: req.user!.userId,
       status: 'REQUESTED',
       vehicleCategory: vehicleCategory as VehicleCategory,
@@ -226,6 +227,23 @@ rideRouter.post('/:id/accept', async (req: Request, res: Response, next: NextFun
   }
 });
 
+// Decline Ride Offer (Driver declines targeted offer)
+rideRouter.post('/:id/decline', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const driver = await db.findDriverByUserId(req.user!.userId);
+    if (!driver) {
+      throw new AppError('Only registered drivers can decline ride offers', 403, 'FORBIDDEN');
+    }
+
+    const { offerId } = req.body;
+    await DispatchService.handleDriverReject(req.params.id, driver.id, offerId);
+
+    res.json({ success: true, message: 'Offer declined. Next candidate being dispatched.' });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // Transition Ride Status (State Machine Enforcement)
 rideRouter.post('/:id/transition', async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -332,11 +350,20 @@ rideRouter.post('/:id/cancel', async (req: Request, res: Response, next: NextFun
 
     const cancelledBy = isRider ? 'RIDER' : isDriver ? 'DRIVER' : 'SYSTEM';
 
-    const updated = await db.updateRide(ride.id, {
-      status: 'CANCELLED',
-      cancellationReason: reason || 'Cancelled by user',
-      cancelledBy,
-    });
+    const result = await db.atomicTransitionRide(
+      ride.id,
+      'CANCELLED',
+      ['REQUESTED', 'SEARCHING_DRIVER', 'DRIVER_ASSIGNED', 'DRIVER_ARRIVING', 'DRIVER_ARRIVED'],
+      {
+        cancellationReason: reason || 'Cancelled by user',
+        cancelledBy,
+        byUserId: req.user!.userId,
+      } as any
+    );
+
+    if (!result.success || !result.ride) {
+      throw new AppError(result.message || 'Failed to cancel ride', 400, 'CANNOT_CANCEL');
+    }
 
     if (io) {
       io.to(`ride:${ride.id}`).emit('ride:status_changed', {
@@ -344,10 +371,11 @@ rideRouter.post('/:id/cancel', async (req: Request, res: Response, next: NextFun
         status: 'CANCELLED',
         cancelledBy,
         reason,
+        ride: result.ride,
       });
     }
 
-    res.json({ success: true, data: updated });
+    res.json({ success: true, data: result.ride });
   } catch (err) {
     next(err);
   }
@@ -381,7 +409,7 @@ rideRouter.post('/:id/rate', async (req: Request, res: Response, next: NextFunct
     const toUserId = driver ? driver.userId : '';
 
     const rating = await db.createRating({
-      id: 'rat_' + Math.random().toString(36).substring(2, 9),
+      id: generateId('rat'),
       rideId: ride.id,
       fromUserId: req.user!.userId,
       toUserId,

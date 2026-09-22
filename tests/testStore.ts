@@ -4,6 +4,7 @@ import {
   IDriver,
   IVehicle,
   IRide,
+  IRideOffer,
   IWallet,
   IWalletTransaction,
   IRating,
@@ -12,6 +13,7 @@ import {
   IAuditLog,
   IPayment,
   RideStatus,
+  VehicleCategory,
 } from '../server/types';
 import { AppError } from '../server/middleware/errorHandler';
 
@@ -20,6 +22,7 @@ export class TestDatabaseStore implements IDatabaseStore {
   public drivers = new Map<string, IDriver>();
   public vehicles = new Map<string, IVehicle>();
   public rides = new Map<string, IRide>();
+  public offers = new Map<string, IRideOffer>();
   public wallets = new Map<string, IWallet>();
   public transactions = new Map<string, IWalletTransaction[]>();
   public payments = new Map<string, IPayment>();
@@ -242,10 +245,111 @@ export class TestDatabaseStore implements IDatabaseStore {
     if (!ride || ride.driverId || !['REQUESTED', 'SEARCHING_DRIVER'].includes(ride.status)) {
       return { success: false, message: 'Ride unavailable' };
     }
+    const driver = this.drivers.get(driverId);
+    if (driver) {
+      driver.isBusy = true;
+      driver.activeRideId = rideId;
+    }
     ride.driverId = driverId;
     ride.status = 'DRIVER_ASSIGNED';
     ride.updatedAt = new Date().toISOString();
     return { success: true, ride };
+  }
+
+  async freeDriver(driverId: string, rideId?: string): Promise<boolean> {
+    const driver = this.drivers.get(driverId);
+    if (driver) {
+      if (!rideId || driver.activeRideId === rideId) {
+        driver.isBusy = false;
+        driver.activeRideId = undefined;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  async findNearbyEligibleDrivers(params: {
+    pickupLat: number;
+    pickupLng: number;
+    radiusKm: number;
+    category?: VehicleCategory;
+    excludedDriverIds?: string[];
+  }): Promise<Array<{ driver: IDriver; distanceKm: number }>> {
+    const { pickupLat, pickupLng, radiusKm, category, excludedDriverIds = [] } = params;
+    const results: Array<{ driver: IDriver; distanceKm: number }> = [];
+
+    for (const driver of this.drivers.values()) {
+      if (!driver.isOnline || driver.approvalStatus !== 'APPROVED' || driver.isBusy) continue;
+      if (excludedDriverIds.includes(driver.id)) continue;
+      if (category && driver.vehicle && driver.vehicle.category !== category) continue;
+
+      const dLat = (driver.currentLocation.lat - pickupLat) * (Math.PI / 180);
+      const dLng = (driver.currentLocation.lng - pickupLng) * (Math.PI / 180);
+      const a =
+        Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+        Math.cos(pickupLat * (Math.PI / 180)) *
+          Math.cos(driver.currentLocation.lat * (Math.PI / 180)) *
+          Math.sin(dLng / 2) *
+          Math.sin(dLng / 2);
+      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+      const distanceKm = Math.round(6371 * c * 100) / 100;
+
+      if (distanceKm <= radiusKm) {
+        results.push({ driver, distanceKm });
+      }
+    }
+
+    return results.sort((a, b) => a.distanceKm - b.distanceKm);
+  }
+
+  async createRideOffer(offer: Partial<IRideOffer>): Promise<IRideOffer> {
+    const id = 'offer_' + Math.random().toString(36).substring(2, 9);
+    const created: IRideOffer = {
+      id,
+      rideId: offer.rideId!,
+      driverId: offer.driverId!,
+      status: offer.status || 'PENDING',
+      expiresAt: offer.expiresAt || new Date(Date.now() + 25000).toISOString(),
+      distanceKm: offer.distanceKm || 1,
+      estimatedFare: offer.estimatedFare || 25,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    this.offers.set(id, created);
+    return created;
+  }
+
+  async findOfferById(offerId: string): Promise<IRideOffer | null> {
+    return this.offers.get(offerId) || null;
+  }
+
+  async findActiveOfferForRide(rideId: string): Promise<IRideOffer | null> {
+    for (const o of this.offers.values()) {
+      if (o.rideId === rideId && o.status === 'PENDING') return o;
+    }
+    return null;
+  }
+
+  async updateRideOfferStatus(
+    offerId: string,
+    status: 'ACCEPTED' | 'REJECTED' | 'EXPIRED'
+  ): Promise<void> {
+    const offer = this.offers.get(offerId);
+    if (offer) {
+      offer.status = status;
+      offer.updatedAt = new Date().toISOString();
+    }
+  }
+
+  async getPendingOffersExpiredBefore(date: Date): Promise<IRideOffer[]> {
+    const expired: IRideOffer[] = [];
+    const targetMs = date.getTime();
+    for (const o of this.offers.values()) {
+      if (o.status === 'PENDING' && new Date(o.expiresAt).getTime() < targetMs) {
+        expired.push(o);
+      }
+    }
+    return expired;
   }
 
   // Wallet

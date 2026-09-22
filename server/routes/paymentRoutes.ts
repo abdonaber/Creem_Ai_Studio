@@ -38,7 +38,7 @@ paymentRouter.post('/webhook', async (req: Request, res: Response, next: NextFun
       (req.body && req.body.id) ||
       (Array.isArray(eventIdHeader) ? eventIdHeader[0] : eventIdHeader) ||
       `evt_${Date.now()}`;
-    const rawPayload = JSON.stringify(req.body);
+    const rawPayload = (req as any).rawBody || JSON.stringify(req.body);
 
     const verified = await PaymentService.handleWebhook(rawPayload, signature, eventId);
     res.json({ received: true, verified });

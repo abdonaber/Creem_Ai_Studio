@@ -10,6 +10,8 @@ import { config } from './server/config';
 import { connectDB, isDbConnected, closeDB } from './server/db/connection';
 import { initSocketIO } from './server/socket/socketHandler';
 import { errorHandler } from './server/middleware/errorHandler';
+import { requestIdMiddleware } from './server/middleware/requestId';
+import { DispatchService } from './server/services/dispatchService';
 
 // Route Handlers
 import { authRouter } from './server/routes/authRoutes';
@@ -37,9 +39,17 @@ app.use(
     credentials: true,
   })
 );
-app.use(express.json({ limit: '10mb' }));
+app.use(
+  express.json({
+    limit: '10mb',
+    verify: (req: any, _res, buf) => {
+      req.rawBody = buf;
+    },
+  })
+);
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(cookieParser());
+app.use(requestIdMiddleware);
 
 // Security Headers
 app.use((req, res, next) => {
@@ -110,6 +120,9 @@ async function startServer() {
   const server = http.createServer(app);
   initSocketIO(server);
 
+  // Start background dispatch engine
+  DispatchService.startWorker();
+
   const PORT = config.port;
   server.listen(PORT, '0.0.0.0', () => {
     console.log(`[CreemY] Server live on http://0.0.0.0:${PORT} (env: ${config.nodeEnv})`);
@@ -118,6 +131,7 @@ async function startServer() {
   // Graceful shutdown handling
   const shutdown = async (signal: string) => {
     console.log(`[CreemY] Received ${signal}. Closing gracefully...`);
+    DispatchService.stopWorker();
     server.close(async () => {
       await closeDB();
       console.log('[CreemY] HTTP and DB connections closed.');

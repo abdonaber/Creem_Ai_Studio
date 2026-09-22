@@ -6,6 +6,7 @@ import { config } from '../config';
 import { db } from '../db/store';
 import { AuthPayload } from '../middleware/auth';
 import { IMessage } from '../types';
+import { generateId } from '../utils/id';
 
 export let io: SocketIOServer | null = null;
 
@@ -194,7 +195,7 @@ export function initSocketIO(server: any): SocketIOServer {
       }
 
       const message: IMessage = {
-        id: 'msg_' + Math.random().toString(36).substring(2, 9),
+        id: generateId('msg'),
         rideId: ride.id,
         senderId: user.userId,
         senderName: senderUser?.name || 'User',

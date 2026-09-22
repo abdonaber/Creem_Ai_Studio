@@ -5,6 +5,7 @@ import {
   DriverModel,
   VehicleModel,
   RideModel,
+  RideOfferModel,
   WalletModel,
   WalletTransactionModel,
   PaymentModel,
@@ -21,6 +22,7 @@ import {
   IDriver,
   IVehicle,
   IRide,
+  IRideOffer,
   IWallet,
   IWalletTransaction,
   IRating,
@@ -29,6 +31,7 @@ import {
   IAuditLog,
   IPayment,
   RideStatus,
+  VehicleCategory,
 } from '../types';
 import { AppError } from '../middleware/errorHandler';
 
@@ -83,6 +86,21 @@ export interface IDatabaseStore {
     rideId: string,
     driverId: string
   ): Promise<{ success: boolean; ride?: IRide; message?: string }>;
+  freeDriver(driverId: string, rideId?: string): Promise<boolean>;
+  findNearbyEligibleDrivers(params: {
+    pickupLat: number;
+    pickupLng: number;
+    radiusKm: number;
+    category?: VehicleCategory;
+    excludedDriverIds?: string[];
+  }): Promise<Array<{ driver: IDriver; distanceKm: number }>>;
+
+  // Ride Offer Operations
+  createRideOffer(offer: Partial<IRideOffer>): Promise<IRideOffer>;
+  findOfferById(offerId: string): Promise<IRideOffer | null>;
+  findActiveOfferForRide(rideId: string): Promise<IRideOffer | null>;
+  updateRideOfferStatus(offerId: string, status: 'ACCEPTED' | 'REJECTED' | 'EXPIRED'): Promise<void>;
+  getPendingOffersExpiredBefore(date: Date): Promise<IRideOffer[]>;
 
   // Wallet & Financial Operations
   getOrCreateWallet(userId: string): Promise<IWallet>;
@@ -199,6 +217,8 @@ export class MongoDatabaseStore implements IDatabaseStore {
       userId: doc.userId,
       approvalStatus: doc.approvalStatus,
       isOnline: doc.isOnline,
+      isBusy: doc.isBusy || false,
+      activeRideId: doc.activeRideId || undefined,
       currentLocation: {
         lat: doc.currentLocation?.lat ?? 24.7136,
         lng: doc.currentLocation?.lng ?? 46.6753,
@@ -249,6 +269,25 @@ export class MongoDatabaseStore implements IDatabaseStore {
       paymentStatus: doc.paymentStatus,
       cancellationReason: doc.cancellationReason,
       cancelledBy: doc.cancelledBy,
+      stateHistory: (doc.stateHistory || []).map((s: any) => ({
+        status: s.status,
+        timestamp: s.timestamp instanceof Date ? s.timestamp.toISOString() : new Date(s.timestamp).toISOString(),
+        byUserId: s.byUserId,
+        reason: s.reason,
+      })),
+      offeredDriverIds: doc.offeredDriverIds || [],
+      currentOffer: doc.currentOffer
+        ? {
+            driverId: doc.currentOffer.driverId,
+            offerId: doc.currentOffer.offerId,
+            expiresAt:
+              doc.currentOffer.expiresAt instanceof Date
+                ? doc.currentOffer.expiresAt.toISOString()
+                : new Date(doc.currentOffer.expiresAt).toISOString(),
+          }
+        : undefined,
+      searchRadiusKm: doc.searchRadiusKm || 3,
+      retryCount: doc.retryCount || 0,
       startedAt: doc.startedAt ? new Date(doc.startedAt).toISOString() : undefined,
       completedAt: doc.completedAt ? new Date(doc.completedAt).toISOString() : undefined,
       createdAt: doc.createdAt?.toISOString?.() || new Date(doc.createdAt).toISOString(),
@@ -528,14 +567,26 @@ export class MongoDatabaseStore implements IDatabaseStore {
   ): Promise<{ success: boolean; ride?: IRide; message?: string }> {
     this.ensureConnection();
     const lockKey = `ride_transition:${rideId}`;
-    const acquired = await acquireLock(lockKey, 5000);
-    if (!acquired) {
+    const lock = await acquireLock(lockKey, 5000);
+    if (!lock.acquired) {
       return { success: false, message: 'Conflict: Ride update is currently being processed by another worker.' };
     }
 
     try {
       const query = mongoose.Types.ObjectId.isValid(rideId) ? { _id: rideId } : { id: rideId };
-      const updateData: any = { status: nextStatus, updatedAt: new Date(), ...(additionalUpdates || {}) };
+      const updateData: any = {
+        status: nextStatus,
+        updatedAt: new Date(),
+        ...(additionalUpdates || {}),
+        $push: {
+          stateHistory: {
+            status: nextStatus,
+            timestamp: new Date(),
+            byUserId: (additionalUpdates as any)?.byUserId || additionalUpdates?.cancelledBy,
+            reason: additionalUpdates?.cancellationReason,
+          },
+        },
+      };
 
       if (nextStatus === 'RIDE_STARTED' && !updateData.startedAt) {
         updateData.startedAt = new Date();
@@ -545,7 +596,7 @@ export class MongoDatabaseStore implements IDatabaseStore {
 
       const updatedDoc = await RideModel.findOneAndUpdate(
         { ...query, status: { $in: allowedCurrentStatuses } },
-        { $set: updateData },
+        updateData,
         { new: true }
       ).lean();
 
@@ -557,9 +608,21 @@ export class MongoDatabaseStore implements IDatabaseStore {
         };
       }
 
+      // If ride is finished or cancelled, release driver reservation
+      if (nextStatus === 'RIDE_COMPLETED' || nextStatus === 'CANCELLED') {
+        if (updatedDoc.driverId) {
+          await this.freeDriver(updatedDoc.driverId, rideId);
+        }
+        // Also expire any remaining pending offers
+        await RideOfferModel.updateMany(
+          { rideId, status: 'PENDING' },
+          { $set: { status: 'EXPIRED', updatedAt: new Date() } }
+        );
+      }
+
       return { success: true, ride: this.docToRide(updatedDoc) };
     } finally {
-      await releaseLock(lockKey);
+      await releaseLock(lockKey, lock.token);
     }
   }
 
@@ -568,17 +631,60 @@ export class MongoDatabaseStore implements IDatabaseStore {
     driverId: string
   ): Promise<{ success: boolean; ride?: IRide; message?: string }> {
     this.ensureConnection();
-    const lockKey = `ride_claim:${rideId}`;
-    const acquired = await acquireLock(lockKey, 8000);
-    if (!acquired) {
-      return { success: false, message: 'This ride is currently being claimed by another captain.' };
+
+    // 1. Dual-level locking: Lock driver and ride to eliminate race conditions
+    const driverLockKey = `driver_reservation:${driverId}`;
+    const rideLockKey = `ride_claim:${rideId}`;
+
+    const driverLock = await acquireLock(driverLockKey, 10000, { failClosed: true });
+    if (!driverLock.acquired) {
+      return { success: false, message: 'Captain reservation in progress. Please try again.' };
     }
 
+    let rideLock: { acquired: boolean; token: string } | null = null;
     try {
-      const query = mongoose.Types.ObjectId.isValid(rideId) ? { _id: rideId } : { id: rideId };
+      // 2. Atomic Driver Reservation in MongoDB:
+      // Captain must be approved, online, and NOT already busy
+      const driverQuery = mongoose.Types.ObjectId.isValid(driverId) ? { _id: driverId } : { id: driverId };
+      const reservedDriver = await DriverModel.findOneAndUpdate(
+        {
+          ...driverQuery,
+          approvalStatus: 'APPROVED',
+          isOnline: true,
+          isBusy: { $ne: true },
+        },
+        {
+          $set: {
+            isBusy: true,
+            activeRideId: rideId,
+          },
+        },
+        { new: true }
+      ).lean();
+
+      if (!reservedDriver) {
+        return {
+          success: false,
+          message: 'Captain is currently on another ride or is offline.',
+        };
+      }
+
+      // 3. Acquire Ride Lock
+      rideLock = await acquireLock(rideLockKey, 8000);
+      if (!rideLock.acquired) {
+        // Rollback driver reservation
+        await DriverModel.updateOne(
+          { ...driverQuery, activeRideId: rideId },
+          { $set: { isBusy: false, activeRideId: null } }
+        );
+        return { success: false, message: 'This ride is currently being claimed by another captain.' };
+      }
+
+      // 4. Atomically claim Ride
+      const rideQuery = mongoose.Types.ObjectId.isValid(rideId) ? { _id: rideId } : { id: rideId };
       const updatedDoc = await RideModel.findOneAndUpdate(
         {
-          ...query,
+          ...rideQuery,
           status: { $in: ['REQUESTED', 'SEARCHING_DRIVER'] },
           driverId: { $exists: false },
         },
@@ -587,19 +693,209 @@ export class MongoDatabaseStore implements IDatabaseStore {
             status: 'DRIVER_ASSIGNED',
             driverId,
             updatedAt: new Date(),
+            'currentOffer.status': 'ACCEPTED',
+          },
+          $push: {
+            stateHistory: {
+              status: 'DRIVER_ASSIGNED',
+              timestamp: new Date(),
+              byUserId: reservedDriver.userId,
+              reason: 'Ride accepted by captain',
+            },
           },
         },
         { new: true }
       ).lean();
 
       if (!updatedDoc) {
+        // Rollback driver reservation if ride was already claimed or cancelled
+        await DriverModel.updateOne(
+          { ...driverQuery, activeRideId: rideId },
+          { $set: { isBusy: false, activeRideId: null } }
+        );
         return { success: false, message: 'Ride has already been accepted by another captain or was cancelled.' };
       }
 
+      // 5. Update RideOffer records
+      await RideOfferModel.updateMany(
+        { rideId, driverId, status: 'PENDING' },
+        { $set: { status: 'ACCEPTED', updatedAt: new Date() } }
+      );
+      await RideOfferModel.updateMany(
+        { rideId, driverId: { $ne: driverId }, status: 'PENDING' },
+        { $set: { status: 'EXPIRED', updatedAt: new Date() } }
+      );
+
       return { success: true, ride: this.docToRide(updatedDoc) };
     } finally {
-      await releaseLock(lockKey);
+      if (rideLock && rideLock.acquired) {
+        await releaseLock(rideLockKey, rideLock.token);
+      }
+      await releaseLock(driverLockKey, driverLock.token);
     }
+  }
+
+  public async freeDriver(driverId: string, rideId?: string): Promise<boolean> {
+    this.ensureConnection();
+    const query: any = mongoose.Types.ObjectId.isValid(driverId) ? { _id: driverId } : { id: driverId };
+    if (rideId) {
+      query.activeRideId = rideId;
+    }
+    const res = await DriverModel.updateOne(
+      query,
+      { $set: { isBusy: false, activeRideId: null } }
+    );
+    return res.modifiedCount > 0;
+  }
+
+  public async findNearbyEligibleDrivers(params: {
+    pickupLat: number;
+    pickupLng: number;
+    radiusKm: number;
+    category?: VehicleCategory;
+    excludedDriverIds?: string[];
+  }): Promise<Array<{ driver: IDriver; distanceKm: number }>> {
+    this.ensureConnection();
+    const { pickupLat, pickupLng, radiusKm, category, excludedDriverIds = [] } = params;
+
+    // Must be online, approved, and not busy
+    const filter: any = {
+      isOnline: true,
+      approvalStatus: 'APPROVED',
+      isBusy: { $ne: true },
+    };
+
+    if (excludedDriverIds.length > 0) {
+      const validIds = excludedDriverIds
+        .filter((id) => mongoose.Types.ObjectId.isValid(id))
+        .map((id) => new mongoose.Types.ObjectId(id));
+      filter._id = { $nin: validIds };
+    }
+
+    const driverDocs = await DriverModel.find(filter).lean();
+    const results: Array<{ driver: IDriver; distanceKm: number }> = [];
+
+    for (const doc of driverDocs) {
+      const driver = this.docToDriver(doc);
+      const vehicle = await this.findVehicleByDriverId(driver.id);
+      if (vehicle) driver.vehicle = vehicle;
+
+      // Filter by vehicle category if specified
+      if (category && driver.vehicle && driver.vehicle.category !== category) {
+        continue;
+      }
+
+      // Calculate distance using Haversine formula
+      const dLat = (driver.currentLocation.lat - pickupLat) * (Math.PI / 180);
+      const dLng = (driver.currentLocation.lng - pickupLng) * (Math.PI / 180);
+      const a =
+        Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+        Math.cos(pickupLat * (Math.PI / 180)) *
+          Math.cos(driver.currentLocation.lat * (Math.PI / 180)) *
+          Math.sin(dLng / 2) *
+          Math.sin(dLng / 2);
+      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+      const distanceKm = Math.round(6371 * c * 100) / 100;
+
+      if (distanceKm <= radiusKm) {
+        results.push({ driver, distanceKm });
+      }
+    }
+
+    return results.sort((a, b) => a.distanceKm - b.distanceKm);
+  }
+
+  // ==========================================
+  // RIDE OFFER OPERATIONS
+  // ==========================================
+  public async createRideOffer(offer: Partial<IRideOffer>): Promise<IRideOffer> {
+    this.ensureConnection();
+    const doc = await RideOfferModel.create({
+      _id: new mongoose.Types.ObjectId(),
+      rideId: offer.rideId,
+      driverId: offer.driverId,
+      status: offer.status || 'PENDING',
+      expiresAt: new Date(offer.expiresAt!),
+      distanceKm: offer.distanceKm,
+      estimatedFare: offer.estimatedFare,
+    });
+    return {
+      id: doc._id.toString(),
+      rideId: doc.rideId,
+      driverId: doc.driverId,
+      status: doc.status as any,
+      expiresAt: doc.expiresAt.toISOString(),
+      distanceKm: doc.distanceKm,
+      estimatedFare: doc.estimatedFare,
+      createdAt: doc.createdAt.toISOString(),
+      updatedAt: doc.updatedAt.toISOString(),
+    };
+  }
+
+  public async findOfferById(offerId: string): Promise<IRideOffer | null> {
+    this.ensureConnection();
+    const query = mongoose.Types.ObjectId.isValid(offerId) ? { _id: offerId } : { id: offerId };
+    const doc = await RideOfferModel.findOne(query).lean();
+    if (!doc) return null;
+    return {
+      id: doc._id.toString(),
+      rideId: doc.rideId,
+      driverId: doc.driverId,
+      status: doc.status as any,
+      expiresAt: doc.expiresAt.toISOString(),
+      distanceKm: doc.distanceKm,
+      estimatedFare: doc.estimatedFare,
+      createdAt: doc.createdAt.toISOString(),
+      updatedAt: doc.updatedAt.toISOString(),
+    };
+  }
+
+  public async findActiveOfferForRide(rideId: string): Promise<IRideOffer | null> {
+    this.ensureConnection();
+    const doc = await RideOfferModel.findOne({ rideId, status: 'PENDING' })
+      .sort({ createdAt: -1 })
+      .lean();
+    if (!doc) return null;
+    return {
+      id: doc._id.toString(),
+      rideId: doc.rideId,
+      driverId: doc.driverId,
+      status: doc.status as any,
+      expiresAt: doc.expiresAt.toISOString(),
+      distanceKm: doc.distanceKm,
+      estimatedFare: doc.estimatedFare,
+      createdAt: doc.createdAt.toISOString(),
+      updatedAt: doc.updatedAt.toISOString(),
+    };
+  }
+
+  public async updateRideOfferStatus(
+    offerId: string,
+    status: 'ACCEPTED' | 'REJECTED' | 'EXPIRED'
+  ): Promise<void> {
+    this.ensureConnection();
+    const query = mongoose.Types.ObjectId.isValid(offerId) ? { _id: offerId } : { id: offerId };
+    await RideOfferModel.updateOne(query, { $set: { status, updatedAt: new Date() } });
+  }
+
+  public async getPendingOffersExpiredBefore(date: Date): Promise<IRideOffer[]> {
+    this.ensureConnection();
+    const docs = await RideOfferModel.find({
+      status: 'PENDING',
+      expiresAt: { $lt: date },
+    }).lean();
+
+    return docs.map((doc: any) => ({
+      id: doc._id.toString(),
+      rideId: doc.rideId,
+      driverId: doc.driverId,
+      status: doc.status as any,
+      expiresAt: doc.expiresAt.toISOString(),
+      distanceKm: doc.distanceKm,
+      estimatedFare: doc.estimatedFare,
+      createdAt: doc.createdAt.toISOString(),
+      updatedAt: doc.updatedAt.toISOString(),
+    }));
   }
 
   // ==========================================
