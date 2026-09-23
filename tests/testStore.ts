@@ -282,7 +282,7 @@ export class TestDatabaseStore implements IDatabaseStore {
     const results: Array<{ driver: IDriver; distanceKm: number }> = [];
 
     for (const driver of this.drivers.values()) {
-      if (!driver.isOnline || driver.approvalStatus !== 'APPROVED' || driver.isBusy) continue;
+      if (!driver.isOnline || driver.approvalStatus !== 'APPROVED' || driver.isBusy || !driver.currentLocation) continue;
       if (excludedDriverIds.includes(driver.id)) continue;
       if (category && driver.vehicle && driver.vehicle.category !== category) continue;
 

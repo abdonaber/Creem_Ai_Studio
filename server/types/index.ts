@@ -54,7 +54,7 @@ export interface IDriver {
   isOnline: boolean;
   isBusy?: boolean;
   activeRideId?: string;
-  currentLocation: {
+  currentLocation?: {
     lat: number;
     lng: number;
     heading?: number;

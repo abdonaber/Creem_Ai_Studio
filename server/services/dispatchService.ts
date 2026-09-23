@@ -4,48 +4,64 @@ import { io } from '../socket/socketHandler';
 import { generateId } from '../utils/id';
 import { logger } from '../utils/logger';
 import { acquireLock, releaseLock } from '../redis/redisClient';
+import { QueueManager, NotificationJobData } from '../queue/queueManager';
 
 export class DispatchService {
-  private static workerTimer: NodeJS.Timeout | null = null;
-  private static isWorkerRunning = false;
+  private static isInitialized = false;
 
   /**
-   * Initializes the Dispatch background worker that monitors expired offers
-   * and self-heals orphaned ride dispatch requests.
+   * Initializes the Dispatch Engine and connects BullMQ workers
    */
-  public static startWorker(): void {
-    if (this.workerTimer) return;
+  public static async init(): Promise<void> {
+    if (this.isInitialized) return;
 
-    logger.info('[Dispatch Engine] Background worker started.');
-    this.workerTimer = setInterval(async () => {
-      if (this.isWorkerRunning) return;
-      this.isWorkerRunning = true;
-      try {
-        await this.sweepExpiredOffers();
-      } catch (err: any) {
-        logger.error('[Dispatch Worker] Error during sweep:', err);
-      } finally {
-        this.isWorkerRunning = false;
-      }
-    }, 4000);
+    // Register queue job handlers
+    QueueManager.registerHandlers({
+      onDispatch: async (rideId: string) => {
+        await this.executeOfferCandidate(rideId);
+      },
+      onOfferTimeout: async (rideId: string, offerId: string) => {
+        await this.handleOfferTimeout(rideId, offerId);
+      },
+      onSearchRetry: async (rideId: string) => {
+        await this.offerNextCandidate(rideId);
+      },
+      onNotification: async (data: NotificationJobData) => {
+        await this.processNotification(data);
+      },
+    });
+
+    await QueueManager.init();
+    this.isInitialized = true;
+    logger.info('[Dispatch Engine] Initialized with BullMQ distributed queues & workers.');
   }
 
-  public static stopWorker(): void {
-    if (this.workerTimer) {
-      clearInterval(this.workerTimer);
-      this.workerTimer = null;
-      logger.info('[Dispatch Engine] Background worker stopped.');
-    }
+  /**
+   * Stops background dispatch workers and releases queue resources gracefully
+   */
+  public static async stopWorker(): Promise<void> {
+    await QueueManager.close();
+    this.isInitialized = false;
+    logger.info('[Dispatch Engine] Background workers stopped.');
+  }
+
+  /**
+   * Backward-compatible start worker
+   */
+  public static startWorker(): void {
+    this.init().catch((err) => {
+      logger.error('[Dispatch Engine] Failed to initialize dispatch workers:', err);
+    });
   }
 
   /**
    * Main Dispatch Entry Point
-   * Transitions ride to SEARCHING_DRIVER and starts sequential offers.
+   * Transitions ride to SEARCHING_DRIVER and enqueues background dispatch job.
    */
   public static async dispatchRide(ride: IRide): Promise<void> {
     logger.info(`[Dispatch] Initiating dispatch for ride ${ride.id}`);
 
-    // Update ride to SEARCHING_DRIVER
+    // Atomically transition ride to SEARCHING_DRIVER
     await db.atomicTransitionRide(ride.id, 'SEARCHING_DRIVER', ['REQUESTED'], {
       searchRadiusKm: 5,
       retryCount: 0,
@@ -59,13 +75,21 @@ export class DispatchService {
       });
     }
 
-    // Begin sequential candidate matching
-    await this.offerNextCandidate(ride.id);
+    // Hand off dispatch work to BullMQ queue
+    await QueueManager.enqueueRideDispatch(ride.id);
+  }
+
+  /**
+   * Worker handler that initiates candidate matching
+   */
+  private static async executeOfferCandidate(rideId: string): Promise<void> {
+    await this.offerNextCandidate(rideId);
   }
 
   /**
    * Sequential Candidate Dispatch
-   * Selects the nearest eligible candidate, creates a time-limited offer (25s),
+   * Selects nearest eligible candidate using MongoDB geospatial aggregation,
+   * creates time-limited offer (25s), schedules delayed BullMQ expiration,
    * or expands search radius, or transitions to NO_DRIVER_FOUND.
    */
   public static async offerNextCandidate(rideId: string): Promise<void> {
@@ -87,7 +111,7 @@ export class DispatchService {
       const retryCount = ride.retryCount || 0;
       const excludedDriverIds = ride.offeredDriverIds || [];
 
-      // Query nearest eligible drivers
+      // Query nearest eligible drivers with MongoDB $geoNear server-side aggregation
       const candidates = await db.findNearbyEligibleDrivers({
         pickupLat: ride.pickup.lat,
         pickupLng: ride.pickup.lng,
@@ -130,6 +154,9 @@ export class DispatchService {
           `[Dispatch] Dispatched offer ${offer.id} for ride ${ride.id} to driver ${driver.id} (${driverUser?.name}). Distance: ${target.distanceKm}km. Expires in 25s.`
         );
 
+        // Schedule delayed BullMQ offer expiration job
+        await QueueManager.scheduleOfferExpiration(ride.id, offer.id, offerTtlMs);
+
         // Targeted socket notification to the selected driver
         if (io) {
           io.to(`user:${driver.userId}`).emit('ride:incoming_request', {
@@ -169,9 +196,9 @@ export class DispatchService {
           retryCount: retryCount + 1,
         });
 
-        // Release lock before recursive call so next cycle can acquire
-        await releaseLock(lockKey, lock.token);
-        return this.offerNextCandidate(ride.id);
+        // Enqueue search retry job via BullMQ
+        await QueueManager.enqueueSearchRetry(ride.id, nextRadius, retryCount + 1, 300);
+        return;
       }
 
       // Max radius reached and no candidates found -> NO_DRIVER_FOUND
@@ -188,8 +215,7 @@ export class DispatchService {
           message: 'عذراً، لم نتمكن من العثور على كابتن قريب حالياً. يرجى المحاولة بعد قليل.',
         });
 
-        await db.createNotification({
-          id: generateId('notif'),
+        await QueueManager.enqueueNotification({
           userId: ride.riderId,
           title: 'لم يتم العثور على كابتن',
           body: 'نعتذر، جميع الكباتن في منطقتك مشغولون حالياً. حاول مجدداً بعد بضع دقائق.',
@@ -222,21 +248,26 @@ export class DispatchService {
       }
     }
 
-    // Immediately trigger next candidate offer without rider waiting
+    // Immediately trigger next candidate offer without waiting
     await this.offerNextCandidate(rideId);
   }
 
   /**
    * Offer Timeout Handler
-   * Called when driver didn't respond within 25 seconds.
+   * Called by delayed BullMQ job when driver didn't respond within 25 seconds.
    */
   public static async handleOfferTimeout(rideId: string, offerId: string): Promise<void> {
+    const offer = await db.findOfferById(offerId);
+    if (!offer || offer.status !== 'PENDING') {
+      // Offer already accepted or rejected; idempotent no-op
+      return;
+    }
+
     logger.info(`[Dispatch] Offer ${offerId} for ride ${rideId} expired.`);
     await db.updateRideOfferStatus(offerId, 'EXPIRED');
 
     // Notify driver that offer expired
-    const offer = await db.findOfferById(offerId);
-    if (offer && io) {
+    if (io) {
       const driver = await db.findDriverById(offer.driverId);
       if (driver) {
         io.to(`user:${driver.userId}`).emit('ride:offer_expired', {
@@ -251,22 +282,24 @@ export class DispatchService {
   }
 
   /**
-   * Periodic sweep for expired offers and stuck searches across distributed instances
+   * Handles notification delivery and DB persistence
    */
-  private static async sweepExpiredOffers(): Promise<void> {
-    const sweepLock = await acquireLock('dispatch_sweep_leader', 3500);
-    if (!sweepLock.acquired) {
-      // Another instance is already handling the periodic sweep
-      return;
-    }
+  private static async processNotification(data: NotificationJobData): Promise<void> {
+    await db.createNotification({
+      id: generateId('notif'),
+      userId: data.userId,
+      title: data.title,
+      body: data.body,
+      type: data.type as any,
+      metadata: data.metadata,
+    });
 
-    try {
-      const expiredOffers = await db.getPendingOffersExpiredBefore(new Date());
-      for (const offer of expiredOffers) {
-        await this.handleOfferTimeout(offer.rideId, offer.id);
-      }
-    } finally {
-      await releaseLock('dispatch_sweep_leader', sweepLock.token);
+    if (io) {
+      io.to(`user:${data.userId}`).emit('notification:new', {
+        title: data.title,
+        body: data.body,
+        type: data.type,
+      });
     }
   }
 
@@ -284,7 +317,7 @@ export class DispatchService {
         driver: {
           id: driver.id,
           name: driverUser?.name || 'كابتن معتمد',
-          phone: driverUser?.phone || '+966 50 123 4567',
+          phone: driverUser?.phone || '',
           rating: driver.rating,
           vehicle: vehicle || driver.vehicle,
           currentLocation: driver.currentLocation,
@@ -298,8 +331,7 @@ export class DispatchService {
       });
     }
 
-    await db.createNotification({
-      id: generateId('notif'),
+    await QueueManager.enqueueNotification({
       userId: ride.riderId,
       title: 'تم قبول رحلتك! 🚗',
       body: `الكابتن ${driverUser?.name || ''} في طريقه إلى نقطة الالتقاء.`,

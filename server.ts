@@ -13,6 +13,8 @@ import { errorHandler } from './server/middleware/errorHandler';
 import { requestIdMiddleware } from './server/middleware/requestId';
 import { DispatchService } from './server/services/dispatchService';
 import { isRedisConnected, getRedisClient } from './server/redis/redisClient';
+import { QueueManager } from './server/queue/queueManager';
+import { metrics } from './server/utils/metrics';
 
 // Route Handlers
 import { authRouter } from './server/routes/authRoutes';
@@ -76,6 +78,7 @@ const checkReadiness = async (_req: express.Request, res: express.Response) => {
   const redisConfigured = Boolean(config.redisUrl);
   const redisStatus = redisConfigured ? isRedisConnected() : true;
   const configStatus = Boolean(config.jwtSecret && config.jwtSecret.length >= 8);
+  const queueHealth = await QueueManager.getQueueMetrics();
 
   const isReady = (dbStatus || !config.isProduction) && redisStatus && configStatus;
 
@@ -85,6 +88,7 @@ const checkReadiness = async (_req: express.Request, res: express.Response) => {
     checks: {
       database: dbStatus ? 'connected' : 'disconnected',
       redis: redisConfigured ? (redisStatus ? 'connected' : 'disconnected') : 'not_configured',
+      queue: queueHealth,
       configuration: configStatus ? 'valid' : 'invalid',
     },
   };
@@ -98,6 +102,9 @@ const checkReadiness = async (_req: express.Request, res: express.Response) => {
 
 app.get('/readiness', checkReadiness);
 app.get('/ready', checkReadiness);
+app.get('/metrics', (_req, res) => {
+  res.json(metrics.getSnapshot());
+});
 
 // 3. Mount REST API Routes (Version 1)
 app.use('/api/v1/auth', authRouter);
@@ -148,7 +155,7 @@ async function startServer() {
   const shutdown = async (signal: string) => {
     console.log(`[CreemY] Received ${signal}. Initiating graceful shutdown...`);
     // 1. Stop background workers
-    DispatchService.stopWorker();
+    await DispatchService.stopWorker();
 
     // 2. Stop accepting new HTTP requests
     server.close(async () => {

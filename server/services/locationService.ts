@@ -159,4 +159,35 @@ export class LocationService {
 
     return { accepted: true };
   }
+
+  /**
+   * Sweeps and marks drivers as offline if they haven't reported GPS location in > 5 minutes
+   */
+  public static async sweepStaleDrivers(staleThresholdMs: number = 300000): Promise<number> {
+    try {
+      const cutoffDate = new Date(Date.now() - staleThresholdMs);
+      const onlineDrivers = await db.getOnlineApprovedDrivers();
+      let staleCount = 0;
+
+      for (const driver of onlineDrivers) {
+        if (!driver.currentLocation || !driver.currentLocation.updatedAt) {
+          await db.updateDriver(driver.id, { isOnline: false });
+          staleCount++;
+          continue;
+        }
+
+        const lastUpdated = new Date(driver.currentLocation.updatedAt);
+        if (lastUpdated < cutoffDate && !driver.isBusy) {
+          logger.info(`[LocationTracker] Driver ${driver.id} marked offline due to stale GPS telemetry.`);
+          await db.updateDriver(driver.id, { isOnline: false });
+          staleCount++;
+        }
+      }
+
+      return staleCount;
+    } catch (err: any) {
+      logger.warn(`[LocationTracker] Stale driver sweep encountered an error: ${err.message}`);
+      return 0;
+    }
+  }
 }

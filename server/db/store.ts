@@ -269,14 +269,17 @@ export class MongoDatabaseStore implements IDatabaseStore {
       isOnline: doc.isOnline,
       isBusy: doc.isBusy || false,
       activeRideId: doc.activeRideId || undefined,
-      currentLocation: {
-        lat: doc.currentLocation?.lat ?? 24.7136,
-        lng: doc.currentLocation?.lng ?? 46.6753,
-        heading: doc.currentLocation?.heading || 0,
-        updatedAt:
-          doc.currentLocation?.updatedAt?.toISOString?.() ||
-          new Date(doc.currentLocation?.updatedAt || Date.now()).toISOString(),
-      },
+      currentLocation:
+        doc.currentLocation?.lat != null && doc.currentLocation?.lng != null
+          ? {
+              lat: doc.currentLocation.lat,
+              lng: doc.currentLocation.lng,
+              heading: doc.currentLocation?.heading || 0,
+              updatedAt:
+                doc.currentLocation?.updatedAt?.toISOString?.() ||
+                new Date(doc.currentLocation?.updatedAt || Date.now()).toISOString(),
+            }
+          : undefined,
       rating: doc.rating ?? 5.0,
       totalRides: doc.totalRides ?? 0,
       licenseNumber: doc.licenseNumber,
@@ -422,19 +425,20 @@ export class MongoDatabaseStore implements IDatabaseStore {
       userId: driver.userId,
       approvalStatus: driver.approvalStatus || 'PENDING',
       isOnline: driver.isOnline || false,
-      currentLocation: driver.currentLocation || {
-        lat: 24.7136,
-        lng: 46.6753,
-        heading: 0,
-        updatedAt: new Date(),
-      },
-      location: {
-        type: 'Point',
-        coordinates: [
-          driver.currentLocation?.lng ?? 46.6753,
-          driver.currentLocation?.lat ?? 24.7136,
-        ],
-      },
+      currentLocation: driver.currentLocation
+        ? {
+            lat: driver.currentLocation.lat,
+            lng: driver.currentLocation.lng,
+            heading: driver.currentLocation.heading || 0,
+            updatedAt: new Date(driver.currentLocation.updatedAt || Date.now()),
+          }
+        : undefined,
+      location: driver.currentLocation
+        ? {
+            type: 'Point',
+            coordinates: [driver.currentLocation.lng, driver.currentLocation.lat],
+          }
+        : undefined,
       rating: driver.rating || 5.0,
       totalRides: driver.totalRides || 0,
       licenseNumber: driver.licenseNumber,
@@ -826,7 +830,7 @@ export class MongoDatabaseStore implements IDatabaseStore {
     }
 
     try {
-      // 1. Production MongoDB 2dsphere $geoNear pipeline
+      // 1. Production MongoDB 2dsphere $geoNear aggregation with server-side vehicle lookup
       const pipeline: any[] = [
         {
           $geoNear: {
@@ -840,21 +844,42 @@ export class MongoDatabaseStore implements IDatabaseStore {
             spherical: true,
           },
         },
+        {
+          $lookup: {
+            from: 'vehicles',
+            let: { driverIdStr: { $toString: '$_id' } },
+            pipeline: [
+              { $match: { $expr: { $eq: ['$driverId', '$$driverIdStr'] } } },
+            ],
+            as: 'vehicleDoc',
+          },
+        },
+        {
+          $unwind: {
+            path: '$vehicleDoc',
+            preserveNullAndEmptyArrays: false, // Driver must possess an approved vehicle
+          },
+        },
       ];
+
+      if (category) {
+        pipeline.push({
+          $match: {
+            'vehicleDoc.category': category,
+          },
+        });
+      }
+
+      pipeline.push({ $limit: 25 });
 
       const geoDocs = await DriverModel.aggregate(pipeline);
       const results: Array<{ driver: IDriver; distanceKm: number }> = [];
 
       for (const doc of geoDocs) {
         const driver = this.docToDriver(doc);
-        const vehicle = await this.findVehicleByDriverId(driver.id);
-        if (vehicle) driver.vehicle = vehicle;
-
-        // Filter by category if specified
-        if (category && driver.vehicle && driver.vehicle.category !== category) {
-          continue;
+        if (doc.vehicleDoc) {
+          driver.vehicle = this.docToVehicle(doc.vehicleDoc);
         }
-
         const distanceKm = Math.round((doc.calculatedDistanceMeters / 1000) * 100) / 100;
         results.push({ driver, distanceKm });
       }
@@ -871,6 +896,10 @@ export class MongoDatabaseStore implements IDatabaseStore {
         if (vehicle) driver.vehicle = vehicle;
 
         if (category && driver.vehicle && driver.vehicle.category !== category) {
+          continue;
+        }
+
+        if (!driver.currentLocation) {
           continue;
         }
 

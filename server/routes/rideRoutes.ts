@@ -3,6 +3,7 @@ import { authenticate } from '../middleware/auth';
 import { db } from '../db/store';
 import { AppError } from '../middleware/errorHandler';
 import { FareService } from '../services/fareService';
+import { RoutingService } from '../services/routing/routingService';
 import { DispatchService } from '../services/dispatchService';
 import { PaymentService } from '../services/paymentService';
 import { IRide, RideStatus, VehicleCategory } from '../types';
@@ -14,20 +15,19 @@ export const rideRouter = Router();
 rideRouter.use(authenticate);
 
 // Estimate Fare
-rideRouter.post('/estimate', (req: Request, res: Response, next: NextFunction) => {
+rideRouter.post('/estimate', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { pickup, destination } = req.body;
     if (!pickup?.lat || !pickup?.lng || !destination?.lat || !destination?.lng) {
       throw new AppError('Valid pickup and destination coordinates are required', 400, 'INVALID_COORDINATES');
     }
 
-    const distanceKm = FareService.calculateDistanceKm(
-      pickup.lat,
-      pickup.lng,
-      destination.lat,
-      destination.lng
+    const route = await RoutingService.calculateRoute(
+      { lat: pickup.lat, lng: pickup.lng },
+      { lat: destination.lat, lng: destination.lng }
     );
-    const durationMinutes = FareService.estimateDurationMinutes(distanceKm);
+    const distanceKm = route.distanceKm;
+    const durationMinutes = route.durationMinutes;
 
     const categories: VehicleCategory[] = ['ECO', 'STANDARD', 'COMFORT', 'VIP'];
     const estimates = categories.map((cat) => {
@@ -38,6 +38,8 @@ rideRouter.post('/estimate', (req: Request, res: Response, next: NextFunction) =
         durationMinutes,
         estimatedFare: fare.total,
         breakdown: fare,
+        routePolyline: route.polyline,
+        routingProvider: route.provider,
       };
     });
 
@@ -47,6 +49,8 @@ rideRouter.post('/estimate', (req: Request, res: Response, next: NextFunction) =
         distanceKm,
         durationMinutes,
         estimates,
+        routePolyline: route.polyline,
+        routingProvider: route.provider,
       },
     });
   } catch (err) {
@@ -69,13 +73,12 @@ rideRouter.post('/request', async (req: Request, res: Response, next: NextFuncti
       throw new AppError('You already have an active ride in progress', 400, 'ACTIVE_RIDE_EXISTS');
     }
 
-    const distanceKm = FareService.calculateDistanceKm(
-      pickup.lat,
-      pickup.lng,
-      destination.lat,
-      destination.lng
+    const route = await RoutingService.calculateRoute(
+      { lat: pickup.lat, lng: pickup.lng },
+      { lat: destination.lat, lng: destination.lng }
     );
-    const durationMinutes = FareService.estimateDurationMinutes(distanceKm);
+    const distanceKm = route.distanceKm;
+    const durationMinutes = route.durationMinutes;
     const fare = FareService.calculateFare(distanceKm, durationMinutes, vehicleCategory as VehicleCategory);
 
     const ride: IRide = {

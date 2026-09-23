@@ -184,7 +184,7 @@ export async function acquireLockWithRetry(
     attempt++;
     if (attempt <= maxRetries) {
       // Exponential backoff with random jitter between 0 and 50ms
-      const jitter = Math.floor(Math.random() * 50);
+      const jitter = crypto.randomInt(0, 50);
       const delay = initialDelayMs * Math.pow(2, attempt - 1) + jitter;
       await new Promise((res) => setTimeout(res, delay));
     }

@@ -99,12 +99,6 @@ export class AuthService {
         userId,
         approvalStatus,
         isOnline: false, // Never online until admin approval and driver toggle
-        currentLocation: {
-          lat: 24.7136,
-          lng: 46.6753,
-          heading: 0,
-          updatedAt: new Date().toISOString(),
-        },
         vehicle,
         rating: 5.0,
         totalRides: 0,

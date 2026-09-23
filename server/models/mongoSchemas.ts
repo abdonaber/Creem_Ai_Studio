@@ -73,10 +73,10 @@ export const DriverSchema = new Schema<IDriverDocument>(
     isBusy: { type: Boolean, default: false, index: true },
     activeRideId: { type: String, default: null },
     currentLocation: {
-      lat: { type: Number, default: 24.7136 },
-      lng: { type: Number, default: 46.6753 },
+      lat: { type: Number },
+      lng: { type: Number },
       heading: { type: Number, default: 0 },
-      updatedAt: { type: Date, default: Date.now },
+      updatedAt: { type: Date },
     },
     location: {
       type: {
@@ -86,7 +86,6 @@ export const DriverSchema = new Schema<IDriverDocument>(
       },
       coordinates: {
         type: [Number], // [lng, lat]
-        default: [46.6753, 24.7136],
       },
     },
     rating: { type: Number, default: 5.0 },
@@ -104,7 +103,8 @@ export const DriverSchema = new Schema<IDriverDocument>(
 );
 
 DriverSchema.index({ isOnline: 1, approvalStatus: 1, isBusy: 1 });
-DriverSchema.index({ location: '2dsphere' });
+DriverSchema.index({ location: '2dsphere' }, { sparse: true });
+DriverSchema.index({ location: '2dsphere', isOnline: 1, approvalStatus: 1, isBusy: 1 });
 DriverSchema.index({ 'currentLocation.lat': 1, 'currentLocation.lng': 1 });
 DriverSchema.index({ 'currentLocation.updatedAt': -1 });
 
