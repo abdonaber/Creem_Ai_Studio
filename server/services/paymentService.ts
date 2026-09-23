@@ -62,43 +62,15 @@ export class PaymentService {
         );
       }
     } else if (method === 'CASH') {
-      // Cash paid directly by rider to driver
-      if (ride.driverId) {
-        const driver = await db.findDriverById(ride.driverId);
-        if (driver) {
-          const platformFee = Math.round(amount * 0.2 * 100) / 100;
-          try {
-            // Deduct platform commission from driver's wallet
-            await db.debitWallet(
-              driver.userId,
-              platformFee,
-              `Platform commission (20%) for cash ride #${rideId.slice(0, 8)}`,
-              rideId,
-              idempotencyKey ? `${idempotencyKey}_commission` : undefined
-            );
-          } catch {
-            console.warn(`[Payment] Driver ${driver.id} wallet debit deferred for cash commission.`);
-          }
-
-          await db.updateDriver(driver.id, {
-            earningsTotal: (driver.earningsTotal || 0) + (amount - platformFee),
-          });
-        }
+      if (!ride.driverId) {
+        throw new AppError('Cannot settle cash payment without an assigned driver', 400, 'NO_DRIVER_ASSIGNED');
       }
 
-      await db.updateRide(rideId, {
-        paymentStatus: 'SUCCEEDED',
-        paymentMethod: 'CASH',
-        finalFare: amount,
-      });
-
-      const payment = await db.createPayment({
+      const settleResult = await db.settleCashPayment({
         rideId,
-        userId: ride.riderId,
+        riderId: ride.riderId,
+        driverId: ride.driverId,
         amount,
-        currency: 'SAR',
-        status: 'SUCCEEDED',
-        paymentMethod: 'CASH',
         idempotencyKey,
       });
 
@@ -111,7 +83,7 @@ export class PaymentService {
         });
       }
 
-      return { success: true, paymentStatus: 'SUCCEEDED', transactionId: payment.id };
+      return { success: true, paymentStatus: 'SUCCEEDED', transactionId: settleResult.transactionId };
     } else {
       // Credit card via Stripe
       const intent = await StripeService.createPaymentIntent({
@@ -159,70 +131,131 @@ export class PaymentService {
       throw new AppError('Missing webhook signature.', 400, 'INVALID_SIGNATURE');
     }
 
-    // Persistent deduplication check
-    if (eventId) {
-      const alreadyProcessed = await db.isWebhookProcessed(eventId);
-      if (alreadyProcessed) {
-        console.warn(`[Payment] Duplicate webhook detected and safely skipped: ${eventId}`);
-        return true;
-      }
-    }
-
     const event = StripeService.constructWebhookEvent(payload, signature);
     const effectiveEventId = eventId || event.id;
 
     if (effectiveEventId) {
-      const alreadyProcessed = await db.isWebhookProcessed(effectiveEventId);
-      if (alreadyProcessed) {
+      const claim = await db.claimWebhookEvent(effectiveEventId, 'stripe', event.type);
+      if (!claim.claimed) {
+        if (claim.alreadyProcessed) {
+          return true;
+        }
+        console.warn(`[Payment] Webhook event ${effectiveEventId} is already being processed concurrently.`);
         return true;
       }
     }
 
-    if (event.type === 'payment_intent.succeeded') {
-      const paymentIntent = event.data.object as any;
-      const payment = await db.findPaymentByStripeIntent(paymentIntent.id);
-      if (payment) {
-        await db.updatePayment(payment.id, { status: 'SUCCEEDED' });
-        await db.updateRide(payment.rideId, { paymentStatus: 'SUCCEEDED' });
+    try {
+      if (event.type === 'payment_intent.succeeded') {
+        const paymentIntent = event.data.object as any;
+        const payment = await db.findPaymentByStripeIntent(paymentIntent.id);
+        if (payment && payment.status !== 'SUCCEEDED') {
+          await db.updatePayment(payment.id, { status: 'SUCCEEDED' });
+          await db.updateRide(payment.rideId, { paymentStatus: 'SUCCEEDED', finalFare: payment.amount });
 
-        const ride = await db.findRideById(payment.rideId);
-        if (ride?.driverId) {
-          const driver = await db.findDriverById(ride.driverId);
-          if (driver) {
-            const driverEarning = Math.round(payment.amount * 0.8 * 100) / 100;
-            await db.creditWallet(
-              driver.userId,
-              driverEarning,
-              `Earnings for card ride #${payment.rideId.slice(0, 8)}`,
-              payment.rideId
-            );
-            await db.updateDriver(driver.id, {
-              earningsTotal: (driver.earningsTotal || 0) + driverEarning,
+          await db.recordLedgerEntry({
+            rideId: payment.rideId,
+            type: 'RIDER_FARE',
+            amount: payment.amount,
+            currency: 'SAR',
+            fromAccount: `rider:${payment.userId}`,
+            toAccount: 'platform:escrow',
+            status: 'SETTLED',
+            idempotencyKey: `webhook_${effectiveEventId}_fare`,
+          });
+
+          const ride = await db.findRideById(payment.rideId);
+          if (ride?.driverId) {
+            const driver = await db.findDriverById(ride.driverId);
+            if (driver) {
+              const driverEarning = Math.round(payment.amount * 0.8 * 100) / 100;
+              const platformCommission = Math.round((payment.amount - driverEarning) * 100) / 100;
+
+              // Offset cash commission debt if any
+              let debtRecovery = 0;
+              if (driver.outstandingDebt && driver.outstandingDebt > 0) {
+                debtRecovery = Math.min(driverEarning, driver.outstandingDebt);
+              }
+
+              const netPayout = driverEarning - debtRecovery;
+              if (netPayout > 0) {
+                await db.creditWallet(
+                  driver.userId,
+                  netPayout,
+                  `Earnings for card ride #${payment.rideId.slice(0, 8)} (minus debt recovery)`,
+                  payment.rideId,
+                  `webhook_${effectiveEventId}_credit`
+                );
+              }
+
+              if (debtRecovery > 0) {
+                await db.updateDriver(driver.id, {
+                  outstandingDebt: Math.max(0, (driver.outstandingDebt || 0) - debtRecovery),
+                });
+                await db.recordLedgerEntry({
+                  rideId: payment.rideId,
+                  type: 'DEBT_RECOVERY',
+                  amount: debtRecovery,
+                  currency: 'SAR',
+                  fromAccount: `driver:${driver.id}`,
+                  toAccount: 'platform:commission',
+                  status: 'SETTLED',
+                  idempotencyKey: `webhook_${effectiveEventId}_debt_rec`,
+                });
+              }
+
+              await db.recordLedgerEntry({
+                rideId: payment.rideId,
+                type: 'PLATFORM_COMMISSION',
+                amount: platformCommission,
+                currency: 'SAR',
+                fromAccount: 'platform:escrow',
+                toAccount: 'platform:revenue',
+                status: 'COMMITTED',
+                idempotencyKey: `webhook_${effectiveEventId}_comm`,
+              });
+
+              await db.updateDriver(driver.id, {
+                earningsTotal: (driver.earningsTotal || 0) + driverEarning,
+                totalRides: (driver.totalRides || 0) + 1,
+              });
+            }
+          }
+
+          if (io) {
+            io.to(`ride:${payment.rideId}`).emit('ride:payment_completed', {
+              rideId: payment.rideId,
+              status: 'SUCCEEDED',
+              method: 'CREDIT_CARD',
+              amount: payment.amount,
             });
           }
         }
-
-        if (io) {
-          io.to(`ride:${payment.rideId}`).emit('ride:payment_completed', {
-            rideId: payment.rideId,
-            status: 'SUCCEEDED',
-            method: 'CREDIT_CARD',
-            amount: payment.amount,
-          });
-        }
       }
-    }
 
-    if (effectiveEventId) {
-      await db.recordProcessedWebhook(
-        effectiveEventId,
-        'stripe',
-        event.type,
-        { id: event.id, type: event.type },
-        'PROCESSED'
-      );
-    }
+      if (effectiveEventId) {
+        await db.recordProcessedWebhook(
+          effectiveEventId,
+          'stripe',
+          event.type,
+          { id: event.id, type: event.type },
+          'PROCESSED'
+        );
+      }
 
-    return true;
+      return true;
+    } catch (err: any) {
+      if (effectiveEventId) {
+        await db.recordProcessedWebhook(
+          effectiveEventId,
+          'stripe',
+          event.type,
+          { id: event.id, type: event.type },
+          'FAILED',
+          err.message
+        );
+      }
+      throw err;
+    }
   }
 }

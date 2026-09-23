@@ -7,6 +7,7 @@ import { db } from '../db/store';
 import { AuthPayload } from '../middleware/auth';
 import { IMessage } from '../types';
 import { generateId } from '../utils/id';
+import { LocationService } from '../services/locationService';
 
 export let io: SocketIOServer | null = null;
 
@@ -115,7 +116,7 @@ export function initSocketIO(server: any): SocketIOServer {
       socket.leave(`ride:${data.rideId}`);
     });
 
-    // Driver Location Update (Driver only, strictly authenticated)
+    // Driver Location Update (Driver only, strictly authenticated with rate limiting & anti-spoofing)
     socket.on('driver:location_update', async (data: { lat: number; lng: number; heading?: number }) => {
       if (user.role !== 'DRIVER') {
         socket.emit('error', { message: 'Only drivers can publish location updates' });
@@ -127,46 +128,17 @@ export function initSocketIO(server: any): SocketIOServer {
         return;
       }
 
-      // Payload coordinate bounds check
-      if (
-        typeof data.lat !== 'number' ||
-        typeof data.lng !== 'number' ||
-        data.lat < -90 ||
-        data.lat > 90 ||
-        data.lng < -180 ||
-        data.lng > 180
-      ) {
-        return;
-      }
-
-      const updatedLoc = {
+      const result = await LocationService.processDriverLocationUpdate({
+        driverId: driver.id,
+        userId: user.userId,
         lat: data.lat,
         lng: data.lng,
-        heading: data.heading || 0,
-        updatedAt: new Date().toISOString(),
-      };
-
-      await db.updateDriver(driver.id, { currentLocation: updatedLoc });
-
-      // If driver is currently on an active ride, update and broadcast to the ride room
-      const allDriverRides = await db.getRidesByDriverId(driver.id);
-      const activeRides = allDriverRides.filter((r) =>
-        ['DRIVER_ASSIGNED', 'DRIVER_ARRIVING', 'DRIVER_ARRIVED', 'RIDE_STARTED'].includes(r.status)
-      );
-
-      for (const ride of activeRides) {
-        await db.updateRide(ride.id, { currentDriverLocation: { lat: data.lat, lng: data.lng } });
-        io?.to(`ride:${ride.id}`).emit('driver:moved', {
-          rideId: ride.id,
-          location: updatedLoc,
-        });
-      }
-
-      // Broadcast to admins for live fleet map
-      io?.to('role:admins').emit('driver:fleet_location', {
-        driverId: driver.id,
-        location: updatedLoc,
+        heading: data.heading,
       });
+
+      if (!result.accepted && result.reason === 'UNREALISTIC_MOVEMENT_SPOOFING') {
+        socket.emit('location:rejected', { reason: result.reason });
+      }
     });
 
     // In-Ride Chat Messaging
@@ -217,4 +189,14 @@ export function initSocketIO(server: any): SocketIOServer {
   });
 
   return io;
+}
+
+export async function closeSocketIO(): Promise<void> {
+  if (io) {
+    await new Promise<void>((resolve) => {
+      io!.close(() => resolve());
+    });
+    io = null;
+    console.log('[Socket.IO] Server closed.');
+  }
 }

@@ -12,10 +12,12 @@ import {
   INotification,
   IAuditLog,
   IPayment,
+  IPlatformLedger,
   RideStatus,
   VehicleCategory,
 } from '../server/types';
 import { AppError } from '../server/middleware/errorHandler';
+import { generateId } from '../server/utils/id';
 
 export class TestDatabaseStore implements IDatabaseStore {
   public users = new Map<string, IUser>();
@@ -26,6 +28,7 @@ export class TestDatabaseStore implements IDatabaseStore {
   public wallets = new Map<string, IWallet>();
   public transactions = new Map<string, IWalletTransaction[]>();
   public payments = new Map<string, IPayment>();
+  public ledger: IPlatformLedger[] = [];
   public ratings: IRating[] = [];
   public messages: IMessage[] = [];
   public notifications: INotification[] = [];
@@ -67,7 +70,7 @@ export class TestDatabaseStore implements IDatabaseStore {
     return null;
   }
   async createUser(user: Partial<IUser>): Promise<IUser> {
-    const id = user.id || 'usr_' + Math.random().toString(36).substring(2, 9);
+    const id = user.id || generateId('usr');
     const created: IUser = {
       id,
       name: user.name || '',
@@ -105,7 +108,7 @@ export class TestDatabaseStore implements IDatabaseStore {
     return null;
   }
   async createDriver(driver: Partial<IDriver>): Promise<IDriver> {
-    const id = driver.id || 'drv_' + Math.random().toString(36).substring(2, 9);
+    const id = driver.id || generateId('drv');
     const created: IDriver = {
       id,
       userId: driver.userId!,
@@ -145,7 +148,7 @@ export class TestDatabaseStore implements IDatabaseStore {
     return this.vehicles.get(driverId) || null;
   }
   async createVehicle(vehicle: Partial<IVehicle>): Promise<IVehicle> {
-    const id = vehicle.id || 'veh_' + Math.random().toString(36).substring(2, 9);
+    const id = vehicle.id || generateId('veh');
     const created: IVehicle = {
       id,
       driverId: vehicle.driverId!,
@@ -169,7 +172,7 @@ export class TestDatabaseStore implements IDatabaseStore {
 
   // Rides
   async createRide(ride: Partial<IRide>): Promise<IRide> {
-    const id = ride.id || 'ride_' + Math.random().toString(36).substring(2, 9);
+    const id = ride.id || generateId('ride');
     const created: IRide = {
       id,
       riderId: ride.riderId!,
@@ -303,7 +306,7 @@ export class TestDatabaseStore implements IDatabaseStore {
   }
 
   async createRideOffer(offer: Partial<IRideOffer>): Promise<IRideOffer> {
-    const id = 'offer_' + Math.random().toString(36).substring(2, 9);
+    const id = offer.id || generateId('offer');
     const created: IRideOffer = {
       id,
       rideId: offer.rideId!,
@@ -380,7 +383,7 @@ export class TestDatabaseStore implements IDatabaseStore {
     }
     wallet.balance -= amount;
     const tx: IWalletTransaction = {
-      id: 'tx_' + Math.random().toString(36).substring(2, 9),
+      id: generateId('tx'),
       walletId: wallet.id,
       userId,
       amount,
@@ -405,7 +408,7 @@ export class TestDatabaseStore implements IDatabaseStore {
     const wallet = await this.getOrCreateWallet(userId);
     wallet.balance += amount;
     const tx: IWalletTransaction = {
-      id: 'tx_' + Math.random().toString(36).substring(2, 9),
+      id: generateId('tx'),
       walletId: wallet.id,
       userId,
       amount,
@@ -444,7 +447,7 @@ export class TestDatabaseStore implements IDatabaseStore {
 
   // Payments
   async createPayment(payment: Partial<IPayment>): Promise<IPayment> {
-    const id = payment.id || 'pay_' + Math.random().toString(36).substring(2, 9);
+    const id = payment.id || generateId('pay');
     const p: IPayment = {
       id,
       rideId: payment.rideId!,
@@ -485,14 +488,130 @@ export class TestDatabaseStore implements IDatabaseStore {
   async isWebhookProcessed(eventId: string): Promise<boolean> {
     return this.processedWebhooks.has(eventId);
   }
+  async claimWebhookEvent(
+    eventId: string,
+    source: string,
+    type: string
+  ): Promise<{ claimed: boolean; alreadyProcessed: boolean }> {
+    if (this.processedWebhooks.has(eventId)) {
+      return { claimed: false, alreadyProcessed: true };
+    }
+    this.processedWebhooks.add(eventId);
+    return { claimed: true, alreadyProcessed: false };
+  }
   async recordProcessedWebhook(eventId: string): Promise<void> {
     this.processedWebhooks.add(eventId);
+  }
+
+  // Ledger & Cash Settlement
+  async recordLedgerEntry(entry: Omit<IPlatformLedger, 'id' | 'createdAt'>): Promise<IPlatformLedger> {
+    const l: IPlatformLedger = {
+      id: generateId('led'),
+      rideId: entry.rideId,
+      type: entry.type,
+      amount: entry.amount,
+      currency: entry.currency || 'SAR',
+      fromAccount: entry.fromAccount,
+      toAccount: entry.toAccount,
+      status: entry.status || 'COMMITTED',
+      idempotencyKey: entry.idempotencyKey,
+      createdAt: new Date().toISOString(),
+    };
+    this.ledger.push(l);
+    return l;
+  }
+  async getPlatformLedger(limit: number = 100, filter?: Partial<IPlatformLedger>): Promise<IPlatformLedger[]> {
+    let result = [...this.ledger];
+    if (filter?.rideId) result = result.filter((x) => x.rideId === filter.rideId);
+    if (filter?.type) result = result.filter((x) => x.type === filter.type);
+    if (filter?.status) result = result.filter((x) => x.status === filter.status);
+    return result.slice(0, limit);
+  }
+  async settleCashPayment(params: {
+    rideId: string;
+    riderId: string;
+    driverId: string;
+    amount: number;
+    idempotencyKey?: string;
+  }): Promise<{ success: boolean; transactionId: string; platformFee: number; commissionDebt: number }> {
+    const platformFee = Math.round(params.amount * 0.2 * 100) / 100;
+    let debtIncurred = 0;
+
+    const payment = await this.createPayment({
+      rideId: params.rideId,
+      userId: params.riderId,
+      amount: params.amount,
+      currency: 'SAR',
+      status: 'SUCCEEDED',
+      paymentMethod: 'CASH',
+      idempotencyKey: params.idempotencyKey,
+    });
+
+    // Record Rider cash payment ledger entry
+    await this.recordLedgerEntry({
+      rideId: params.rideId,
+      type: 'RIDER_FARE',
+      amount: params.amount,
+      currency: 'SAR',
+      fromAccount: `rider:${params.riderId}`,
+      toAccount: `driver:${params.driverId}`,
+      status: 'COMMITTED',
+      idempotencyKey: params.idempotencyKey ? `${params.idempotencyKey}_rider` : undefined,
+    });
+
+    // Process driver commission
+    const driver = await this.findDriverById(params.driverId);
+    if (driver) {
+      const driverWallet = await this.getOrCreateWallet(driver.userId);
+      if (driverWallet.balance >= platformFee) {
+        await this.debitWallet(
+          driver.userId,
+          platformFee,
+          `Platform commission (20%) for cash ride #${params.rideId.slice(0, 8)}`,
+          params.rideId
+        );
+        await this.recordLedgerEntry({
+          rideId: params.rideId,
+          type: 'PLATFORM_COMMISSION',
+          amount: platformFee,
+          currency: 'SAR',
+          fromAccount: `driver:${driver.id}`,
+          toAccount: 'platform:commission',
+          status: 'COMMITTED',
+        });
+      } else {
+        debtIncurred = platformFee;
+        driver.outstandingDebt = (driver.outstandingDebt || 0) + debtIncurred;
+        await this.recordLedgerEntry({
+          rideId: params.rideId,
+          type: 'COMMISSION_DEBT',
+          amount: debtIncurred,
+          currency: 'SAR',
+          fromAccount: `driver:${driver.id}`,
+          toAccount: 'platform:debt',
+          status: 'OUTSTANDING',
+        });
+      }
+    }
+
+    await this.updateRide(params.rideId, {
+      paymentStatus: 'SUCCEEDED',
+      paymentMethod: 'CASH',
+      finalFare: params.amount,
+    });
+
+    return {
+      success: true,
+      transactionId: payment.id,
+      platformFee,
+      commissionDebt: debtIncurred,
+    };
   }
 
   // Ratings
   async createRating(rating: Partial<IRating>): Promise<IRating> {
     const r: IRating = {
-      id: 'rat_' + Math.random().toString(36).substring(2, 9),
+      id: generateId('rat'),
       rideId: rating.rideId!,
       fromUserId: rating.fromUserId!,
       toUserId: rating.toUserId!,
@@ -513,7 +632,7 @@ export class TestDatabaseStore implements IDatabaseStore {
   // Messages
   async createMessage(msg: Partial<IMessage>): Promise<IMessage> {
     const m: IMessage = {
-      id: 'msg_' + Math.random().toString(36).substring(2, 9),
+      id: generateId('msg'),
       rideId: msg.rideId!,
       senderId: msg.senderId!,
       senderName: msg.senderName || '',
@@ -532,7 +651,7 @@ export class TestDatabaseStore implements IDatabaseStore {
   // Notifications
   async createNotification(notif: Partial<INotification>): Promise<INotification> {
     const n: INotification = {
-      id: 'notif_' + Math.random().toString(36).substring(2, 9),
+      id: generateId('notif'),
       userId: notif.userId!,
       title: notif.title || '',
       body: notif.body || (notif as any).message || '',
@@ -575,7 +694,7 @@ export class TestDatabaseStore implements IDatabaseStore {
   // Audit
   async logAudit(userId: string, action: string, details?: any, ip?: string): Promise<void> {
     this.auditLogs.push({
-      id: 'aud_' + Math.random().toString(36).substring(2, 9),
+      id: generateId('aud'),
       userId,
       action,
       details: details || {},
@@ -585,7 +704,7 @@ export class TestDatabaseStore implements IDatabaseStore {
   }
   async createAuditLog(log: Partial<IAuditLog>): Promise<IAuditLog> {
     const a: IAuditLog = {
-      id: 'aud_' + Math.random().toString(36).substring(2, 9),
+      id: generateId('aud'),
       userId: log.userId || '',
       action: log.action || '',
       details: log.details || {},
@@ -608,10 +727,116 @@ export class TestDatabaseStore implements IDatabaseStore {
     };
   }
 
+  async getRidesPaginated(options: {
+    page?: number;
+    limit?: number;
+    status?: string;
+    riderId?: string;
+    driverId?: string;
+    search?: string;
+    startDate?: string;
+    endDate?: string;
+  }): Promise<{ data: IRide[]; total: number; page: number; totalPages: number }> {
+    let arr = Array.from(this.rides.values());
+    if (options.status) arr = arr.filter((r) => r.status === options.status);
+    if (options.riderId) arr = arr.filter((r) => r.riderId === options.riderId);
+    if (options.driverId) arr = arr.filter((r) => r.driverId === options.driverId);
+
+    const page = Math.max(1, options.page || 1);
+    const limit = Math.min(100, Math.max(1, options.limit || 20));
+    const total = arr.length;
+    const skip = (page - 1) * limit;
+
+    return {
+      data: arr.slice(skip, skip + limit),
+      total,
+      page,
+      totalPages: Math.ceil(total / limit) || 1,
+    };
+  }
+
+  async getUsersPaginated(options: {
+    page?: number;
+    limit?: number;
+    role?: string;
+    search?: string;
+  }): Promise<{ data: Omit<IUser, 'passwordHash'>[]; total: number; page: number; totalPages: number }> {
+    let arr = Array.from(this.users.values()).map((u) => {
+      const { passwordHash: _, ...safe } = u as any;
+      return safe;
+    });
+    if (options.role) arr = arr.filter((u) => u.role === options.role);
+    if (options.search) {
+      const s = options.search.toLowerCase();
+      arr = arr.filter((u) => u.name?.toLowerCase().includes(s) || u.email?.toLowerCase().includes(s));
+    }
+
+    const page = Math.max(1, options.page || 1);
+    const limit = Math.min(100, Math.max(1, options.limit || 20));
+    const total = arr.length;
+    const skip = (page - 1) * limit;
+
+    return {
+      data: arr.slice(skip, skip + limit),
+      total,
+      page,
+      totalPages: Math.ceil(total / limit) || 1,
+    };
+  }
+
+  async getDriversPaginated(options: {
+    page?: number;
+    limit?: number;
+    approvalStatus?: string;
+    isOnline?: boolean;
+    search?: string;
+  }): Promise<{ data: IDriver[]; total: number; page: number; totalPages: number }> {
+    let arr = Array.from(this.drivers.values());
+    if (options.approvalStatus) arr = arr.filter((d) => d.approvalStatus === options.approvalStatus);
+    if (options.isOnline !== undefined) arr = arr.filter((d) => d.isOnline === options.isOnline);
+
+    const page = Math.max(1, options.page || 1);
+    const limit = Math.min(100, Math.max(1, options.limit || 20));
+    const total = arr.length;
+    const skip = (page - 1) * limit;
+
+    return {
+      data: arr.slice(skip, skip + limit),
+      total,
+      page,
+      totalPages: Math.ceil(total / limit) || 1,
+    };
+  }
+
+  async getFinancialSummary(): Promise<{
+    totalGrossVolume: number;
+    totalPlatformRevenue: number;
+    totalDriverPayouts: number;
+    totalOutstandingDebt: number;
+    transactionCount: number;
+  }> {
+    const succeeded = Array.from(this.payments.values()).filter((p) => p.status === 'SUCCEEDED');
+    const totalGrossVolume = succeeded.reduce((sum, p) => sum + (p.amount || 0), 0);
+    const totalPlatformRevenue = Math.round(totalGrossVolume * 0.2 * 100) / 100;
+    const totalDriverPayouts = Math.round((totalGrossVolume - totalPlatformRevenue) * 100) / 100;
+    const totalOutstandingDebt = Array.from(this.drivers.values()).reduce(
+      (sum, d) => sum + ((d as any).outstandingDebt || 0),
+      0
+    );
+
+    return {
+      totalGrossVolume,
+      totalPlatformRevenue,
+      totalDriverPayouts,
+      totalOutstandingDebt,
+      transactionCount: succeeded.length,
+    };
+  }
+
   // Sessions
   async createRefreshSession(session: any): Promise<IRefreshSession> {
     const s: IRefreshSession = {
-      id: 'ses_' + Math.random().toString(36).substring(2, 9),
+      id: generateId('ses'),
       userId: session.userId,
       jti: session.jti,
       tokenHash: session.tokenHash,

@@ -70,6 +70,7 @@ export interface IDriver {
     idCardPhoto?: string;
   };
   earningsTotal: number;
+  outstandingDebt?: number;
 }
 
 export interface IRideOffer {
@@ -200,3 +201,23 @@ export interface IPayment {
   metadata?: Record<string, any>;
   createdAt: string;
 }
+
+export interface IPlatformLedger {
+  id: string;
+  rideId: string;
+  type:
+    | 'RIDER_FARE'
+    | 'DRIVER_EARNING'
+    | 'PLATFORM_COMMISSION'
+    | 'COMMISSION_DEBT'
+    | 'DEBT_RECOVERY'
+    | 'REFUND';
+  amount: number;
+  currency: string;
+  fromAccount: string;
+  toAccount: string;
+  status: 'COMMITTED' | 'OUTSTANDING' | 'SETTLED';
+  idempotencyKey?: string;
+  createdAt: string;
+}
+

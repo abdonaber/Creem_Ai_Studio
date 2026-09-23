@@ -54,6 +54,11 @@ export const config = {
   stripePublishableKey: process.env.STRIPE_PUBLISHABLE_KEY || '',
   stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET || '',
 
+  // Routing & Maps
+  mapsApiKey: process.env.GOOGLE_MAPS_API_KEY || '',
+  mapboxAccessToken: process.env.MAPBOX_ACCESS_TOKEN || '',
+  routingProvider: (process.env.ROUTING_PROVIDER || 'auto') as 'google' | 'mapbox' | 'osrm' | 'haversine' | 'auto',
+
   // Operational Settings
   allowedOrigins,
   corsOrigin: allowedOrigins.length === 1 ? allowedOrigins[0] : allowedOrigins,

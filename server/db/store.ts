@@ -1,5 +1,5 @@
 import mongoose from 'mongoose';
-import { acquireLock, releaseLock } from '../redis/redisClient';
+import { acquireLock, releaseLock, LockAcquisitionResult } from '../redis/redisClient';
 import {
   UserModel,
   DriverModel,
@@ -15,6 +15,7 @@ import {
   AuditLogModel,
   RefreshSessionModel,
   WebhookEventModel,
+  PlatformLedgerModel,
 } from '../models/mongoSchemas';
 import { isDbConnected } from './connection';
 import {
@@ -30,6 +31,7 @@ import {
   INotification,
   IAuditLog,
   IPayment,
+  IPlatformLedger,
   RideStatus,
   VehicleCategory,
 } from '../types';
@@ -136,6 +138,11 @@ export interface IDatabaseStore {
 
   // Webhook Deduplication & Idempotency
   isWebhookProcessed(eventId: string): Promise<boolean>;
+  claimWebhookEvent(
+    eventId: string,
+    source: string,
+    type: string
+  ): Promise<{ claimed: boolean; alreadyProcessed: boolean }>;
   recordProcessedWebhook(
     eventId: string,
     source: string,
@@ -144,6 +151,49 @@ export interface IDatabaseStore {
     status?: 'PROCESSED' | 'FAILED',
     errorMessage?: string
   ): Promise<void>;
+
+  // Platform Ledger & Cash Settlement
+  recordLedgerEntry(entry: Omit<IPlatformLedger, 'id' | 'createdAt'>): Promise<IPlatformLedger>;
+  getPlatformLedger(limit?: number, filter?: Partial<IPlatformLedger>): Promise<IPlatformLedger[]>;
+  settleCashPayment(params: {
+    rideId: string;
+    riderId: string;
+    driverId: string;
+    amount: number;
+    idempotencyKey?: string;
+  }): Promise<{ success: boolean; transactionId: string; platformFee: number; commissionDebt: number }>;
+
+  // Paginated Administrative Queries
+  getRidesPaginated(options: {
+    page?: number;
+    limit?: number;
+    status?: string;
+    riderId?: string;
+    driverId?: string;
+    search?: string;
+    startDate?: string;
+    endDate?: string;
+  }): Promise<{ data: IRide[]; total: number; page: number; totalPages: number }>;
+  getUsersPaginated(options: {
+    page?: number;
+    limit?: number;
+    role?: string;
+    search?: string;
+  }): Promise<{ data: Omit<IUser, 'passwordHash'>[]; total: number; page: number; totalPages: number }>;
+  getDriversPaginated(options: {
+    page?: number;
+    limit?: number;
+    approvalStatus?: string;
+    isOnline?: boolean;
+    search?: string;
+  }): Promise<{ data: IDriver[]; total: number; page: number; totalPages: number }>;
+  getFinancialSummary(): Promise<{
+    totalGrossVolume: number;
+    totalPlatformRevenue: number;
+    totalDriverPayouts: number;
+    totalOutstandingDebt: number;
+    transactionCount: number;
+  }>;
 
   // Rating Operations
   createRating(rating: Partial<IRating>): Promise<IRating>;
@@ -641,7 +691,7 @@ export class MongoDatabaseStore implements IDatabaseStore {
       return { success: false, message: 'Captain reservation in progress. Please try again.' };
     }
 
-    let rideLock: { acquired: boolean; token: string } | null = null;
+    let rideLock: LockAcquisitionResult | null = null;
     try {
       // 2. Atomic Driver Reservation in MongoDB:
       // Captain must be approved, online, and NOT already busy
@@ -671,7 +721,7 @@ export class MongoDatabaseStore implements IDatabaseStore {
 
       // 3. Acquire Ride Lock
       rideLock = await acquireLock(rideLockKey, 8000);
-      if (!rideLock.acquired) {
+      if (!rideLock || !rideLock.acquired) {
         // Rollback driver reservation
         await DriverModel.updateOne(
           { ...driverQuery, activeRideId: rideId },
@@ -757,9 +807,10 @@ export class MongoDatabaseStore implements IDatabaseStore {
   }): Promise<Array<{ driver: IDriver; distanceKm: number }>> {
     this.ensureConnection();
     const { pickupLat, pickupLng, radiusKm, category, excludedDriverIds = [] } = params;
+    const maxDistanceMeters = radiusKm * 1000;
 
     // Must be online, approved, and not busy
-    const filter: any = {
+    const matchFilter: any = {
       isOnline: true,
       approvalStatus: 'APPROVED',
       isBusy: { $ne: true },
@@ -769,40 +820,79 @@ export class MongoDatabaseStore implements IDatabaseStore {
       const validIds = excludedDriverIds
         .filter((id) => mongoose.Types.ObjectId.isValid(id))
         .map((id) => new mongoose.Types.ObjectId(id));
-      filter._id = { $nin: validIds };
+      if (validIds.length > 0) {
+        matchFilter._id = { $nin: validIds };
+      }
     }
 
-    const driverDocs = await DriverModel.find(filter).lean();
-    const results: Array<{ driver: IDriver; distanceKm: number }> = [];
+    try {
+      // 1. Production MongoDB 2dsphere $geoNear pipeline
+      const pipeline: any[] = [
+        {
+          $geoNear: {
+            near: {
+              type: 'Point',
+              coordinates: [pickupLng, pickupLat],
+            },
+            distanceField: 'calculatedDistanceMeters',
+            maxDistance: maxDistanceMeters,
+            query: matchFilter,
+            spherical: true,
+          },
+        },
+      ];
 
-    for (const doc of driverDocs) {
-      const driver = this.docToDriver(doc);
-      const vehicle = await this.findVehicleByDriverId(driver.id);
-      if (vehicle) driver.vehicle = vehicle;
+      const geoDocs = await DriverModel.aggregate(pipeline);
+      const results: Array<{ driver: IDriver; distanceKm: number }> = [];
 
-      // Filter by vehicle category if specified
-      if (category && driver.vehicle && driver.vehicle.category !== category) {
-        continue;
-      }
+      for (const doc of geoDocs) {
+        const driver = this.docToDriver(doc);
+        const vehicle = await this.findVehicleByDriverId(driver.id);
+        if (vehicle) driver.vehicle = vehicle;
 
-      // Calculate distance using Haversine formula
-      const dLat = (driver.currentLocation.lat - pickupLat) * (Math.PI / 180);
-      const dLng = (driver.currentLocation.lng - pickupLng) * (Math.PI / 180);
-      const a =
-        Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-        Math.cos(pickupLat * (Math.PI / 180)) *
-          Math.cos(driver.currentLocation.lat * (Math.PI / 180)) *
-          Math.sin(dLng / 2) *
-          Math.sin(dLng / 2);
-      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-      const distanceKm = Math.round(6371 * c * 100) / 100;
+        // Filter by category if specified
+        if (category && driver.vehicle && driver.vehicle.category !== category) {
+          continue;
+        }
 
-      if (distanceKm <= radiusKm) {
+        const distanceKm = Math.round((doc.calculatedDistanceMeters / 1000) * 100) / 100;
         results.push({ driver, distanceKm });
       }
-    }
 
-    return results.sort((a, b) => a.distanceKm - b.distanceKm);
+      return results;
+    } catch {
+      // 2. Resilient fallback to coordinate bounding & precise Haversine
+      const driverDocs = await DriverModel.find(matchFilter).lean();
+      const results: Array<{ driver: IDriver; distanceKm: number }> = [];
+
+      for (const doc of driverDocs) {
+        const driver = this.docToDriver(doc);
+        const vehicle = await this.findVehicleByDriverId(driver.id);
+        if (vehicle) driver.vehicle = vehicle;
+
+        if (category && driver.vehicle && driver.vehicle.category !== category) {
+          continue;
+        }
+
+        // Calculate distance using Haversine formula
+        const dLat = (driver.currentLocation.lat - pickupLat) * (Math.PI / 180);
+        const dLng = (driver.currentLocation.lng - pickupLng) * (Math.PI / 180);
+        const a =
+          Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+          Math.cos(pickupLat * (Math.PI / 180)) *
+            Math.cos(driver.currentLocation.lat * (Math.PI / 180)) *
+            Math.sin(dLng / 2) *
+            Math.sin(dLng / 2);
+        const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+        const distanceKm = Math.round(6371 * c * 100) / 100;
+
+        if (distanceKm <= radiusKm) {
+          results.push({ driver, distanceKm });
+        }
+      }
+
+      return results.sort((a, b) => a.distanceKm - b.distanceKm);
+    }
   }
 
   // ==========================================
@@ -1105,7 +1195,7 @@ export class MongoDatabaseStore implements IDatabaseStore {
     }
 
     // Debit rider
-    const debitResult = await this.debitWallet(
+    await this.debitWallet(
       riderId,
       amount,
       `Payment for ride #${rideId.slice(0, 8)}`,
@@ -1113,18 +1203,68 @@ export class MongoDatabaseStore implements IDatabaseStore {
       idempotencyKey ? `${idempotencyKey}_debit` : undefined
     );
 
+    await this.recordLedgerEntry({
+      rideId,
+      type: 'RIDER_FARE',
+      amount,
+      currency: 'SAR',
+      fromAccount: `rider:${riderId}`,
+      toAccount: 'platform:escrow',
+      status: 'SETTLED',
+      idempotencyKey: idempotencyKey ? `${idempotencyKey}_ledger_fare` : undefined,
+    });
+
     // Credit driver (80% net earnings after 20% platform commission)
     if (driverId) {
       const driver = await this.findDriverById(driverId);
       if (driver) {
         const driverEarning = Math.round(amount * 0.8 * 100) / 100;
-        await this.creditWallet(
-          driver.userId,
-          driverEarning,
-          `Net earnings for ride #${rideId.slice(0, 8)} (80%)`,
+        const platformCommission = Math.round((amount - driverEarning) * 100) / 100;
+
+        // Automatically offset outstanding cash commission debt if any
+        let debtRecovery = 0;
+        if (driver.outstandingDebt && driver.outstandingDebt > 0) {
+          debtRecovery = Math.min(driverEarning, driver.outstandingDebt);
+        }
+
+        const netPayout = driverEarning - debtRecovery;
+        if (netPayout > 0) {
+          await this.creditWallet(
+            driver.userId,
+            netPayout,
+            `Net earnings for ride #${rideId.slice(0, 8)} (80% minus debt recovery)`,
+            rideId,
+            idempotencyKey ? `${idempotencyKey}_driver_credit` : undefined
+          );
+        }
+
+        if (debtRecovery > 0) {
+          await DriverModel.findByIdAndUpdate(driver.id, {
+            $inc: { outstandingDebt: -debtRecovery },
+          });
+          await this.recordLedgerEntry({
+            rideId,
+            type: 'DEBT_RECOVERY',
+            amount: debtRecovery,
+            currency: 'SAR',
+            fromAccount: `driver:${driver.id}`,
+            toAccount: 'platform:commission',
+            status: 'SETTLED',
+            idempotencyKey: idempotencyKey ? `${idempotencyKey}_debt_rec` : undefined,
+          });
+        }
+
+        await this.recordLedgerEntry({
           rideId,
-          idempotencyKey ? `${idempotencyKey}_driver_credit` : undefined
-        );
+          type: 'PLATFORM_COMMISSION',
+          amount: platformCommission,
+          currency: 'SAR',
+          fromAccount: 'platform:escrow',
+          toAccount: 'platform:revenue',
+          status: 'COMMITTED',
+          idempotencyKey: idempotencyKey ? `${idempotencyKey}_ledger_comm` : undefined,
+        });
+
         await DriverModel.findByIdAndUpdate(driver.id, {
           $inc: { earningsTotal: driverEarning, totalRides: 1 },
         });
@@ -1150,6 +1290,110 @@ export class MongoDatabaseStore implements IDatabaseStore {
     });
 
     return { success: true, transactionId: payment.id };
+  }
+
+  public async settleCashPayment(params: {
+    rideId: string;
+    riderId: string;
+    driverId: string;
+    amount: number;
+    idempotencyKey?: string;
+  }): Promise<{ success: boolean; transactionId: string; platformFee: number; commissionDebt: number }> {
+    this.ensureConnection();
+    const { rideId, riderId, driverId, amount, idempotencyKey } = params;
+
+    const existingPayment = await PaymentModel.findOne({ rideId, status: 'SUCCEEDED' }).lean();
+    if (existingPayment) {
+      return {
+        success: true,
+        transactionId: existingPayment._id.toString(),
+        platformFee: Math.round(amount * 0.2 * 100) / 100,
+        commissionDebt: 0,
+      };
+    }
+
+    const platformFee = Math.round(amount * 0.2 * 100) / 100;
+    const driverEarning = Math.round((amount - platformFee) * 100) / 100;
+    const driver = await this.findDriverById(driverId);
+    let debtIncurred = 0;
+
+    if (driver) {
+      const driverWallet = await this.getOrCreateWallet(driver.userId);
+      if (driverWallet.balance >= platformFee) {
+        // Sufficient funds in wallet: deduct platform commission immediately
+        await this.debitWallet(
+          driver.userId,
+          platformFee,
+          `Platform commission (20%) for cash ride #${rideId.slice(0, 8)}`,
+          rideId,
+          idempotencyKey ? `${idempotencyKey}_cash_comm` : undefined
+        );
+        await this.recordLedgerEntry({
+          rideId,
+          type: 'PLATFORM_COMMISSION',
+          amount: platformFee,
+          currency: 'SAR',
+          fromAccount: `driver:${driver.id}`,
+          toAccount: 'platform:commission',
+          status: 'COMMITTED',
+          idempotencyKey: idempotencyKey ? `${idempotencyKey}_ledger_comm` : undefined,
+        });
+      } else {
+        // Partial or zero balance in wallet
+        const available = Math.max(0, driverWallet.balance);
+        if (available > 0) {
+          await this.debitWallet(
+            driver.userId,
+            available,
+            `Partial platform commission for cash ride #${rideId.slice(0, 8)}`,
+            rideId,
+            idempotencyKey ? `${idempotencyKey}_partial_comm` : undefined
+          );
+        }
+        debtIncurred = Math.round((platformFee - available) * 100) / 100;
+        await DriverModel.findByIdAndUpdate(driver.id, {
+          $inc: { outstandingDebt: debtIncurred },
+        });
+
+        await this.recordLedgerEntry({
+          rideId,
+          type: 'COMMISSION_DEBT',
+          amount: debtIncurred,
+          currency: 'SAR',
+          fromAccount: `driver:${driver.id}`,
+          toAccount: 'platform:debt',
+          status: 'OUTSTANDING',
+          idempotencyKey: idempotencyKey ? `${idempotencyKey}_debt_inc` : undefined,
+        });
+      }
+
+      await DriverModel.findByIdAndUpdate(driver.id, {
+        $inc: { earningsTotal: driverEarning, totalRides: 1 },
+      });
+    }
+
+    await this.updateRide(rideId, {
+      paymentStatus: 'SUCCEEDED',
+      paymentMethod: 'CASH',
+      finalFare: amount,
+    });
+
+    const payment = await this.createPayment({
+      rideId,
+      userId: riderId,
+      amount,
+      currency: 'SAR',
+      status: 'SUCCEEDED',
+      paymentMethod: 'CASH',
+      idempotencyKey,
+    });
+
+    return {
+      success: true,
+      transactionId: payment.id,
+      platformFee,
+      commissionDebt: debtIncurred,
+    };
   }
 
   public async getTransactionsForUser(userId: string): Promise<IWalletTransaction[]> {
@@ -1289,6 +1533,33 @@ export class MongoDatabaseStore implements IDatabaseStore {
     return count > 0;
   }
 
+  public async claimWebhookEvent(
+    eventId: string,
+    source: string,
+    type: string
+  ): Promise<{ claimed: boolean; alreadyProcessed: boolean }> {
+    this.ensureConnection();
+    try {
+      await WebhookEventModel.create({
+        _id: new mongoose.Types.ObjectId(),
+        eventId,
+        source,
+        type,
+        status: 'PROCESSING',
+      });
+      return { claimed: true, alreadyProcessed: false };
+    } catch (err: any) {
+      if (err.code === 11000 || err.message?.includes('duplicate key')) {
+        const existing = await WebhookEventModel.findOne({ eventId }).lean();
+        if (existing?.status === 'PROCESSED') {
+          return { claimed: false, alreadyProcessed: true };
+        }
+        return { claimed: false, alreadyProcessed: false };
+      }
+      throw err;
+    }
+  }
+
   public async recordProcessedWebhook(
     eventId: string,
     source: string,
@@ -1313,6 +1584,59 @@ export class MongoDatabaseStore implements IDatabaseStore {
       },
       { upsert: true }
     );
+  }
+
+  // ==========================================
+  // PLATFORM LEDGER OPERATIONS
+  // ==========================================
+  public async recordLedgerEntry(entry: Omit<IPlatformLedger, 'id' | 'createdAt'>): Promise<IPlatformLedger> {
+    this.ensureConnection();
+    const doc = await PlatformLedgerModel.create({
+      _id: new mongoose.Types.ObjectId(),
+      rideId: entry.rideId,
+      type: entry.type,
+      amount: entry.amount,
+      currency: entry.currency || 'SAR',
+      fromAccount: entry.fromAccount,
+      toAccount: entry.toAccount,
+      status: entry.status || 'COMMITTED',
+      idempotencyKey: entry.idempotencyKey,
+    });
+
+    return {
+      id: doc._id.toString(),
+      rideId: doc.rideId,
+      type: doc.type as any,
+      amount: doc.amount,
+      currency: doc.currency,
+      fromAccount: doc.fromAccount,
+      toAccount: doc.toAccount,
+      status: doc.status as any,
+      idempotencyKey: doc.idempotencyKey,
+      createdAt: doc.createdAt.toISOString(),
+    };
+  }
+
+  public async getPlatformLedger(limit: number = 100, filter?: Partial<IPlatformLedger>): Promise<IPlatformLedger[]> {
+    this.ensureConnection();
+    const query: any = {};
+    if (filter?.rideId) query.rideId = filter.rideId;
+    if (filter?.type) query.type = filter.type;
+    if (filter?.status) query.status = filter.status;
+
+    const docs = await PlatformLedgerModel.find(query).sort({ createdAt: -1 }).limit(limit).lean();
+    return docs.map((doc) => ({
+      id: doc._id.toString(),
+      rideId: doc.rideId,
+      type: doc.type as any,
+      amount: doc.amount,
+      currency: doc.currency,
+      fromAccount: doc.fromAccount,
+      toAccount: doc.toAccount,
+      status: doc.status as any,
+      idempotencyKey: doc.idempotencyKey,
+      createdAt: doc.createdAt.toISOString(),
+    }));
   }
 
   // ==========================================
@@ -1594,6 +1918,147 @@ export class MongoDatabaseStore implements IDatabaseStore {
       activeRides,
       totalGMV: Math.round(totalGMV * 100) / 100,
       platformNetRevenue,
+    };
+  }
+
+  // ==========================================
+  // PAGINATED ADMIN QUERIES & FINANCIAL SUMMARY
+  // ==========================================
+  public async getRidesPaginated(options: {
+    page?: number;
+    limit?: number;
+    status?: string;
+    riderId?: string;
+    driverId?: string;
+    search?: string;
+    startDate?: string;
+    endDate?: string;
+  }): Promise<{ data: IRide[]; total: number; page: number; totalPages: number }> {
+    this.ensureConnection();
+    const page = Math.max(1, options.page || 1);
+    const limit = Math.min(100, Math.max(1, options.limit || 20));
+    const skip = (page - 1) * limit;
+
+    const query: any = {};
+    if (options.status) query.status = options.status;
+    if (options.riderId) query.riderId = options.riderId;
+    if (options.driverId) query.driverId = options.driverId;
+    if (options.startDate || options.endDate) {
+      query.createdAt = {};
+      if (options.startDate) query.createdAt.$gte = new Date(options.startDate);
+      if (options.endDate) query.createdAt.$lte = new Date(options.endDate);
+    }
+
+    const [total, docs] = await Promise.all([
+      RideModel.countDocuments(query),
+      RideModel.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
+    ]);
+
+    return {
+      data: docs.map((d) => this.docToRide(d)),
+      total,
+      page,
+      totalPages: Math.ceil(total / limit) || 1,
+    };
+  }
+
+  public async getUsersPaginated(options: {
+    page?: number;
+    limit?: number;
+    role?: string;
+    search?: string;
+  }): Promise<{ data: Omit<IUser, 'passwordHash'>[]; total: number; page: number; totalPages: number }> {
+    this.ensureConnection();
+    const page = Math.max(1, options.page || 1);
+    const limit = Math.min(100, Math.max(1, options.limit || 20));
+    const skip = (page - 1) * limit;
+
+    const query: any = {};
+    if (options.role) query.role = options.role;
+    if (options.search) {
+      const regex = new RegExp(options.search, 'i');
+      query.$or = [{ name: regex }, { email: regex }, { phone: regex }];
+    }
+
+    const [total, docs] = await Promise.all([
+      UserModel.countDocuments(query),
+      UserModel.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
+    ]);
+
+    return {
+      data: docs.map((d) => {
+        const u = this.docToUser(d);
+        const { passwordHash: _, ...userSafe } = u as any;
+        return userSafe;
+      }),
+      total,
+      page,
+      totalPages: Math.ceil(total / limit) || 1,
+    };
+  }
+
+  public async getDriversPaginated(options: {
+    page?: number;
+    limit?: number;
+    approvalStatus?: string;
+    isOnline?: boolean;
+    search?: string;
+  }): Promise<{ data: IDriver[]; total: number; page: number; totalPages: number }> {
+    this.ensureConnection();
+    const page = Math.max(1, options.page || 1);
+    const limit = Math.min(100, Math.max(1, options.limit || 20));
+    const skip = (page - 1) * limit;
+
+    const query: any = {};
+    if (options.approvalStatus) query.approvalStatus = options.approvalStatus;
+    if (options.isOnline !== undefined) query.isOnline = options.isOnline;
+
+    const [total, docs] = await Promise.all([
+      DriverModel.countDocuments(query),
+      DriverModel.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
+    ]);
+
+    const drivers = await Promise.all(
+      docs.map(async (d) => {
+        const driver = this.docToDriver(d);
+        const vehicle = await this.findVehicleByDriverId(driver.id);
+        if (vehicle) driver.vehicle = vehicle;
+        return driver;
+      })
+    );
+
+    return {
+      data: drivers,
+      total,
+      page,
+      totalPages: Math.ceil(total / limit) || 1,
+    };
+  }
+
+  public async getFinancialSummary(): Promise<{
+    totalGrossVolume: number;
+    totalPlatformRevenue: number;
+    totalDriverPayouts: number;
+    totalOutstandingDebt: number;
+    transactionCount: number;
+  }> {
+    this.ensureConnection();
+    const [payments, drivers] = await Promise.all([
+      PaymentModel.find({ status: 'SUCCEEDED' }).lean(),
+      DriverModel.find({ outstandingDebt: { $gt: 0 } }).lean(),
+    ]);
+
+    const totalGrossVolume = Math.round(payments.reduce((acc, p) => acc + (p.amount || 0), 0) * 100) / 100;
+    const totalPlatformRevenue = Math.round(totalGrossVolume * 0.2 * 100) / 100;
+    const totalDriverPayouts = Math.round((totalGrossVolume - totalPlatformRevenue) * 100) / 100;
+    const totalOutstandingDebt = Math.round(drivers.reduce((acc, d) => acc + ((d as any).outstandingDebt || 0), 0) * 100) / 100;
+
+    return {
+      totalGrossVolume,
+      totalPlatformRevenue,
+      totalDriverPayouts,
+      totalOutstandingDebt,
+      transactionCount: payments.length,
     };
   }
 

@@ -8,10 +8,11 @@ import { createServer as createViteServer } from 'vite';
 
 import { config } from './server/config';
 import { connectDB, isDbConnected, closeDB } from './server/db/connection';
-import { initSocketIO } from './server/socket/socketHandler';
+import { initSocketIO, closeSocketIO } from './server/socket/socketHandler';
 import { errorHandler } from './server/middleware/errorHandler';
 import { requestIdMiddleware } from './server/middleware/requestId';
 import { DispatchService } from './server/services/dispatchService';
+import { isRedisConnected, getRedisClient } from './server/redis/redisClient';
 
 // Route Handlers
 import { authRouter } from './server/routes/authRoutes';
@@ -59,29 +60,44 @@ app.use((req, res, next) => {
   next();
 });
 
-// 2. Health & Readiness Probes
-app.get('/health', (req, res) => {
+// 2. Health (Liveness) & Readiness Probes
+app.get('/health', (_req, res) => {
   res.json({
     status: 'healthy',
     platform: 'CreemY',
     timestamp: new Date().toISOString(),
     uptimeSeconds: Math.floor(process.uptime()),
+    memoryUsage: process.memoryUsage(),
   });
 });
 
-app.get('/ready', (req, res) => {
+const checkReadiness = async (_req: express.Request, res: express.Response) => {
   const dbStatus = isDbConnected();
-  if (!dbStatus && config.isProduction) {
-    return res.status(503).json({
-      status: 'unready',
-      database: 'disconnected',
-    });
+  const redisConfigured = Boolean(config.redisUrl);
+  const redisStatus = redisConfigured ? isRedisConnected() : true;
+  const configStatus = Boolean(config.jwtSecret && config.jwtSecret.length >= 8);
+
+  const isReady = (dbStatus || !config.isProduction) && redisStatus && configStatus;
+
+  const payload = {
+    status: isReady ? 'ready' : 'unready',
+    timestamp: new Date().toISOString(),
+    checks: {
+      database: dbStatus ? 'connected' : 'disconnected',
+      redis: redisConfigured ? (redisStatus ? 'connected' : 'disconnected') : 'not_configured',
+      configuration: configStatus ? 'valid' : 'invalid',
+    },
+  };
+
+  if (!isReady && config.isProduction) {
+    return res.status(503).json(payload);
   }
-  res.json({
-    status: 'ready',
-    database: dbStatus ? 'connected' : 'connecting',
-  });
-});
+
+  return res.status(isReady ? 200 : 503).json(payload);
+};
+
+app.get('/readiness', checkReadiness);
+app.get('/ready', checkReadiness);
 
 // 3. Mount REST API Routes (Version 1)
 app.use('/api/v1/auth', authRouter);
@@ -130,13 +146,38 @@ async function startServer() {
 
   // Graceful shutdown handling
   const shutdown = async (signal: string) => {
-    console.log(`[CreemY] Received ${signal}. Closing gracefully...`);
+    console.log(`[CreemY] Received ${signal}. Initiating graceful shutdown...`);
+    // 1. Stop background workers
     DispatchService.stopWorker();
+
+    // 2. Stop accepting new HTTP requests
     server.close(async () => {
-      await closeDB();
-      console.log('[CreemY] HTTP and DB connections closed.');
-      process.exit(0);
+      try {
+        // 3. Close real-time sockets
+        await closeSocketIO();
+
+        // 4. Close Redis connection if active
+        const redis = getRedisClient();
+        if (redis) {
+          await redis.quit();
+          console.log('[CreemY] Redis connection closed.');
+        }
+
+        // 5. Close MongoDB
+        await closeDB();
+        console.log('[CreemY] All resources cleanly released. Exiting.');
+        process.exit(0);
+      } catch (err) {
+        console.error('[CreemY] Error during graceful teardown:', err);
+        process.exit(1);
+      }
     });
+
+    // Force exit after 10s if shutdown hangs
+    setTimeout(() => {
+      console.error('[CreemY] Teardown timeout reached. Forcing exit.');
+      process.exit(1);
+    }, 10000).unref();
   };
 
   process.on('SIGTERM', () => shutdown('SIGTERM'));

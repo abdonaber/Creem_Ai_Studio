@@ -4,7 +4,7 @@ import jwt from 'jsonwebtoken';
 import { config } from '../config';
 import { db } from '../db/store';
 import { AppError } from '../middleware/errorHandler';
-import { IUser, UserRole, IDriver, IVehicle } from '../types';
+import { IUser, UserRole, IDriver, IVehicle, DriverApprovalStatus } from '../types';
 import { generateId } from '../utils/id';
 
 export class AuthService {
@@ -64,33 +64,41 @@ export class AuthService {
     await db.createUser(user);
     await db.getOrCreateWallet(userId); // Init wallet
 
-    // If driver, initialize driver profile and vehicle
+    // If driver, initialize real driver profile
     if (role === 'DRIVER') {
       const driverId = generateId('drv');
-      const vehicleId = generateId('veh');
-      const randomPlateDigits = crypto.randomInt(1000, 9999);
-      const randomLicDigits = crypto.randomInt(100000, 999999);
+      let vehicle: IVehicle | undefined = undefined;
 
-      const vehicle: IVehicle = {
-        id: vehicleId,
-        driverId,
-        make: data.vehicleDetails?.make || 'Toyota',
-        model: data.vehicleDetails?.model || 'Camry',
-        year: data.vehicleDetails?.year || 2024,
-        color: data.vehicleDetails?.color || 'White',
-        plateNumber: data.vehicleDetails?.plateNumber || `CRM-${randomPlateDigits}`,
-        category: data.vehicleDetails?.category || 'STANDARD',
-      };
-      await db.createVehicle(vehicle);
+      // If vehicle details are supplied during registration, persist them directly
+      if (
+        data.vehicleDetails?.make &&
+        data.vehicleDetails?.model &&
+        data.vehicleDetails?.year &&
+        data.vehicleDetails?.color &&
+        data.vehicleDetails?.plateNumber
+      ) {
+        const vehicleId = generateId('veh');
+        vehicle = {
+          id: vehicleId,
+          driverId,
+          make: data.vehicleDetails.make.trim(),
+          model: data.vehicleDetails.model.trim(),
+          year: Number(data.vehicleDetails.year),
+          color: data.vehicleDetails.color.trim(),
+          plateNumber: data.vehicleDetails.plateNumber.trim(),
+          category: data.vehicleDetails.category || 'STANDARD',
+        };
+        await db.createVehicle(vehicle);
+      }
 
-      // In production mode, require admin verification before online approval
-      const approvalStatus = config.appMode === 'production' ? 'PENDING' : 'APPROVED';
+      // In production and real operation, newly registered drivers require admin verification
+      const approvalStatus: DriverApprovalStatus = 'PENDING';
 
       const driver: IDriver = {
         id: driverId,
         userId,
         approvalStatus,
-        isOnline: approvalStatus === 'APPROVED',
+        isOnline: false, // Never online until admin approval and driver toggle
         currentLocation: {
           lat: 24.7136,
           lng: 46.6753,
@@ -100,12 +108,10 @@ export class AuthService {
         vehicle,
         rating: 5.0,
         totalRides: 0,
-        licenseNumber: data.licenseNumber || `LIC-${randomLicDigits}`,
-        documents: {
-          licensePhoto: 'https://images.unsplash.com/photo-1544620347-c4fd4a3d5957?w=300',
-          vehicleRegistration: 'https://images.unsplash.com/photo-1549399542-7e3f8b79c341?w=300',
-        },
+        licenseNumber: data.licenseNumber?.trim() || '',
+        documents: {},
         earningsTotal: 0,
+        outstandingDebt: 0,
       };
       await db.createDriver(driver);
     }

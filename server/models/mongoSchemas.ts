@@ -56,6 +56,7 @@ export interface IDriverDocument extends Document {
     idCardPhoto?: string;
   };
   earningsTotal: number;
+  outstandingDebt: number;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -97,6 +98,7 @@ export const DriverSchema = new Schema<IDriverDocument>(
       idCardPhoto: String,
     },
     earningsTotal: { type: Number, default: 0 },
+    outstandingDebt: { type: Number, default: 0, min: 0 },
   },
   { timestamps: true }
 );
@@ -104,6 +106,7 @@ export const DriverSchema = new Schema<IDriverDocument>(
 DriverSchema.index({ isOnline: 1, approvalStatus: 1, isBusy: 1 });
 DriverSchema.index({ location: '2dsphere' });
 DriverSchema.index({ 'currentLocation.lat': 1, 'currentLocation.lng': 1 });
+DriverSchema.index({ 'currentLocation.updatedAt': -1 });
 
 // 3. Vehicle Schema
 export interface IVehicleDocument extends Omit<Document, 'model'> {
@@ -523,7 +526,7 @@ export interface IWebhookEventDocument extends Document {
   type: string;
   payload?: Record<string, any>;
   processedAt: Date;
-  status: 'PROCESSED' | 'FAILED';
+  status: 'CLAIMED' | 'PROCESSING' | 'PROCESSED' | 'FAILED';
   errorMessage?: string;
   createdAt: Date;
 }
@@ -535,13 +538,74 @@ export const WebhookEventSchema = new Schema<IWebhookEventDocument>(
     type: { type: String, required: true },
     payload: Schema.Types.Mixed,
     processedAt: { type: Date, default: Date.now },
-    status: { type: String, enum: ['PROCESSED', 'FAILED'], default: 'PROCESSED' },
+    status: {
+      type: String,
+      enum: ['CLAIMED', 'PROCESSING', 'PROCESSED', 'FAILED'],
+      default: 'PROCESSING',
+      index: true,
+    },
     errorMessage: String,
   },
   { timestamps: true }
 );
 
 WebhookEventSchema.index({ createdAt: 1 }, { expireAfterSeconds: 30 * 24 * 60 * 60 }); // Auto-expire after 30 days
+
+// 14. Platform Ledger Schema (Immutable financial audit ledger for real money movements)
+export interface IPlatformLedgerDocument extends Document {
+  rideId: string;
+  type:
+    | 'RIDER_FARE'
+    | 'DRIVER_EARNING'
+    | 'PLATFORM_COMMISSION'
+    | 'COMMISSION_DEBT'
+    | 'DEBT_RECOVERY'
+    | 'REFUND';
+  amount: number;
+  currency: string;
+  fromAccount: string;
+  toAccount: string;
+  status: 'COMMITTED' | 'OUTSTANDING' | 'SETTLED';
+  idempotencyKey?: string;
+  metadata?: Record<string, any>;
+  createdAt: Date;
+}
+
+export const PlatformLedgerSchema = new Schema<IPlatformLedgerDocument>(
+  {
+    rideId: { type: String, required: true, index: true },
+    type: {
+      type: String,
+      enum: [
+        'RIDER_FARE',
+        'DRIVER_EARNING',
+        'PLATFORM_COMMISSION',
+        'COMMISSION_DEBT',
+        'DEBT_RECOVERY',
+        'REFUND',
+      ],
+      required: true,
+      index: true,
+    },
+    amount: { type: Number, required: true, min: 0 },
+    currency: { type: String, default: 'SAR' },
+    fromAccount: { type: String, required: true, index: true },
+    toAccount: { type: String, required: true, index: true },
+    status: {
+      type: String,
+      enum: ['COMMITTED', 'OUTSTANDING', 'SETTLED'],
+      default: 'COMMITTED',
+      index: true,
+    },
+    idempotencyKey: { type: String, unique: true, sparse: true },
+    metadata: Schema.Types.Mixed,
+  },
+  { timestamps: true }
+);
+
+PlatformLedgerSchema.index({ rideId: 1, type: 1 });
+PlatformLedgerSchema.index({ fromAccount: 1, createdAt: -1 });
+PlatformLedgerSchema.index({ toAccount: 1, createdAt: -1 });
 
 // Export Mongoose Models
 export const UserModel = mongoose.models.User || mongoose.model<IUserDocument>('User', UserSchema);
@@ -563,3 +627,5 @@ export const WebhookEventModel =
   mongoose.models.WebhookEvent || mongoose.model<IWebhookEventDocument>('WebhookEvent', WebhookEventSchema);
 export const RideOfferModel =
   mongoose.models.RideOffer || mongoose.model<IRideOfferDocument>('RideOffer', RideOfferSchema);
+export const PlatformLedgerModel =
+  mongoose.models.PlatformLedger || mongoose.model<IPlatformLedgerDocument>('PlatformLedger', PlatformLedgerSchema);

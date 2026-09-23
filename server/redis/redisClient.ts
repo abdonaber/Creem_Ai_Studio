@@ -58,28 +58,41 @@ export function isRedisConnected(): boolean {
   return isConnected && redisInstance?.status === 'ready';
 }
 
+export interface LockOptions {
+  token?: string;
+  failClosed?: boolean;
+  maxRetries?: number;
+  retryDelayMs?: number;
+}
+
 export interface LockAcquisitionResult {
   acquired: boolean;
-  token: string;
+  token?: string;
+  reason?: string;
 }
 
 /**
- * Hardened Distributed Lock using Redis SET NX PX with unique ownership token
- * Prevents race conditions, lock stealing, and deadlocks.
- *
- * @param key Lock identifier
- * @param ttlMs Time-to-live in milliseconds
- * @param options.token Optional custom token. If omitted, a secure UUID is generated.
- * @param options.failClosed If true, fails closed (returns acquired: false) on Redis errors.
+ * Hardened Distributed Lock using Redis SET NX PX with unique ownership token.
+ * For critical paths (financial settlement, driver reservation, atomic dispatch),
+ * this strictly fails-closed to prevent split-brain race conditions when Redis is unavailable.
  */
 export async function acquireLock(
   key: string,
   ttlMs: number = 8000,
-  options?: { token?: string; failClosed?: boolean }
+  options?: LockOptions
 ): Promise<LockAcquisitionResult> {
   const lockKey = `lock:${key}`;
   const token = options?.token || crypto.randomUUID();
   const client = getRedisClient();
+
+  // If Redis is configured in production or explicitly required
+  const isCriticalKey =
+    key.startsWith('driver_reservation:') ||
+    key.startsWith('ride_claim:') ||
+    key.startsWith('financial:') ||
+    key.startsWith('wallet:');
+
+  const mustFailClosed = options?.failClosed ?? (Boolean(config.redisUrl) || isCriticalKey);
 
   if (client && isRedisConnected()) {
     try {
@@ -90,14 +103,18 @@ export async function acquireLock(
       };
     } catch (err: any) {
       logger.error(`[Redis Lock] Failed to acquire lock for ${key}`, err);
-      // Fail closed for critical operations
-      if (options?.failClosed) {
+      if (mustFailClosed) {
         return { acquired: false, token };
       }
     }
+  } else if (config.redisUrl && mustFailClosed) {
+    // Redis is configured for distributed cluster but connection is down:
+    // Strictly fail-closed for critical locks across instances to prevent double claims!
+    logger.warn(`[Redis Lock] Redis cluster unavailable; failing closed for lock ${key}`);
+    return { acquired: false, token };
   }
 
-  // Fallback: in-memory mutual exclusion lock store
+  // Fallback: in-process mutual exclusion lock store for isolated/unit test runtimes
   const now = Date.now();
   const existing = localLockStore.get(lockKey);
   if (existing && existing.expiresAt > now) {
@@ -111,11 +128,105 @@ export async function acquireLock(
 }
 
 /**
+ * Safe Lock Renewal using atomic Lua script
+ * Extends the TTL only if current stored value matches the caller's token.
+ */
+export async function renewLock(
+  key: string,
+  token: string,
+  additionalTtlMs: number = 5000
+): Promise<boolean> {
+  const lockKey = `lock:${key}`;
+  const client = getRedisClient();
+
+  if (client && isRedisConnected()) {
+    try {
+      const luaScript = `
+        if redis.call("get", KEYS[1]) == ARGV[1] then
+          return redis.call("pexpire", KEYS[1], ARGV[2])
+        else
+          return 0
+        end
+      `;
+      const result = await client.eval(luaScript, 1, lockKey, token, additionalTtlMs);
+      return result === 1;
+    } catch (err: any) {
+      logger.warn(`[Redis Lock] Error during lock renewal for ${key}:`, { error: err.message });
+      return false;
+    }
+  }
+
+  const existing = localLockStore.get(lockKey);
+  if (existing && existing.token === token) {
+    existing.expiresAt = Date.now() + additionalTtlMs;
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Acquire lock with automatic retries, exponential backoff, and random jitter
+ */
+export async function acquireLockWithRetry(
+  key: string,
+  ttlMs: number = 8000,
+  maxRetries: number = 3,
+  initialDelayMs: number = 100,
+  options?: LockOptions
+): Promise<LockAcquisitionResult> {
+  let attempt = 0;
+  while (attempt <= maxRetries) {
+    const result = await acquireLock(key, ttlMs, options);
+    if (result.acquired) {
+      return result;
+    }
+    attempt++;
+    if (attempt <= maxRetries) {
+      // Exponential backoff with random jitter between 0 and 50ms
+      const jitter = Math.floor(Math.random() * 50);
+      const delay = initialDelayMs * Math.pow(2, attempt - 1) + jitter;
+      await new Promise((res) => setTimeout(res, delay));
+    }
+  }
+  return { acquired: false, token: options?.token || crypto.randomUUID() };
+}
+
+/**
+ * Executes a critical async function exclusively within a distributed lock
+ */
+export async function executeWithLock<T>(
+  key: string,
+  ttlMs: number,
+  fn: () => Promise<T>,
+  options?: LockOptions
+): Promise<T> {
+  const lock = await acquireLockWithRetry(
+    key,
+    ttlMs,
+    options?.maxRetries ?? 2,
+    options?.retryDelayMs ?? 100,
+    options
+  );
+
+  if (!lock.acquired) {
+    throw new Error(`CONCURRENCY_LOCK_FAILED: Unable to acquire distributed lock for resource [${key}].`);
+  }
+
+  try {
+    return await fn();
+  } finally {
+    await releaseLock(key, lock.token);
+  }
+}
+
+/**
  * Safe Lock Release using atomic Lua script
  * Ensures a lock is ONLY deleted if the current stored token matches the caller's token.
  * Prevents releasing another worker's lock if TTL expired.
  */
-export async function releaseLock(key: string, token: string): Promise<boolean> {
+export async function releaseLock(key: string, token?: string): Promise<boolean> {
+  if (!token) return true;
   const lockKey = `lock:${key}`;
   const client = getRedisClient();
 

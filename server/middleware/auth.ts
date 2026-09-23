@@ -84,3 +84,7 @@ export function requireRole(...allowedRoles: UserRole[]) {
     next();
   };
 }
+
+export function createAuthToken(payload: AuthPayload): string {
+  return jwt.sign(payload, config.jwtSecret, { expiresIn: '15m' });
+}

@@ -3,6 +3,7 @@ import { authenticate, requireRole } from '../middleware/auth';
 import { db } from '../db/store';
 import { AppError } from '../middleware/errorHandler';
 import { generateId } from '../utils/id';
+import { LocationService } from '../services/locationService';
 
 export const driverRouter = Router();
 
@@ -42,6 +43,18 @@ driverRouter.put('/status', async (req: Request, res: Response, next: NextFuncti
     }
 
     const { isOnline } = req.body;
+
+    // Check outstanding commission debt threshold
+    if (isOnline && (driver.outstandingDebt || 0) > 200) {
+      throw new AppError(
+        `Cannot go online: Outstanding platform commission debt (${driver.outstandingDebt?.toFixed(
+          2
+        )} SAR) exceeds maximum threshold (200 SAR). Please top up your wallet to settle.`,
+        403,
+        'DEBT_THRESHOLD_EXCEEDED'
+      );
+    }
+
     const updated = await db.updateDriver(driver.id, { isOnline: Boolean(isOnline) });
 
     res.json({ success: true, data: updated });
@@ -50,33 +63,33 @@ driverRouter.put('/status', async (req: Request, res: Response, next: NextFuncti
   }
 });
 
-// Driver Location Update (Validated GPS with coordinate bounds)
+// Driver Location Update (Validated GPS with coordinate bounds, anti-spoofing & throttling)
 driverRouter.put('/location', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const driver = await db.findDriverByUserId(req.user!.userId);
     if (!driver) throw new AppError('Driver profile not found', 404, 'NOT_FOUND');
 
     const { lat, lng, heading } = req.body;
-    if (
-      typeof lat !== 'number' ||
-      typeof lng !== 'number' ||
-      lat < -90 ||
-      lat > 90 ||
-      lng < -180 ||
-      lng > 180
-    ) {
-      throw new AppError('Valid geographic coordinates required (-90<=lat<=90, -180<=lng<=180)', 400, 'INVALID_INPUT');
-    }
 
-    const updatedLoc = {
+    const result = await LocationService.processDriverLocationUpdate({
+      driverId: driver.id,
+      userId: req.user!.userId,
       lat,
       lng,
-      heading: typeof heading === 'number' ? heading : 0,
-      updatedAt: new Date().toISOString(),
-    };
+      heading,
+    });
 
-    const updated = await db.updateDriver(driver.id, { currentLocation: updatedLoc });
-    res.json({ success: true, data: updated });
+    if (!result.accepted) {
+      if (result.reason === 'RATE_LIMIT_EXCEEDED') {
+        throw new AppError('Location updates throttled. Maximum 1 update per second.', 429, 'RATE_LIMIT');
+      }
+      if (result.reason === 'UNREALISTIC_MOVEMENT_SPOOFING') {
+        throw new AppError('Unrealistic GPS movement detected.', 400, 'GPS_ANOMALY_REJECTED');
+      }
+      throw new AppError('Invalid geographic coordinates (-90<=lat<=90, -180<=lng<=180)', 400, 'INVALID_COORDINATES');
+    }
+
+    res.json({ success: true, message: 'Location ingested' });
   } catch (err) {
     next(err);
   }
@@ -104,18 +117,39 @@ driverRouter.put('/onboarding', async (req: Request, res: Response, next: NextFu
     const { vehicle, documents, licenseNumber } = req.body;
 
     if (vehicle) {
-      let v = await db.findVehicleByDriverId(driver.id);
-      if (v) {
-        await db.updateVehicle(v.id, vehicle);
+      if (
+        !vehicle.make ||
+        !vehicle.model ||
+        !vehicle.year ||
+        !vehicle.color ||
+        !vehicle.plateNumber
+      ) {
+        throw new AppError(
+          'Complete vehicle specifications (make, model, year, color, plateNumber) are required',
+          400,
+          'INVALID_VEHICLE_DATA'
+        );
+      }
+
+      const existingVehicle = await db.findVehicleByDriverId(driver.id);
+      if (existingVehicle) {
+        await db.updateVehicle(existingVehicle.id, {
+          make: vehicle.make.trim(),
+          model: vehicle.model.trim(),
+          year: Number(vehicle.year),
+          color: vehicle.color.trim(),
+          plateNumber: vehicle.plateNumber.trim(),
+          category: vehicle.category || 'STANDARD',
+        });
       } else {
         await db.createVehicle({
           id: generateId('veh'),
           driverId: driver.id,
-          make: vehicle.make || 'Toyota',
-          model: vehicle.model || 'Camry',
-          year: vehicle.year || 2024,
-          color: vehicle.color || 'White',
-          plateNumber: vehicle.plateNumber || 'CRM-9999',
+          make: vehicle.make.trim(),
+          model: vehicle.model.trim(),
+          year: Number(vehicle.year),
+          color: vehicle.color.trim(),
+          plateNumber: vehicle.plateNumber.trim(),
           category: vehicle.category || 'STANDARD',
         });
       }
@@ -123,7 +157,7 @@ driverRouter.put('/onboarding', async (req: Request, res: Response, next: NextFu
 
     const updated = await db.updateDriver(driver.id, {
       ...(documents ? { documents: { ...driver.documents, ...documents } } : {}),
-      ...(licenseNumber ? { licenseNumber } : {}),
+      ...(licenseNumber ? { licenseNumber: licenseNumber.trim() } : {}),
     });
 
     res.json({ success: true, data: updated });

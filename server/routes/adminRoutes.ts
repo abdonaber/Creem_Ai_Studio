@@ -13,44 +13,24 @@ adminRouter.use(requireRole('ADMIN'));
 // System stats & Analytics
 adminRouter.get('/stats', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const allRides = await db.getAllRides();
-    const allDrivers = await db.getAllDrivers();
-    const allUsers = await db.getAllUsers();
-
-    const completedRides = allRides.filter((r) => r.status === 'RIDE_COMPLETED');
-    const activeRides = allRides.filter((r) =>
-      [
-        'REQUESTED',
-        'SEARCHING_DRIVER',
-        'DRIVER_ASSIGNED',
-        'DRIVER_ARRIVING',
-        'DRIVER_ARRIVED',
-        'RIDE_STARTED',
-      ].includes(r.status)
-    );
-    const cancelledRides = allRides.filter((r) => r.status === 'CANCELLED');
-
-    const totalRevenue = completedRides.reduce(
-      (acc, curr) => acc + (curr.finalFare || curr.estimatedFare || 0),
-      0
-    );
-    const platformRevenue = Math.round(totalRevenue * 0.2 * 100) / 100; // 20% platform share
-
-    const onlineDrivers = allDrivers.filter((d) => d.isOnline);
-    const pendingApprovals = allDrivers.filter((d) => d.approvalStatus === 'PENDING');
+    const stats = await db.getPlatformStats();
+    const financial = await db.getFinancialSummary();
 
     res.json({
       success: true,
       data: {
-        totalRevenue: Math.round(totalRevenue * 100) / 100,
-        platformRevenue,
-        activeRidesCount: activeRides.length,
-        completedRidesCount: completedRides.length,
-        cancelledRidesCount: cancelledRides.length,
-        totalDriversCount: allDrivers.length,
-        onlineDriversCount: onlineDrivers.length,
-        pendingApprovalsCount: pendingApprovals.length,
-        totalUsersCount: allUsers.length,
+        totalRevenue: financial.totalGrossVolume,
+        platformRevenue: financial.totalPlatformRevenue,
+        driverPayouts: financial.totalDriverPayouts,
+        outstandingDebt: financial.totalOutstandingDebt,
+        transactionCount: financial.transactionCount,
+        activeRidesCount: stats.activeRides || 0,
+        completedRidesCount: stats.completedRides || 0,
+        cancelledRidesCount: stats.cancelledRides || 0,
+        totalDriversCount: stats.totalDrivers || 0,
+        onlineDriversCount: stats.onlineDrivers || 0,
+        pendingApprovalsCount: stats.pendingApprovals || 0,
+        totalUsersCount: stats.totalUsers || 0,
       },
     });
   } catch (err) {
@@ -58,22 +38,63 @@ adminRouter.get('/stats', async (req: Request, res: Response, next: NextFunction
   }
 });
 
-// All Rides
+// All Rides (Paginated & Filterable)
 adminRouter.get('/rides', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const rides = await db.getAllRides();
-    res.json({ success: true, data: rides });
+    const page = Number(req.query.page) || 1;
+    const limit = Number(req.query.limit) || 20;
+    const status = req.query.status as string;
+    const riderId = req.query.riderId as string;
+    const driverId = req.query.driverId as string;
+    const search = req.query.search as string;
+    const startDate = req.query.startDate as string;
+    const endDate = req.query.endDate as string;
+
+    const result = await db.getRidesPaginated({
+      page,
+      limit,
+      status,
+      riderId,
+      driverId,
+      search,
+      startDate,
+      endDate,
+    });
+
+    res.json({
+      success: true,
+      data: result.data,
+      pagination: {
+        total: result.total,
+        page: result.page,
+        totalPages: result.totalPages,
+        limit,
+      },
+    });
   } catch (err) {
     next(err);
   }
 });
 
-// All Drivers
+// All Drivers (Paginated & Filterable)
 adminRouter.get('/drivers', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const drivers = await db.getAllDrivers();
+    const page = Number(req.query.page) || 1;
+    const limit = Number(req.query.limit) || 20;
+    const approvalStatus = req.query.approvalStatus as string;
+    const isOnline = req.query.isOnline !== undefined ? req.query.isOnline === 'true' : undefined;
+    const search = req.query.search as string;
+
+    const result = await db.getDriversPaginated({
+      page,
+      limit,
+      approvalStatus,
+      isOnline,
+      search,
+    });
+
     const enrichedDrivers = await Promise.all(
-      drivers.map(async (d) => {
+      result.data.map(async (d) => {
         const user = await db.findUserById(d.userId);
         const vehicle = await db.findVehicleByDriverId(d.id);
         return {
@@ -85,7 +106,17 @@ adminRouter.get('/drivers', async (req: Request, res: Response, next: NextFuncti
         };
       })
     );
-    res.json({ success: true, data: enrichedDrivers });
+
+    res.json({
+      success: true,
+      data: enrichedDrivers,
+      pagination: {
+        total: result.total,
+        page: result.page,
+        totalPages: result.totalPages,
+        limit,
+      },
+    });
   } catch (err) {
     next(err);
   }
@@ -97,8 +128,22 @@ adminRouter.put(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const { status } = req.body;
-      if (!['APPROVED', 'REJECTED', 'SUSPENDED'].includes(status)) {
+      if (!['APPROVED', 'REJECTED', 'SUSPENDED', 'PENDING'].includes(status)) {
         throw new AppError('Invalid approval status', 400, 'INVALID_STATUS');
+      }
+
+      // Hard validation: Before approving a driver, ensure valid vehicle details exist
+      if (status === 'APPROVED') {
+        const vehicle = await db.findVehicleByDriverId(req.params.id);
+        const driver = await db.findDriverById(req.params.id);
+        const hasVehicle = vehicle || driver?.vehicle;
+        if (!hasVehicle || !hasVehicle.make || !hasVehicle.model || !hasVehicle.plateNumber) {
+          throw new AppError(
+            'Cannot approve driver without complete vehicle registration (make, model, plate number)',
+            400,
+            'INCOMPLETE_VEHICLE_INFO'
+          );
+        }
       }
 
       const updated = await db.updateDriver(req.params.id, { approvalStatus: status });
@@ -140,12 +185,51 @@ adminRouter.put(
   }
 );
 
-// User Management: List
+// User Management: List (Paginated & Filterable)
 adminRouter.get('/users', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const all = await db.getAllUsers();
-    const safeUsers = all.map(({ passwordHash: _, ...u }) => u);
-    res.json({ success: true, data: safeUsers });
+    const page = Number(req.query.page) || 1;
+    const limit = Number(req.query.limit) || 20;
+    const role = req.query.role as string;
+    const search = req.query.search as string;
+
+    const result = await db.getUsersPaginated({
+      page,
+      limit,
+      role,
+      search,
+    });
+
+    res.json({
+      success: true,
+      data: result.data,
+      pagination: {
+        total: result.total,
+        page: result.page,
+        totalPages: result.totalPages,
+        limit,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Platform Financial Ledger
+adminRouter.get('/ledger', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const limit = Number(req.query.limit) || 100;
+    const rideId = req.query.rideId as string;
+    const type = req.query.type as any;
+    const status = req.query.status as any;
+
+    const ledgerEntries = await db.getPlatformLedger(limit, {
+      rideId,
+      type,
+      status,
+    });
+
+    res.json({ success: true, data: ledgerEntries });
   } catch (err) {
     next(err);
   }
