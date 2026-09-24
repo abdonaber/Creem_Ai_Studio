@@ -44,6 +44,11 @@ export class AuthService {
       throw new AppError('Password must be at least 8 characters long.', 400, 'WEAK_PASSWORD');
     }
 
+    // Phase 12 Security Hardening: Prevent public admin registration
+    if (data.role === 'ADMIN') {
+      throw new AppError('Public registration for the administrator role is strictly forbidden.', 403, 'FORBIDDEN_ROLE');
+    }
+
     const passwordHash = await bcrypt.hash(data.password, this.SALT_ROUNDS);
     const userId = generateId('usr');
     const role: UserRole = data.role || 'RIDER';

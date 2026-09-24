@@ -9,6 +9,23 @@ let isConnected = false;
 // Fallback in-process memory lock store for standalone/test environments
 // Enforces real mutual exclusion with token ownership and TTL!
 const localLockStore = new Map<string, { token: string; expiresAt: number }>();
+const localRateLimitStore = new Map<string, { count: number; resetTime: number }>();
+
+export function isCriticalOperationKey(key: string): boolean {
+  return (
+    key.startsWith('driver_reservation:') ||
+    key.startsWith('ride_claim:') ||
+    key.startsWith('ride_transition:') ||
+    key.startsWith('financial:') ||
+    key.startsWith('wallet:') ||
+    key.startsWith('payment:') ||
+    key.startsWith('stripe_webhook:') ||
+    key.startsWith('idempotency:') ||
+    key.startsWith('rate_limit_auth:') ||
+    key.startsWith('rate_limit_login:') ||
+    key.startsWith('rate_limit_register:')
+  );
+}
 
 export function getRedisClient(): Redis | null {
   if (redisInstance) return redisInstance;
@@ -86,13 +103,8 @@ export async function acquireLock(
   const client = getRedisClient();
 
   // If Redis is configured in production or explicitly required
-  const isCriticalKey =
-    key.startsWith('driver_reservation:') ||
-    key.startsWith('ride_claim:') ||
-    key.startsWith('financial:') ||
-    key.startsWith('wallet:');
-
-  const mustFailClosed = options?.failClosed ?? (Boolean(config.redisUrl) || isCriticalKey);
+  const isCriticalKey = isCriticalOperationKey(key);
+  const mustFailClosed = options?.failClosed ?? (Boolean(config.redisUrl) && isCriticalKey);
 
   if (client && isRedisConnected()) {
     try {
@@ -259,16 +271,59 @@ export async function releaseLock(key: string, token?: string): Promise<boolean>
 }
 
 /**
- * Distributed Rate Limiting backed by Redis with local fallback
+ * Distributed Idempotency Key Claim
+ * For critical financial and webhook operations:
+ * Strictly fails closed if Redis is down in production or when failClosed is required.
+ */
+export async function claimIdempotencyKey(
+  key: string,
+  ttlSeconds: number = 300,
+  options?: { failClosed?: boolean }
+): Promise<{ claimed: boolean; reason?: string }> {
+  const claimKey = `idempotency:${key}`;
+  const client = getRedisClient();
+  const mustFailClosed = options?.failClosed ?? (Boolean(config.redisUrl) && isCriticalOperationKey(claimKey));
+
+  if (client && isRedisConnected()) {
+    try {
+      const res = await client.set(claimKey, 'CLAIMED', 'EX', ttlSeconds, 'NX');
+      return { claimed: res === 'OK' };
+    } catch (err: any) {
+      logger.error(`[Redis Idempotency] Failed to claim key ${key}:`, err);
+      if (mustFailClosed) {
+        return { claimed: false, reason: 'REDIS_OUTAGE_FAIL_CLOSED' };
+      }
+    }
+  } else if (config.redisUrl && mustFailClosed) {
+    logger.warn(`[Redis Idempotency] Redis cluster down; failing closed for idempotency key ${key}`);
+    return { claimed: false, reason: 'REDIS_OUTAGE_FAIL_CLOSED' };
+  }
+
+  // Fallback for standalone/test environments: in-process memory store
+  const now = Date.now();
+  const existing = localLockStore.get(claimKey);
+  if (existing && existing.expiresAt > now) {
+    return { claimed: false, reason: 'ALREADY_CLAIMED' };
+  }
+
+  localLockStore.set(claimKey, { token: 'CLAIMED', expiresAt: now + ttlSeconds * 1000 });
+  return { claimed: true };
+}
+
+/**
+ * Distributed Rate Limiting backed by Redis with safe, controlled fallback
  */
 export async function checkRateLimit(
   key: string,
   limit: number,
-  windowSeconds: number
+  windowSeconds: number,
+  options?: { isSecurityEndpoint?: boolean; failClosed?: boolean }
 ): Promise<{ allowed: boolean; remaining: number; resetTime: number }> {
   const rateKey = `ratelimit:${key}`;
   const client = getRedisClient();
   const now = Date.now();
+  const isSecurity = options?.isSecurityEndpoint ?? isCriticalOperationKey(key);
+  const mustFailClosed = options?.failClosed ?? false;
 
   if (client && isRedisConnected()) {
     try {
@@ -284,20 +339,41 @@ export async function checkRateLimit(
         resetTime: now + (ttl > 0 ? ttl * 1000 : windowSeconds * 1000),
       };
     } catch {
-      // On Redis network error, allow transient pass-through
-      return {
-        allowed: true,
-        remaining: 1,
-        resetTime: now + windowSeconds * 1000,
-      };
+      // If critical security endpoint (e.g. login brute force) and failClosed requested, fail closed
+      if (isSecurity && mustFailClosed) {
+        return {
+          allowed: false,
+          remaining: 0,
+          resetTime: now + windowSeconds * 1000,
+        };
+      }
     }
+  } else if (config.redisUrl && isSecurity && mustFailClosed) {
+    return {
+      allowed: false,
+      remaining: 0,
+      resetTime: now + windowSeconds * 1000,
+    };
   }
 
-  // Without Redis, default pass-through
+  // Local in-memory bounded rate limiter fallback for testing and transient degraded states
+  const local = localRateLimitStore.get(rateKey);
+  if (!local || local.resetTime < now) {
+    localRateLimitStore.set(rateKey, { count: 1, resetTime: now + windowSeconds * 1000 });
+    return {
+      allowed: true,
+      remaining: limit - 1,
+      resetTime: now + windowSeconds * 1000,
+    };
+  }
+
+  local.count++;
+  const allowed = local.count <= limit;
+  const remaining = Math.max(0, limit - local.count);
   return {
-    allowed: true,
-    remaining: limit,
-    resetTime: now + windowSeconds * 1000,
+    allowed,
+    remaining,
+    resetTime: local.resetTime,
   };
 }
 

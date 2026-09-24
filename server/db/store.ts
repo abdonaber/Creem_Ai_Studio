@@ -1,4 +1,5 @@
 import mongoose from 'mongoose';
+import { logger } from '../utils/logger';
 import { acquireLock, releaseLock, LockAcquisitionResult } from '../redis/redisClient';
 import {
   UserModel,
@@ -162,6 +163,17 @@ export interface IDatabaseStore {
     amount: number;
     idempotencyKey?: string;
   }): Promise<{ success: boolean; transactionId: string; platformFee: number; commissionDebt: number }>;
+
+  // Financial Reconciliation
+  reconcileFinancialIntegrity(): Promise<{
+    healthy: boolean;
+    discrepanciesCount: number;
+    discrepancies: Array<{
+      type: 'WALLET_MISMATCH' | 'PAYMENT_RIDE_MISMATCH' | 'COMMISSION_MISMATCH' | 'DRIVER_DEBT_MISMATCH';
+      id: string;
+      details: string;
+    }>;
+  }>;
 
   // Paginated Administrative Queries
   getRidesPaginated(options: {
@@ -686,6 +698,17 @@ export class MongoDatabaseStore implements IDatabaseStore {
   ): Promise<{ success: boolean; ride?: IRide; message?: string }> {
     this.ensureConnection();
 
+    // Check if ride was already accepted by this captain (Idempotent acceptance)
+    const initialRideQuery = mongoose.Types.ObjectId.isValid(rideId) ? { _id: rideId } : { id: rideId };
+    const preCheckRide = await RideModel.findOne(initialRideQuery).lean();
+    if (
+      preCheckRide &&
+      preCheckRide.driverId === driverId &&
+      ['DRIVER_ASSIGNED', 'DRIVER_ARRIVING', 'DRIVER_ARRIVED', 'RIDE_STARTED'].includes(preCheckRide.status)
+    ) {
+      return { success: true, ride: this.docToRide(preCheckRide) };
+    }
+
     // 1. Dual-level locking: Lock driver and ride to eliminate race conditions
     const driverLockKey = `driver_reservation:${driverId}`;
     const rideLockKey = `ride_claim:${rideId}`;
@@ -705,7 +728,7 @@ export class MongoDatabaseStore implements IDatabaseStore {
           ...driverQuery,
           approvalStatus: 'APPROVED',
           isOnline: true,
-          isBusy: { $ne: true },
+          $or: [{ isBusy: { $ne: true } }, { activeRideId: rideId }],
         },
         {
           $set: {
@@ -820,6 +843,13 @@ export class MongoDatabaseStore implements IDatabaseStore {
       isBusy: { $ne: true },
     };
 
+    // Stale driver exclusion (Phase 8 & 9): must have reported location within last 10 minutes
+    const staleCutoff = new Date(Date.now() - 10 * 60 * 1000);
+    matchFilter.$or = [
+      { lastSeenAt: { $gte: staleCutoff } },
+      { 'currentLocation.updatedAt': { $gte: staleCutoff.toISOString() } },
+    ];
+
     if (excludedDriverIds.length > 0) {
       const validIds = excludedDriverIds
         .filter((id) => mongoose.Types.ObjectId.isValid(id))
@@ -885,42 +915,11 @@ export class MongoDatabaseStore implements IDatabaseStore {
       }
 
       return results;
-    } catch {
-      // 2. Resilient fallback to coordinate bounding & precise Haversine
-      const driverDocs = await DriverModel.find(matchFilter).lean();
-      const results: Array<{ driver: IDriver; distanceKm: number }> = [];
-
-      for (const doc of driverDocs) {
-        const driver = this.docToDriver(doc);
-        const vehicle = await this.findVehicleByDriverId(driver.id);
-        if (vehicle) driver.vehicle = vehicle;
-
-        if (category && driver.vehicle && driver.vehicle.category !== category) {
-          continue;
-        }
-
-        if (!driver.currentLocation) {
-          continue;
-        }
-
-        // Calculate distance using Haversine formula
-        const dLat = (driver.currentLocation.lat - pickupLat) * (Math.PI / 180);
-        const dLng = (driver.currentLocation.lng - pickupLng) * (Math.PI / 180);
-        const a =
-          Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-          Math.cos(pickupLat * (Math.PI / 180)) *
-            Math.cos(driver.currentLocation.lat * (Math.PI / 180)) *
-            Math.sin(dLng / 2) *
-            Math.sin(dLng / 2);
-        const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-        const distanceKm = Math.round(6371 * c * 100) / 100;
-
-        if (distanceKm <= radiusKm) {
-          results.push({ driver, distanceKm });
-        }
-      }
-
-      return results.sort((a, b) => a.distanceKm - b.distanceKm);
+    } catch (err: any) {
+      // Phase 7 Production Hardening: NEVER fallback to full fleet memory scan!
+      // Fail safely, report operational error, and allow BullMQ dispatch queue to retry with backoff.
+      logger.error(`[GeoDispatch] Failed geospatial query near [${pickupLat}, ${pickupLng}]: ${err.message}`);
+      return [];
     }
   }
 
@@ -1217,13 +1216,211 @@ export class MongoDatabaseStore implements IDatabaseStore {
     this.ensureConnection();
     const { rideId, riderId, driverId, amount, idempotencyKey } = params;
 
-    // Check idempotency on ride payment first
+    // Try MongoDB transaction if available (replica set / Atlas deployment)
+    const session = await mongoose.startSession().catch(() => null);
+    if (session) {
+      try {
+        let result: { success: boolean; transactionId: string } | null = null;
+        await session.withTransaction(async () => {
+          const existingPayment = await PaymentModel.findOne({ rideId, status: 'SUCCEEDED' })
+            .session(session)
+            .lean();
+          if (existingPayment) {
+            result = { success: true, transactionId: existingPayment._id.toString() };
+            return;
+          }
+
+          // 1. Debit rider
+          const updatedRiderWallet = await WalletModel.findOneAndUpdate(
+            { userId: riderId, balance: { $gte: amount } },
+            { $inc: { balance: -amount }, $set: { updatedAt: new Date() } },
+            { session, new: true }
+          ).lean();
+
+          if (!updatedRiderWallet) {
+            throw new AppError('Insufficient wallet balance to complete payment.', 400, 'INSUFFICIENT_FUNDS');
+          }
+
+          await WalletTransactionModel.create(
+            [
+              {
+                _id: new mongoose.Types.ObjectId(),
+                walletId: updatedRiderWallet._id.toString(),
+                userId: riderId,
+                amount,
+                type: 'DEBIT',
+                balanceAfter: updatedRiderWallet.balance,
+                reason: `Payment for ride #${rideId.slice(0, 8)}`,
+                referenceId: rideId,
+                idempotencyKey: idempotencyKey ? `${idempotencyKey}_debit` : undefined,
+              },
+            ],
+            { session }
+          );
+
+          await PlatformLedgerModel.create(
+            [
+              {
+                _id: new mongoose.Types.ObjectId(),
+                rideId,
+                type: 'RIDER_FARE',
+                amount,
+                currency: 'SAR',
+                fromAccount: `rider:${riderId}`,
+                toAccount: 'platform:escrow',
+                status: 'SETTLED',
+                idempotencyKey: idempotencyKey ? `${idempotencyKey}_ledger_fare` : undefined,
+              },
+            ],
+            { session }
+          );
+
+          // 2. Driver earning & platform commission
+          if (driverId) {
+            const driver = await DriverModel.findById(driverId).session(session).lean();
+            if (driver) {
+              const driverEarning = Math.round(amount * 0.8 * 100) / 100;
+              const platformCommission = Math.round((amount - driverEarning) * 100) / 100;
+
+              let debtRecovery = 0;
+              if (driver.outstandingDebt && driver.outstandingDebt > 0) {
+                debtRecovery = Math.min(driverEarning, driver.outstandingDebt);
+              }
+
+              const netPayout = driverEarning - debtRecovery;
+              if (netPayout > 0) {
+                let driverWallet = await WalletModel.findOne({ userId: driver.userId }).session(session).lean();
+                if (!driverWallet) {
+                  const created = await WalletModel.create(
+                    [{ _id: new mongoose.Types.ObjectId(), userId: driver.userId, balance: 0, currency: 'SAR' }],
+                    { session }
+                  );
+                  driverWallet = created[0].toObject();
+                }
+
+                const updatedDriverWallet = await WalletModel.findOneAndUpdate(
+                  { userId: driver.userId },
+                  { $inc: { balance: netPayout }, $set: { updatedAt: new Date() } },
+                  { session, new: true }
+                ).lean();
+
+                await WalletTransactionModel.create(
+                  [
+                    {
+                      _id: new mongoose.Types.ObjectId(),
+                      walletId: updatedDriverWallet!._id.toString(),
+                      userId: driver.userId,
+                      amount: netPayout,
+                      type: 'CREDIT',
+                      balanceAfter: updatedDriverWallet!.balance,
+                      reason: `Net earnings for ride #${rideId.slice(0, 8)} (80% minus debt recovery)`,
+                      referenceId: rideId,
+                      idempotencyKey: idempotencyKey ? `${idempotencyKey}_driver_credit` : undefined,
+                    },
+                  ],
+                  { session }
+                );
+              }
+
+              if (debtRecovery > 0) {
+                await DriverModel.findByIdAndUpdate(
+                  driver._id,
+                  { $inc: { outstandingDebt: -debtRecovery } },
+                  { session }
+                );
+                await PlatformLedgerModel.create(
+                  [
+                    {
+                      _id: new mongoose.Types.ObjectId(),
+                      rideId,
+                      type: 'DEBT_RECOVERY',
+                      amount: debtRecovery,
+                      currency: 'SAR',
+                      fromAccount: `driver:${driver.id}`,
+                      toAccount: 'platform:commission',
+                      status: 'SETTLED',
+                      idempotencyKey: idempotencyKey ? `${idempotencyKey}_debt_rec` : undefined,
+                    },
+                  ],
+                  { session }
+                );
+              }
+
+              await PlatformLedgerModel.create(
+                [
+                  {
+                    _id: new mongoose.Types.ObjectId(),
+                    rideId,
+                    type: 'PLATFORM_COMMISSION',
+                    amount: platformCommission,
+                    currency: 'SAR',
+                    fromAccount: 'platform:escrow',
+                    toAccount: 'platform:revenue',
+                    status: 'COMMITTED',
+                    idempotencyKey: idempotencyKey ? `${idempotencyKey}_ledger_comm` : undefined,
+                  },
+                ],
+                { session }
+              );
+
+              await DriverModel.findByIdAndUpdate(
+                driver._id,
+                { $inc: { earningsTotal: driverEarning, totalRides: 1 } },
+                { session }
+              );
+            }
+          }
+
+          // 3. Update ride payment status
+          await RideModel.findOneAndUpdate(
+            mongoose.Types.ObjectId.isValid(rideId) ? { _id: rideId } : { id: rideId },
+            {
+              $set: {
+                paymentStatus: 'SUCCEEDED',
+                paymentMethod: 'WALLET',
+                finalFare: amount,
+                updatedAt: new Date(),
+              },
+            },
+            { session }
+          );
+
+          // 4. Create payment record
+          const paymentDocs = await PaymentModel.create(
+            [
+              {
+                _id: new mongoose.Types.ObjectId(),
+                rideId,
+                userId: riderId,
+                amount,
+                currency: 'SAR',
+                status: 'SUCCEEDED',
+                paymentMethod: 'WALLET',
+                idempotencyKey,
+              },
+            ],
+            { session }
+          );
+
+          result = { success: true, transactionId: paymentDocs[0]._id.toString() };
+        });
+
+        if (result) return result;
+      } catch (err: any) {
+        if (!err.message?.includes('replica set') && !err.message?.includes('Transactions are not supported')) {
+          throw err;
+        }
+      } finally {
+        await session.endSession();
+      }
+    }
+
+    // Fallback: atomic serial execution for standalone mongod without replica set
     const existingPayment = await PaymentModel.findOne({ rideId, status: 'SUCCEEDED' }).lean();
     if (existingPayment) {
       return { success: true, transactionId: existingPayment._id.toString() };
     }
 
-    // Debit rider
     await this.debitWallet(
       riderId,
       amount,
@@ -1243,14 +1440,12 @@ export class MongoDatabaseStore implements IDatabaseStore {
       idempotencyKey: idempotencyKey ? `${idempotencyKey}_ledger_fare` : undefined,
     });
 
-    // Credit driver (80% net earnings after 20% platform commission)
     if (driverId) {
       const driver = await this.findDriverById(driverId);
       if (driver) {
         const driverEarning = Math.round(amount * 0.8 * 100) / 100;
         const platformCommission = Math.round((amount - driverEarning) * 100) / 100;
 
-        // Automatically offset outstanding cash commission debt if any
         let debtRecovery = 0;
         if (driver.outstandingDebt && driver.outstandingDebt > 0) {
           debtRecovery = Math.min(driverEarning, driver.outstandingDebt);
@@ -1300,14 +1495,12 @@ export class MongoDatabaseStore implements IDatabaseStore {
       }
     }
 
-    // Update ride payment status
     await this.updateRide(rideId, {
       paymentStatus: 'SUCCEEDED',
       paymentMethod: 'WALLET',
       finalFare: amount,
     });
 
-    // Create payment record
     const payment = await this.createPayment({
       rideId,
       userId: riderId,
@@ -1331,6 +1524,204 @@ export class MongoDatabaseStore implements IDatabaseStore {
     this.ensureConnection();
     const { rideId, riderId, driverId, amount, idempotencyKey } = params;
 
+    // Try MongoDB transaction if available
+    const session = await mongoose.startSession().catch(() => null);
+    if (session) {
+      try {
+        let result: { success: boolean; transactionId: string; platformFee: number; commissionDebt: number } | null = null;
+        await session.withTransaction(async () => {
+          const existingPayment = await PaymentModel.findOne({ rideId, status: 'SUCCEEDED' })
+            .session(session)
+            .lean();
+          if (existingPayment) {
+            result = {
+              success: true,
+              transactionId: existingPayment._id.toString(),
+              platformFee: Math.round(amount * 0.2 * 100) / 100,
+              commissionDebt: 0,
+            };
+            return;
+          }
+
+          const platformFee = Math.round(amount * 0.2 * 100) / 100;
+          const driverEarning = Math.round((amount - platformFee) * 100) / 100;
+          const driver = await DriverModel.findById(driverId).session(session).lean();
+          let debtIncurred = 0;
+
+          if (driver) {
+            let driverWallet = await WalletModel.findOne({ userId: driver.userId }).session(session).lean();
+            if (!driverWallet) {
+              const created = await WalletModel.create(
+                [{ _id: new mongoose.Types.ObjectId(), userId: driver.userId, balance: 0, currency: 'SAR' }],
+                { session }
+              );
+              driverWallet = created[0].toObject();
+            }
+
+            if (driverWallet!.balance >= platformFee) {
+              const updatedWallet = await WalletModel.findOneAndUpdate(
+                { userId: driver.userId, balance: { $gte: platformFee } },
+                { $inc: { balance: -platformFee }, $set: { updatedAt: new Date() } },
+                { session, new: true }
+              ).lean();
+
+              await WalletTransactionModel.create(
+                [
+                  {
+                    _id: new mongoose.Types.ObjectId(),
+                    walletId: updatedWallet!._id.toString(),
+                    userId: driver.userId,
+                    amount: platformFee,
+                    type: 'DEBIT',
+                    balanceAfter: updatedWallet!.balance,
+                    reason: `Platform commission (20%) for cash ride #${rideId.slice(0, 8)}`,
+                    referenceId: rideId,
+                    idempotencyKey: idempotencyKey ? `${idempotencyKey}_cash_comm` : undefined,
+                  },
+                ],
+                { session }
+              );
+
+              await PlatformLedgerModel.create(
+                [
+                  {
+                    _id: new mongoose.Types.ObjectId(),
+                    rideId,
+                    type: 'PLATFORM_COMMISSION',
+                    amount: platformFee,
+                    currency: 'SAR',
+                    fromAccount: `driver:${driver.id}`,
+                    toAccount: 'platform:commission',
+                    status: 'COMMITTED',
+                    idempotencyKey: idempotencyKey ? `${idempotencyKey}_ledger_comm` : undefined,
+                  },
+                ],
+                { session }
+              );
+            } else {
+              const available = Math.max(0, driverWallet!.balance);
+              if (available > 0) {
+                const updatedWallet = await WalletModel.findOneAndUpdate(
+                  { userId: driver.userId },
+                  { $set: { balance: 0, updatedAt: new Date() } },
+                  { session, new: true }
+                ).lean();
+
+                await WalletTransactionModel.create(
+                  [
+                    {
+                      _id: new mongoose.Types.ObjectId(),
+                      walletId: updatedWallet!._id.toString(),
+                      userId: driver.userId,
+                      amount: available,
+                      type: 'DEBIT',
+                      balanceAfter: 0,
+                      reason: `Partial platform commission for cash ride #${rideId.slice(0, 8)}`,
+                      referenceId: rideId,
+                      idempotencyKey: idempotencyKey ? `${idempotencyKey}_partial_comm` : undefined,
+                    },
+                  ],
+                  { session }
+                );
+              }
+
+              debtIncurred = Math.round((platformFee - available) * 100) / 100;
+              await DriverModel.findByIdAndUpdate(
+                driver._id,
+                { $inc: { outstandingDebt: debtIncurred } },
+                { session }
+              );
+
+              await PlatformLedgerModel.create(
+                [
+                  {
+                    _id: new mongoose.Types.ObjectId(),
+                    rideId,
+                    type: 'COMMISSION_DEBT',
+                    amount: debtIncurred,
+                    currency: 'SAR',
+                    fromAccount: `driver:${driver.id}`,
+                    toAccount: 'platform:debt',
+                    status: 'OUTSTANDING',
+                    idempotencyKey: idempotencyKey ? `${idempotencyKey}_debt_inc` : undefined,
+                  },
+                ],
+                { session }
+              );
+            }
+
+            await DriverModel.findByIdAndUpdate(
+              driver._id,
+              { $inc: { earningsTotal: driverEarning, totalRides: 1 } },
+              { session }
+            );
+          }
+
+          await PlatformLedgerModel.create(
+            [
+              {
+                _id: new mongoose.Types.ObjectId(),
+                rideId,
+                type: 'RIDER_FARE',
+                amount,
+                currency: 'SAR',
+                fromAccount: `rider:${riderId}`,
+                toAccount: `driver:${driverId}`,
+                status: 'COMMITTED',
+                idempotencyKey: idempotencyKey ? `${idempotencyKey}_rider_cash` : undefined,
+              },
+            ],
+            { session }
+          );
+
+          await RideModel.findOneAndUpdate(
+            mongoose.Types.ObjectId.isValid(rideId) ? { _id: rideId } : { id: rideId },
+            {
+              $set: {
+                paymentStatus: 'SUCCEEDED',
+                paymentMethod: 'CASH',
+                finalFare: amount,
+                updatedAt: new Date(),
+              },
+            },
+            { session }
+          );
+
+          const paymentDocs = await PaymentModel.create(
+            [
+              {
+                _id: new mongoose.Types.ObjectId(),
+                rideId,
+                userId: riderId,
+                amount,
+                currency: 'SAR',
+                status: 'SUCCEEDED',
+                paymentMethod: 'CASH',
+                idempotencyKey,
+              },
+            ],
+            { session }
+          );
+
+          result = {
+            success: true,
+            transactionId: paymentDocs[0]._id.toString(),
+            platformFee,
+            commissionDebt: debtIncurred,
+          };
+        });
+
+        if (result) return result;
+      } catch (err: any) {
+        if (!err.message?.includes('replica set') && !err.message?.includes('Transactions are not supported')) {
+          throw err;
+        }
+      } finally {
+        await session.endSession();
+      }
+    }
+
+    // Fallback: atomic serial execution for standalone
     const existingPayment = await PaymentModel.findOne({ rideId, status: 'SUCCEEDED' }).lean();
     if (existingPayment) {
       return {
@@ -1349,7 +1740,6 @@ export class MongoDatabaseStore implements IDatabaseStore {
     if (driver) {
       const driverWallet = await this.getOrCreateWallet(driver.userId);
       if (driverWallet.balance >= platformFee) {
-        // Sufficient funds in wallet: deduct platform commission immediately
         await this.debitWallet(
           driver.userId,
           platformFee,
@@ -1368,7 +1758,6 @@ export class MongoDatabaseStore implements IDatabaseStore {
           idempotencyKey: idempotencyKey ? `${idempotencyKey}_ledger_comm` : undefined,
         });
       } else {
-        // Partial or zero balance in wallet
         const available = Math.max(0, driverWallet.balance);
         if (available > 0) {
           await this.debitWallet(
@@ -2088,6 +2477,90 @@ export class MongoDatabaseStore implements IDatabaseStore {
       totalDriverPayouts,
       totalOutstandingDebt,
       transactionCount: payments.length,
+    };
+  }
+
+  public async reconcileFinancialIntegrity(): Promise<{
+    healthy: boolean;
+    discrepanciesCount: number;
+    discrepancies: Array<{
+      type: 'WALLET_MISMATCH' | 'PAYMENT_RIDE_MISMATCH' | 'COMMISSION_MISMATCH' | 'DRIVER_DEBT_MISMATCH';
+      id: string;
+      details: string;
+    }>;
+  }> {
+    this.ensureConnection();
+    const discrepancies: Array<{
+      type: 'WALLET_MISMATCH' | 'PAYMENT_RIDE_MISMATCH' | 'COMMISSION_MISMATCH' | 'DRIVER_DEBT_MISMATCH';
+      id: string;
+      details: string;
+    }> = [];
+
+    // 1. Audit Wallet Balances against Transactions
+    const wallets = await WalletModel.find().lean();
+    for (const wallet of wallets) {
+      const txs = await WalletTransactionModel.find({ userId: wallet.userId }).lean();
+      const calculatedBalance = txs.reduce((sum, tx) => {
+        return tx.type === 'CREDIT' ? sum + tx.amount : sum - tx.amount;
+      }, 0);
+      const diff = Math.abs(wallet.balance - calculatedBalance);
+      if (diff > 0.05) {
+        discrepancies.push({
+          type: 'WALLET_MISMATCH',
+          id: wallet.userId,
+          details: `Wallet balance (${wallet.balance.toFixed(2)} SAR) does not match sum of transactions (${calculatedBalance.toFixed(2)} SAR). Difference: ${diff.toFixed(2)} SAR.`,
+        });
+      }
+    }
+
+    // 2. Audit Payment records vs Completed Rides
+    const completedRides = await RideModel.find({ status: 'RIDE_COMPLETED' }).lean();
+    for (const ride of completedRides) {
+      const payment = await PaymentModel.findOne({ rideId: ride._id.toString() }).lean();
+      if (!payment) {
+        discrepancies.push({
+          type: 'PAYMENT_RIDE_MISMATCH',
+          id: ride._id.toString(),
+          details: `Completed ride #${ride._id.toString().slice(0, 8)} has no payment record.`,
+        });
+      } else if (ride.paymentStatus === 'SUCCEEDED' && payment.status !== 'SUCCEEDED') {
+        discrepancies.push({
+          type: 'PAYMENT_RIDE_MISMATCH',
+          id: ride._id.toString(),
+          details: `Ride marked paymentStatus: SUCCEEDED but payment record #${payment._id} is status: ${payment.status}.`,
+        });
+      }
+    }
+
+    // 3. Audit Driver Outstanding Debt vs Ledger Entries
+    const driversWithDebt = await DriverModel.find({ outstandingDebt: { $gt: 0 } }).lean();
+    for (const driver of driversWithDebt) {
+      const debtLedgers = await PlatformLedgerModel.find({
+        fromAccount: `driver:${driver._id.toString()}`,
+        type: 'COMMISSION_DEBT',
+      }).lean();
+      const recoveryLedgers = await PlatformLedgerModel.find({
+        fromAccount: `driver:${driver._id.toString()}`,
+        type: 'DEBT_RECOVERY',
+      }).lean();
+
+      const totalIncurred = debtLedgers.reduce((acc, l) => acc + l.amount, 0);
+      const totalRecovered = recoveryLedgers.reduce((acc, l) => acc + l.amount, 0);
+      const expectedDebt = Math.max(0, Math.round((totalIncurred - totalRecovered) * 100) / 100);
+
+      if (Math.abs(driver.outstandingDebt - expectedDebt) > 0.05) {
+        discrepancies.push({
+          type: 'DRIVER_DEBT_MISMATCH',
+          id: driver._id.toString(),
+          details: `Driver debt record (${driver.outstandingDebt} SAR) does not match ledger balance (${expectedDebt} SAR).`,
+        });
+      }
+    }
+
+    return {
+      healthy: discrepancies.length === 0,
+      discrepanciesCount: discrepancies.length,
+      discrepancies,
     };
   }
 

@@ -66,24 +66,33 @@ export class PaymentService {
         throw new AppError('Cannot settle cash payment without an assigned driver', 400, 'NO_DRIVER_ASSIGNED');
       }
 
-      const settleResult = await db.settleCashPayment({
-        rideId,
-        riderId: ride.riderId,
-        driverId: ride.driverId,
-        amount,
-        idempotencyKey,
-      });
-
-      if (io) {
-        io.to(`ride:${rideId}`).emit('ride:payment_completed', {
+      try {
+        const settleResult = await db.settleCashPayment({
           rideId,
-          status: 'SUCCEEDED',
-          method: 'CASH',
+          riderId: ride.riderId,
+          driverId: ride.driverId,
           amount,
+          idempotencyKey,
         });
-      }
 
-      return { success: true, paymentStatus: 'SUCCEEDED', transactionId: settleResult.transactionId };
+        if (io) {
+          io.to(`ride:${rideId}`).emit('ride:payment_completed', {
+            rideId,
+            status: 'SUCCEEDED',
+            method: 'CASH',
+            amount,
+          });
+        }
+
+        return { success: true, paymentStatus: 'SUCCEEDED', transactionId: settleResult.transactionId };
+      } catch (err: any) {
+        await db.updateRide(rideId, { paymentStatus: 'REQUIRES_RECONCILIATION' });
+        throw new AppError(
+          `Cash payment settlement failed: ${err.message}. Flagged for reconciliation.`,
+          err.statusCode || 500,
+          'CASH_SETTLEMENT_FAILED'
+        );
+      }
     } else {
       // Credit card via Stripe
       const intent = await StripeService.createPaymentIntent({
@@ -228,6 +237,46 @@ export class PaymentService {
               status: 'SUCCEEDED',
               method: 'CREDIT_CARD',
               amount: payment.amount,
+            });
+          }
+        }
+      } else if (event.type === 'payment_intent.payment_failed') {
+        const paymentIntent = event.data.object as any;
+        const payment = await db.findPaymentByStripeIntent(paymentIntent.id);
+        if (payment && payment.status !== 'SUCCEEDED') {
+          await db.updatePayment(payment.id, { status: 'FAILED' });
+          await db.updateRide(payment.rideId, { paymentStatus: 'FAILED' });
+          if (io) {
+            io.to(`ride:${payment.rideId}`).emit('ride:payment_failed', {
+              rideId: payment.rideId,
+              status: 'FAILED',
+              reason: paymentIntent.last_payment_error?.message || 'Payment failed',
+            });
+          }
+        }
+      } else if (event.type === 'charge.refunded' || event.type === 'payment_intent.canceled') {
+        const obj = event.data.object as any;
+        const paymentIntentId = obj.payment_intent || obj.id;
+        const payment = await db.findPaymentByStripeIntent(paymentIntentId);
+        if (payment) {
+          const refundAmount = obj.amount_refunded ? obj.amount_refunded / 100 : payment.amount;
+          await db.updatePayment(payment.id, { status: 'REFUNDED', refundAmount });
+          await db.updateRide(payment.rideId, { paymentStatus: 'REFUNDED' });
+          await db.recordLedgerEntry({
+            rideId: payment.rideId,
+            type: 'REFUND',
+            amount: refundAmount,
+            currency: 'SAR',
+            fromAccount: 'platform:escrow',
+            toAccount: `rider:${payment.userId}`,
+            status: 'SETTLED',
+            idempotencyKey: `webhook_${effectiveEventId}_refund`,
+          });
+          if (io) {
+            io.to(`ride:${payment.rideId}`).emit('ride:payment_refunded', {
+              rideId: payment.rideId,
+              status: 'REFUNDED',
+              amount: refundAmount,
             });
           }
         }

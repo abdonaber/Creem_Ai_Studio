@@ -235,6 +235,29 @@ adminRouter.get('/ledger', async (req: Request, res: Response, next: NextFunctio
   }
 });
 
+// Financial Reconciliation Audit
+adminRouter.get('/reconciliation', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const report = await db.reconcileFinancialIntegrity();
+    res.json({ success: true, data: report });
+  } catch (err) {
+    next(err);
+  }
+});
+
+adminRouter.post('/reconciliation/run', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const report = await db.reconcileFinancialIntegrity();
+    await db.logAudit(req.user!.userId, 'FINANCIAL_RECONCILIATION_RUN', {
+      healthy: report.healthy,
+      discrepanciesCount: report.discrepanciesCount,
+    });
+    res.json({ success: true, data: report });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // User Management: Change Status (Suspend / Activate)
 adminRouter.put(
   '/users/:id/status',

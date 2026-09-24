@@ -14,7 +14,7 @@ export type RideStatus =
   | 'CANCELLED'
   | 'NO_DRIVER_FOUND';
 
-export type PaymentStatus = 'PENDING' | 'SUCCEEDED' | 'FAILED' | 'REFUNDED';
+export type PaymentStatus = 'PENDING' | 'PROCESSING' | 'SUCCEEDED' | 'FAILED' | 'REFUNDED' | 'REQUIRES_RECONCILIATION';
 export type PaymentMethod = 'WALLET' | 'CASH' | 'CREDIT_CARD';
 
 export interface LocationCoordinate {
@@ -60,6 +60,7 @@ export interface IDriver {
     heading?: number;
     updatedAt: string;
   };
+  lastSeenAt?: string;
   vehicle?: IVehicle;
   rating: number;
   totalRides: number;

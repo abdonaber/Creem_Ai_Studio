@@ -208,4 +208,130 @@ describe('Production Hardening & Integrity Suite', () => {
       expect(userId.length).toBeGreaterThan(16);
     });
   });
+
+  describe('7. Stripe Webhook Concurrency & Deduplication (Phase 6)', () => {
+    it('processes exactly one financial effect when 20 identical webhooks fire concurrently', async () => {
+      // Create a test ride and payment
+      const ride = await store.createRide({
+        riderId: riderUser.id,
+        driverId: driverRecord.id,
+        status: 'RIDE_COMPLETED',
+        estimatedFare: 50,
+        distanceKm: 10,
+        durationMinutes: 20,
+        paymentMethod: 'CREDIT_CARD',
+        paymentStatus: 'PENDING',
+      });
+
+      const intentId = 'pi_test_concurrency_' + generateId('pi');
+      await store.createPayment({
+        rideId: ride.id,
+        userId: riderUser.id,
+        amount: 50,
+        currency: 'SAR',
+        status: 'PENDING',
+        paymentMethod: 'CREDIT_CARD',
+        stripePaymentIntentId: intentId,
+      });
+
+      const eventId = 'evt_concurrent_test_' + generateId('evt');
+
+      // Mock webhook payload
+      const mockEvent = {
+        id: eventId,
+        type: 'payment_intent.succeeded',
+        data: {
+          object: {
+            id: intentId,
+            amount: 5000,
+            currency: 'sar',
+            metadata: { rideId: ride.id },
+          },
+        },
+      };
+
+      // Spy on StripeService.constructWebhookEvent
+      const { StripeService } = await import('../server/services/stripeService');
+      const constructSpy = (StripeService as any).constructWebhookEvent;
+      StripeService.constructWebhookEvent = () => mockEvent as any;
+
+      try {
+        // Send 20 concurrent webhook requests
+        const promises = Array.from({ length: 20 }, () =>
+          PaymentService.handleWebhook(JSON.stringify(mockEvent), 'test_sig', eventId)
+        );
+
+        const results = await Promise.all(promises);
+        expect(results.every((r) => r === true)).toBe(true);
+
+        // Verify exactly ONE ledger fare entry was recorded for this event
+        const fareLedgers = store.ledger.filter(
+          (l) => l.rideId === ride.id && l.type === 'RIDER_FARE'
+        );
+        expect(fareLedgers.length).toBe(1);
+
+        // Verify ride payment status is SUCCEEDED
+        const updatedRide = await store.findRideById(ride.id);
+        expect(updatedRide?.paymentStatus).toBe('SUCCEEDED');
+      } finally {
+        StripeService.constructWebhookEvent = constructSpy;
+      }
+    });
+  });
+
+  describe('8. Cash Payment Failure & Financial State Machine (Phase 5)', () => {
+    it('transitions ride to REQUIRES_RECONCILIATION if cash settlement fails unexpectedly', async () => {
+      const ride = await store.createRide({
+        riderId: riderUser.id,
+        driverId: driverRecord.id,
+        status: 'RIDE_COMPLETED',
+        estimatedFare: 40,
+        distanceKm: 8,
+        durationMinutes: 15,
+        paymentMethod: 'CASH',
+        paymentStatus: 'PENDING',
+      });
+
+      // Temporarily mock settleCashPayment to throw
+      const originalSettle = store.settleCashPayment.bind(store);
+      store.settleCashPayment = async () => {
+        throw new Error('Ledger database connection timed out during settlement');
+      };
+
+      try {
+        await expect(
+          PaymentService.processRidePayment(ride.id, riderUser.id, 40, 'CASH')
+        ).rejects.toThrow('Flagged for reconciliation');
+
+        const updatedRide = await store.findRideById(ride.id);
+        expect(updatedRide?.paymentStatus).toBe('REQUIRES_RECONCILIATION');
+      } finally {
+        store.settleCashPayment = originalSettle;
+      }
+    });
+  });
+
+  describe('9. Financial Reconciliation Audit Mechanism (Phase 4)', () => {
+    it('returns healthy status when all wallets and ledgers are balanced', async () => {
+      const res = await request(app)
+        .get('/api/v1/admin/reconciliation')
+        .set('Authorization', `Bearer ${adminToken}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.data.healthy).toBe(true);
+      expect(res.body.data.discrepanciesCount).toBe(0);
+    });
+
+    it('detects and flags discrepancies when a wallet mismatch is introduced', async () => {
+      // Artificially corrupt a wallet balance without transaction
+      const targetWallet = await store.getOrCreateWallet(riderUser.id);
+      targetWallet.balance += 999; // Corrupt balance
+
+      const report = await store.reconcileFinancialIntegrity();
+      expect(report.healthy).toBe(false);
+      expect(report.discrepanciesCount).toBeGreaterThan(0);
+      expect(report.discrepancies.some((d) => d.type === 'WALLET_MISMATCH')).toBe(true);
+    });
+  });
 });

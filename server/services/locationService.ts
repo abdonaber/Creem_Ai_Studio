@@ -44,9 +44,25 @@ export class LocationService {
     lat: number;
     lng: number;
     heading?: number;
+    timestamp?: number;
   }): Promise<{ accepted: boolean; reason?: string }> {
-    const { driverId, userId, lat, lng, heading = 0 } = params;
+    const { driverId, userId, lat, lng, heading = 0, timestamp: clientTimestamp } = params;
     const now = Date.now();
+
+    // 0. Timestamp & Recency Validations (Phase 8 Production Hardening)
+    if (clientTimestamp !== undefined) {
+      if (typeof clientTimestamp !== 'number' || isNaN(clientTimestamp)) {
+        return { accepted: false, reason: 'INVALID_TIMESTAMP' };
+      }
+      // Future timestamp rejection (>30s ahead of server clock)
+      if (clientTimestamp > now + 30000) {
+        return { accepted: false, reason: 'FUTURE_TIMESTAMP_REJECTED' };
+      }
+      // Stale location packet rejection (>60s old)
+      if (clientTimestamp < now - 60000) {
+        return { accepted: false, reason: 'STALE_LOCATION_REJECTED' };
+      }
+    }
 
     // 1. Geographic Coordinate Bounds Check
     if (
@@ -62,10 +78,20 @@ export class LocationService {
       return { accepted: false, reason: 'INVALID_COORDINATES_BOUNDS' };
     }
 
-    const headingNum = typeof heading === 'number' && !isNaN(heading) ? (heading % 360 + 360) % 360 : 0;
+    // Heading validation (0 to 360 degrees)
+    if (typeof heading !== 'number' || isNaN(heading) || heading < 0 || heading > 360) {
+      return { accepted: false, reason: 'INVALID_HEADING_BOUNDS' };
+    }
+    const headingNum = (heading % 360 + 360) % 360;
     const previous = this.driverStates.get(driverId);
 
     if (previous) {
+      const effectivePacketTime = clientTimestamp || now;
+      // Out-of-order packet rejection
+      if (clientTimestamp && clientTimestamp <= previous.timestamp) {
+        return { accepted: false, reason: 'OUT_OF_ORDER_PACKET' };
+      }
+
       const elapsedSeconds = (now - previous.timestamp) / 1000;
 
       // 2. High-Frequency Rate Limiting (Minimum 0.8 seconds between updates)
@@ -152,7 +178,10 @@ export class LocationService {
       state.lastPersistedLng = lng;
 
       // Async DB write without blocking caller
-      db.updateDriver(driverId, { currentLocation: updatedLoc }).catch((err: any) => {
+      db.updateDriver(driverId, {
+        currentLocation: updatedLoc,
+        lastSeenAt: new Date(now).toISOString(),
+      }).catch((err: any) => {
         logger.error(`[LocationTracker] Failed to persist driver ${driverId} location to DB:`, err);
       });
     }
@@ -170,14 +199,19 @@ export class LocationService {
       let staleCount = 0;
 
       for (const driver of onlineDrivers) {
-        if (!driver.currentLocation || !driver.currentLocation.updatedAt) {
+        const lastSeen = driver.lastSeenAt
+          ? new Date(driver.lastSeenAt)
+          : driver.currentLocation?.updatedAt
+          ? new Date(driver.currentLocation.updatedAt)
+          : null;
+
+        if (!lastSeen) {
           await db.updateDriver(driver.id, { isOnline: false });
           staleCount++;
           continue;
         }
 
-        const lastUpdated = new Date(driver.currentLocation.updatedAt);
-        if (lastUpdated < cutoffDate && !driver.isBusy) {
+        if (lastSeen < cutoffDate && !driver.isBusy) {
           logger.info(`[LocationTracker] Driver ${driver.id} marked offline due to stale GPS telemetry.`);
           await db.updateDriver(driver.id, { isOnline: false });
           staleCount++;

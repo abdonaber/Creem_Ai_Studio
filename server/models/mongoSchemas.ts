@@ -57,6 +57,7 @@ export interface IDriverDocument extends Document {
   };
   earningsTotal: number;
   outstandingDebt: number;
+  lastSeenAt?: Date;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -98,6 +99,7 @@ export const DriverSchema = new Schema<IDriverDocument>(
     },
     earningsTotal: { type: Number, default: 0 },
     outstandingDebt: { type: Number, default: 0, min: 0 },
+    lastSeenAt: { type: Date, index: true },
   },
   { timestamps: true }
 );
@@ -107,6 +109,7 @@ DriverSchema.index({ location: '2dsphere' }, { sparse: true });
 DriverSchema.index({ location: '2dsphere', isOnline: 1, approvalStatus: 1, isBusy: 1 });
 DriverSchema.index({ 'currentLocation.lat': 1, 'currentLocation.lng': 1 });
 DriverSchema.index({ 'currentLocation.updatedAt': -1 });
+DriverSchema.index({ lastSeenAt: -1 });
 
 // 3. Vehicle Schema
 export interface IVehicleDocument extends Omit<Document, 'model'> {
@@ -229,7 +232,7 @@ export const RideSchema = new Schema<IRideDocument>(
     },
     paymentStatus: {
       type: String,
-      enum: ['PENDING', 'SUCCEEDED', 'FAILED', 'REFUNDED'],
+      enum: ['PENDING', 'PROCESSING', 'SUCCEEDED', 'FAILED', 'REFUNDED', 'REQUIRES_RECONCILIATION'],
       default: 'PENDING',
     },
     cancellationReason: String,
@@ -369,7 +372,7 @@ export const PaymentSchema = new Schema<IPaymentDocument>(
     currency: { type: String, default: 'SAR' },
     status: {
       type: String,
-      enum: ['PENDING', 'SUCCEEDED', 'FAILED', 'REFUNDED'],
+      enum: ['PENDING', 'PROCESSING', 'SUCCEEDED', 'FAILED', 'REFUNDED', 'REQUIRES_RECONCILIATION'],
       default: 'PENDING',
     },
     paymentMethod: {
@@ -604,8 +607,17 @@ export const PlatformLedgerSchema = new Schema<IPlatformLedgerDocument>(
 );
 
 PlatformLedgerSchema.index({ rideId: 1, type: 1 });
+PlatformLedgerSchema.index({ rideId: 1, type: 1, idempotencyKey: 1 }, { unique: true, sparse: true });
 PlatformLedgerSchema.index({ fromAccount: 1, createdAt: -1 });
 PlatformLedgerSchema.index({ toAccount: 1, createdAt: -1 });
+
+// Hard immutability guarantee: Ledger is strictly append-only
+PlatformLedgerSchema.pre(['updateOne', 'updateMany', 'findOneAndUpdate', 'replaceOne'] as any, function () {
+  throw new Error('IMMUTABLE_LEDGER: Updates to financial ledger entries are strictly forbidden.');
+});
+PlatformLedgerSchema.pre(['deleteOne', 'deleteMany', 'findOneAndDelete'] as any, function () {
+  throw new Error('IMMUTABLE_LEDGER: Deletions of financial ledger entries are strictly forbidden.');
+});
 
 // Export Mongoose Models
 export const UserModel = mongoose.models.User || mongoose.model<IUserDocument>('User', UserSchema);

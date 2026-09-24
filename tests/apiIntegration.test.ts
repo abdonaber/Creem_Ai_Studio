@@ -3,6 +3,7 @@ import request from 'supertest';
 import { app } from '../server';
 import { setDatabaseStore } from '../server/db/store';
 import { TestDatabaseStore } from './testStore';
+import { createAuthToken } from '../server/middleware/auth';
 
 describe('End-to-End API Integration & RBAC Tests', () => {
   let riderToken: string;
@@ -49,15 +50,15 @@ describe('End-to-End API Integration & RBAC Tests', () => {
       });
     }
 
-    // Register Admin
-    const adminReg = await request(app).post('/api/v1/auth/register').send({
+    // Create Admin directly in database (public registration cannot create ADMIN)
+    const admin = await testStore.createUser({
       name: 'Test Admin',
       email: 'admin_test@creemy.app',
       phone: '+966533333333',
-      password: 'TestPassword123!',
       role: 'ADMIN',
+      status: 'ACTIVE',
     });
-    adminToken = adminReg.body.data.accessToken;
+    adminToken = createAuthToken({ userId: admin.id, role: 'ADMIN', email: admin.email });
   });
 
   it('GET /health returns healthy system status', async () => {

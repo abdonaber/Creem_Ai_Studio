@@ -69,7 +69,7 @@ driverRouter.put('/location', async (req: Request, res: Response, next: NextFunc
     const driver = await db.findDriverByUserId(req.user!.userId);
     if (!driver) throw new AppError('Driver profile not found', 404, 'NOT_FOUND');
 
-    const { lat, lng, heading } = req.body;
+    const { lat, lng, heading, timestamp } = req.body;
 
     const result = await LocationService.processDriverLocationUpdate({
       driverId: driver.id,
@@ -77,6 +77,7 @@ driverRouter.put('/location', async (req: Request, res: Response, next: NextFunc
       lat,
       lng,
       heading,
+      timestamp,
     });
 
     if (!result.accepted) {
@@ -85,6 +86,18 @@ driverRouter.put('/location', async (req: Request, res: Response, next: NextFunc
       }
       if (result.reason === 'UNREALISTIC_MOVEMENT_SPOOFING') {
         throw new AppError('Unrealistic GPS movement detected.', 400, 'GPS_ANOMALY_REJECTED');
+      }
+      if (result.reason === 'FUTURE_TIMESTAMP_REJECTED') {
+        throw new AppError('Telemetry packet timestamp is in the future.', 400, 'FUTURE_TIMESTAMP_REJECTED');
+      }
+      if (result.reason === 'STALE_LOCATION_REJECTED') {
+        throw new AppError('Telemetry packet timestamp is too old / stale.', 400, 'STALE_LOCATION_REJECTED');
+      }
+      if (result.reason === 'OUT_OF_ORDER_PACKET') {
+        throw new AppError('Telemetry packet received out of order.', 400, 'OUT_OF_ORDER_PACKET');
+      }
+      if (result.reason === 'INVALID_HEADING_BOUNDS') {
+        throw new AppError('Heading must be between 0 and 360 degrees.', 400, 'INVALID_HEADING');
       }
       throw new AppError('Invalid geographic coordinates (-90<=lat<=90, -180<=lng<=180)', 400, 'INVALID_COORDINATES');
     }

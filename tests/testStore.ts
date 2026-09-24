@@ -456,6 +456,11 @@ export class TestDatabaseStore implements IDatabaseStore {
       currency: payment.currency || 'SAR',
       status: payment.status || 'PENDING',
       paymentMethod: payment.paymentMethod || 'WALLET',
+      stripePaymentIntentId: payment.stripePaymentIntentId,
+      stripeClientSecret: payment.stripeClientSecret,
+      idempotencyKey: payment.idempotencyKey,
+      refundAmount: payment.refundAmount,
+      metadata: payment.metadata,
       createdAt: new Date().toISOString(),
     };
     this.payments.set(id, p);
@@ -830,6 +835,88 @@ export class TestDatabaseStore implements IDatabaseStore {
       totalDriverPayouts,
       totalOutstandingDebt,
       transactionCount: succeeded.length,
+    };
+  }
+
+  async reconcileFinancialIntegrity(): Promise<{
+    healthy: boolean;
+    discrepanciesCount: number;
+    discrepancies: Array<{
+      type: 'WALLET_MISMATCH' | 'PAYMENT_RIDE_MISMATCH' | 'COMMISSION_MISMATCH' | 'DRIVER_DEBT_MISMATCH';
+      id: string;
+      details: string;
+    }>;
+  }> {
+    const discrepancies: Array<{
+      type: 'WALLET_MISMATCH' | 'PAYMENT_RIDE_MISMATCH' | 'COMMISSION_MISMATCH' | 'DRIVER_DEBT_MISMATCH';
+      id: string;
+      details: string;
+    }> = [];
+
+    // 1. Audit Wallets against transactions
+    for (const [userId, wallet] of this.wallets.entries()) {
+      const userTxs = this.transactions.get(userId) || [];
+      const calculatedBalance = userTxs.reduce((sum, tx) => {
+        return tx.type === 'CREDIT' ? sum + tx.amount : sum - tx.amount;
+      }, 0);
+      const diff = Math.abs(wallet.balance - calculatedBalance);
+      if (diff > 0.05) {
+        discrepancies.push({
+          type: 'WALLET_MISMATCH',
+          id: userId,
+          details: `Wallet balance (${wallet.balance.toFixed(2)} SAR) does not match sum of transactions (${calculatedBalance.toFixed(2)} SAR). Difference: ${diff.toFixed(2)} SAR.`,
+        });
+      }
+    }
+
+    // 2. Audit Completed Rides vs Payments
+    for (const [rideId, ride] of this.rides.entries()) {
+      if (ride.status === 'RIDE_COMPLETED') {
+        const payment = Array.from(this.payments.values()).find((p) => p.rideId === rideId);
+        if (!payment) {
+          discrepancies.push({
+            type: 'PAYMENT_RIDE_MISMATCH',
+            id: rideId,
+            details: `Completed ride #${rideId} has no payment record.`,
+          });
+        } else if (ride.paymentStatus === 'SUCCEEDED' && payment.status !== 'SUCCEEDED') {
+          discrepancies.push({
+            type: 'PAYMENT_RIDE_MISMATCH',
+            id: rideId,
+            details: `Ride marked paymentStatus: SUCCEEDED but payment record #${payment.id} is status: ${payment.status}.`,
+          });
+        }
+      }
+    }
+
+    // 3. Audit Driver Outstanding Debt against Ledger
+    for (const [driverId, driver] of this.drivers.entries()) {
+      if ((driver.outstandingDebt || 0) > 0) {
+        const debtLedgers = this.ledger.filter(
+          (l) => l.fromAccount === `driver:${driverId}` && l.type === 'COMMISSION_DEBT'
+        );
+        const recoveryLedgers = this.ledger.filter(
+          (l) => l.fromAccount === `driver:${driverId}` && l.type === 'DEBT_RECOVERY'
+        );
+
+        const totalIncurred = debtLedgers.reduce((acc, l) => acc + l.amount, 0);
+        const totalRecovered = recoveryLedgers.reduce((acc, l) => acc + l.amount, 0);
+        const expectedDebt = Math.max(0, Math.round((totalIncurred - totalRecovered) * 100) / 100);
+
+        if (Math.abs((driver.outstandingDebt || 0) - expectedDebt) > 0.05) {
+          discrepancies.push({
+            type: 'DRIVER_DEBT_MISMATCH',
+            id: driverId,
+            details: `Driver debt record (${driver.outstandingDebt} SAR) does not match ledger balance (${expectedDebt} SAR).`,
+          });
+        }
+      }
+    }
+
+    return {
+      healthy: discrepancies.length === 0,
+      discrepanciesCount: discrepancies.length,
+      discrepancies,
     };
   }
 
