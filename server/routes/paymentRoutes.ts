@@ -10,17 +10,26 @@ paymentRouter.post('/process', authenticate, async (req: Request, res: Response,
   try {
     const { rideId, amount, paymentMethod = 'WALLET', idempotencyKey } = req.body;
 
-    if (!rideId || !amount) {
-      throw new AppError('rideId and amount are required', 400, 'INVALID_INPUT');
+    if (!rideId) {
+      throw new AppError('rideId is required', 400, 'INVALID_INPUT');
+    }
+
+    let parsedAmount: number | undefined = undefined;
+    if (amount !== undefined && amount !== null) {
+      if (typeof amount !== 'number' || isNaN(amount)) {
+        throw new AppError('Provided payment amount must be a valid number', 400, 'INVALID_AMOUNT');
+      }
+      parsedAmount = amount;
     }
 
     const result = await PaymentService.processRidePayment(
       rideId,
       req.user!.userId,
-      Number(amount),
+      parsedAmount,
       paymentMethod,
       idempotencyKey
     );
+
 
     res.json({ success: true, data: result });
   } catch (err) {

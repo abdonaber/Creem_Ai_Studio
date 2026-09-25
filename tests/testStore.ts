@@ -18,6 +18,7 @@ import {
 } from '../server/types';
 import { AppError } from '../server/middleware/errorHandler';
 import { generateId } from '../server/utils/id';
+import { config } from '../server/config';
 
 export class TestDatabaseStore implements IDatabaseStore {
   public users = new Map<string, IUser>();
@@ -35,6 +36,7 @@ export class TestDatabaseStore implements IDatabaseStore {
   public auditLogs: IAuditLog[] = [];
   public sessions = new Map<string, IRefreshSession>();
   public processedWebhooks = new Set<string>();
+  public webhookEvents = new Map<string, { status: string; leaseExpiresAt: number }>();
 
   public clearAll(): void {
     this.users.clear();
@@ -50,6 +52,7 @@ export class TestDatabaseStore implements IDatabaseStore {
     this.auditLogs = [];
     this.sessions.clear();
     this.processedWebhooks.clear();
+    this.webhookEvents.clear();
   }
 
   // Users
@@ -281,10 +284,20 @@ export class TestDatabaseStore implements IDatabaseStore {
     const { pickupLat, pickupLng, radiusKm, category, excludedDriverIds = [] } = params;
     const results: Array<{ driver: IDriver; distanceKm: number }> = [];
 
+    const staleCutoff = Date.now() - config.driverLocationStaleMs;
     for (const driver of this.drivers.values()) {
       if (!driver.isOnline || driver.approvalStatus !== 'APPROVED' || driver.isBusy || !driver.currentLocation) continue;
+
+      const lastSeenTime = driver.lastSeenAt
+        ? new Date(driver.lastSeenAt).getTime()
+        : driver.currentLocation.updatedAt
+        ? new Date(driver.currentLocation.updatedAt).getTime()
+        : 0;
+      if (lastSeenTime < staleCutoff) continue;
+
       if (excludedDriverIds.includes(driver.id)) continue;
       if (category && driver.vehicle && driver.vehicle.category !== category) continue;
+
 
       const dLat = (driver.currentLocation.lat - pickupLat) * (Math.PI / 180);
       const dLng = (driver.currentLocation.lng - pickupLng) * (Math.PI / 180);
@@ -493,20 +506,143 @@ export class TestDatabaseStore implements IDatabaseStore {
   async isWebhookProcessed(eventId: string): Promise<boolean> {
     return this.processedWebhooks.has(eventId);
   }
+
   async claimWebhookEvent(
     eventId: string,
     source: string,
-    type: string
+    type: string,
+    leaseDurationMs: number = 60000
   ): Promise<{ claimed: boolean; alreadyProcessed: boolean }> {
-    if (this.processedWebhooks.has(eventId)) {
-      return { claimed: false, alreadyProcessed: true };
+    const now = Date.now();
+    const existing = this.webhookEvents.get(eventId);
+
+    if (existing) {
+      if (existing.status === 'PROCESSED') {
+        return { claimed: false, alreadyProcessed: true };
+      }
+      // If processing and lease still valid -> in flight, reject claim
+      if (existing.status === 'PROCESSING' && existing.leaseExpiresAt > now) {
+        return { claimed: false, alreadyProcessed: false };
+      }
+      // If lease expired or status FAILED, allow re-claim with new lease
+      existing.status = 'PROCESSING';
+      existing.leaseExpiresAt = now + leaseDurationMs;
+      return { claimed: true, alreadyProcessed: false };
     }
-    this.processedWebhooks.add(eventId);
+
+    this.webhookEvents.set(eventId, { status: 'PROCESSING', leaseExpiresAt: now + leaseDurationMs });
     return { claimed: true, alreadyProcessed: false };
   }
-  async recordProcessedWebhook(eventId: string): Promise<void> {
-    this.processedWebhooks.add(eventId);
+
+  async recordProcessedWebhook(
+    eventId: string,
+    source?: string,
+    type?: string,
+    payload?: any,
+    status: 'PROCESSED' | 'FAILED' = 'PROCESSED',
+    errorMessage?: string
+  ): Promise<void> {
+    const existing = this.webhookEvents.get(eventId) || { status: 'PROCESSING', leaseExpiresAt: 0 };
+    existing.status = status;
+    this.webhookEvents.set(eventId, existing);
+    if (status === 'PROCESSED') {
+      this.processedWebhooks.add(eventId);
+    }
   }
+
+  async settleStripePaymentSucceeded(params: {
+    paymentIntentId: string;
+    eventId: string;
+    amount?: number;
+    metadata?: Record<string, any>;
+  }): Promise<{ success: boolean; paymentId: string; alreadySettled?: boolean }> {
+    const payment = await this.findPaymentByStripeIntent(params.paymentIntentId);
+    if (!payment) throw new AppError('Payment not found', 404, 'PAYMENT_NOT_FOUND');
+
+    if (payment.status === 'SUCCEEDED') {
+      return { success: true, paymentId: payment.id, alreadySettled: true };
+    }
+
+    // 1. Mark payment SUCCEEDED
+    payment.status = 'SUCCEEDED';
+    await this.updatePayment(payment.id, { status: 'SUCCEEDED' });
+
+    // 2. Mark ride SUCCEEDED
+    await this.updateRide(payment.rideId, { paymentStatus: 'SUCCEEDED', finalFare: payment.amount });
+
+    // 3. Platform Ledger fare entry
+    await this.recordLedgerEntry({
+      rideId: payment.rideId,
+      type: 'RIDER_FARE',
+      amount: payment.amount,
+      currency: 'SAR',
+      fromAccount: `rider:${payment.userId}`,
+      toAccount: 'platform:escrow',
+      status: 'SETTLED',
+      idempotencyKey: `webhook_${params.eventId}_fare`,
+    });
+
+    // 4. Driver earnings, debt recovery, and platform commission
+    const ride = await this.findRideById(payment.rideId);
+    if (ride?.driverId) {
+      const driver = await this.findDriverById(ride.driverId);
+      if (driver) {
+        const driverEarning = Math.round(payment.amount * 0.8 * 100) / 100;
+        const platformCommission = Math.round((payment.amount - driverEarning) * 100) / 100;
+
+        let debtRecovery = 0;
+        if (driver.outstandingDebt && driver.outstandingDebt > 0) {
+          debtRecovery = Math.min(driverEarning, driver.outstandingDebt);
+        }
+
+        const netPayout = driverEarning - debtRecovery;
+        if (netPayout > 0) {
+          await this.creditWallet(
+            driver.userId,
+            netPayout,
+            `Net earnings for card ride #${payment.rideId.slice(0, 8)} (minus debt recovery)`,
+            payment.rideId,
+            `webhook_${params.eventId}_driver_credit`
+          );
+        }
+
+        if (debtRecovery > 0) {
+          await this.updateDriver(driver.id, {
+            outstandingDebt: Math.max(0, (driver.outstandingDebt || 0) - debtRecovery),
+          });
+          await this.recordLedgerEntry({
+            rideId: payment.rideId,
+            type: 'DEBT_RECOVERY',
+            amount: debtRecovery,
+            currency: 'SAR',
+            fromAccount: `driver:${driver.id}`,
+            toAccount: 'platform:commission',
+            status: 'SETTLED',
+            idempotencyKey: `webhook_${params.eventId}_debt_rec`,
+          });
+        }
+
+        await this.recordLedgerEntry({
+          rideId: payment.rideId,
+          type: 'PLATFORM_COMMISSION',
+          amount: platformCommission,
+          currency: 'SAR',
+          fromAccount: 'platform:escrow',
+          toAccount: 'platform:revenue',
+          status: 'COMMITTED',
+          idempotencyKey: `webhook_${params.eventId}_ledger_comm`,
+        });
+
+        await this.updateDriver(driver.id, {
+          earningsTotal: (driver.earningsTotal || 0) + driverEarning,
+          totalRides: (driver.totalRides || 0) + 1,
+        });
+      }
+    }
+
+    return { success: true, paymentId: payment.id };
+  }
+
 
   // Ledger & Cash Settlement
   async recordLedgerEntry(entry: Omit<IPlatformLedger, 'id' | 'createdAt'>): Promise<IPlatformLedger> {
@@ -842,16 +978,17 @@ export class TestDatabaseStore implements IDatabaseStore {
     healthy: boolean;
     discrepanciesCount: number;
     discrepancies: Array<{
-      type: 'WALLET_MISMATCH' | 'PAYMENT_RIDE_MISMATCH' | 'COMMISSION_MISMATCH' | 'DRIVER_DEBT_MISMATCH';
+      type: 'WALLET_MISMATCH' | 'PAYMENT_RIDE_MISMATCH' | 'COMMISSION_MISMATCH' | 'DRIVER_DEBT_MISMATCH' | 'DRIVER_EARNINGS_MISMATCH';
       id: string;
       details: string;
     }>;
   }> {
     const discrepancies: Array<{
-      type: 'WALLET_MISMATCH' | 'PAYMENT_RIDE_MISMATCH' | 'COMMISSION_MISMATCH' | 'DRIVER_DEBT_MISMATCH';
+      type: 'WALLET_MISMATCH' | 'PAYMENT_RIDE_MISMATCH' | 'COMMISSION_MISMATCH' | 'DRIVER_DEBT_MISMATCH' | 'DRIVER_EARNINGS_MISMATCH';
       id: string;
       details: string;
     }> = [];
+
 
     // 1. Audit Wallets against transactions
     for (const [userId, wallet] of this.wallets.entries()) {
@@ -913,12 +1050,57 @@ export class TestDatabaseStore implements IDatabaseStore {
       }
     }
 
+    // 4. Audit Driver Earnings vs Settled Rides (Phase 7 Hardening)
+    for (const [driverId, driver] of this.drivers.entries()) {
+      if ((driver.earningsTotal || 0) > 0) {
+        const settledDriverRides = Array.from(this.rides.values()).filter(
+          (r) => r.driverId === driverId && r.status === 'RIDE_COMPLETED' && r.paymentStatus === 'SUCCEEDED'
+        );
+
+        const expectedEarnings = settledDriverRides.reduce((acc, r) => {
+          const fare = r.finalFare ?? r.estimatedFare ?? 0;
+          return acc + Math.round(fare * 0.8 * 100) / 100;
+        }, 0);
+
+        const diff = Math.abs((driver.earningsTotal || 0) - expectedEarnings);
+        if (diff > 0.1) {
+          discrepancies.push({
+            type: 'DRIVER_EARNINGS_MISMATCH',
+            id: driverId,
+            details: `Driver earningsTotal (${(driver.earningsTotal || 0).toFixed(2)} SAR) does not match sum of settled rides (${expectedEarnings.toFixed(2)} SAR). Difference: ${diff.toFixed(2)} SAR.`,
+          });
+        }
+      }
+    }
+
+    // 5. Audit Platform Commission in Ledger vs Settled Rides
+    const settledRides = Array.from(this.rides.values()).filter(
+      (r) => r.status === 'RIDE_COMPLETED' && r.paymentStatus === 'SUCCEEDED'
+    );
+
+    const expectedTotalCommission = settledRides.reduce((acc, r) => {
+      const fare = r.finalFare ?? r.estimatedFare ?? 0;
+      return acc + Math.round(fare * 0.2 * 100) / 100;
+    }, 0);
+
+    const commissionLedgers = this.ledger.filter((l) => l.type === 'PLATFORM_COMMISSION');
+    const recordedCommission = commissionLedgers.reduce((acc, l) => acc + (l.amount || 0), 0);
+
+    if (Math.abs(expectedTotalCommission - recordedCommission) > 0.1) {
+      discrepancies.push({
+        type: 'COMMISSION_MISMATCH',
+        id: 'platform_commission_pool',
+        details: `Platform commission recorded in ledger (${recordedCommission.toFixed(2)} SAR) does not match expected commission on settled rides (${expectedTotalCommission.toFixed(2)} SAR).`,
+      });
+    }
+
     return {
       healthy: discrepancies.length === 0,
       discrepanciesCount: discrepancies.length,
       discrepancies,
     };
   }
+
 
   // Sessions
   async createRefreshSession(session: any): Promise<IRefreshSession> {

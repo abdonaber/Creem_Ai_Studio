@@ -1,3 +1,4 @@
+import { config } from '../config';
 import { db } from '../db/store';
 import { io } from '../socket/socketHandler';
 import { logger } from '../utils/logger';
@@ -58,11 +59,12 @@ export class LocationService {
       if (clientTimestamp > now + 30000) {
         return { accepted: false, reason: 'FUTURE_TIMESTAMP_REJECTED' };
       }
-      // Stale location packet rejection (>60s old)
-      if (clientTimestamp < now - 60000) {
+      // Stale location packet rejection based on unified DRIVER_LOCATION_STALE_MS
+      if (clientTimestamp < now - config.driverLocationStaleMs) {
         return { accepted: false, reason: 'STALE_LOCATION_REJECTED' };
       }
     }
+
 
     // 1. Geographic Coordinate Bounds Check
     if (
@@ -190,11 +192,12 @@ export class LocationService {
   }
 
   /**
-   * Sweeps and marks drivers as offline if they haven't reported GPS location in > 5 minutes
+   * Sweeps and marks drivers as offline if they haven't reported GPS location within DRIVER_LOCATION_STALE_MS
    */
-  public static async sweepStaleDrivers(staleThresholdMs: number = 300000): Promise<number> {
+  public static async sweepStaleDrivers(staleThresholdMs: number = config.driverLocationStaleMs): Promise<number> {
     try {
       const cutoffDate = new Date(Date.now() - staleThresholdMs);
+
       const onlineDrivers = await db.getOnlineApprovedDrivers();
       let staleCount = 0;
 

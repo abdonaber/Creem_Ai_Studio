@@ -9,13 +9,19 @@ const rawJwtSecret = process.env.JWT_SECRET;
 const rawRefreshSecret = process.env.JWT_REFRESH_SECRET;
 const rawCookieSecret = process.env.COOKIE_SECRET;
 
-// In strict production, fail fast if required cryptographic secrets are missing or weak
+// In strict production, fail fast if required cryptographic secrets or infrastructure URLs are missing or weak
 if (isProduction) {
   if (!rawJwtSecret || rawJwtSecret.trim().length < 32) {
     throw new Error('FATAL: JWT_SECRET must be defined with at least 32 characters in production!');
   }
   if (!rawRefreshSecret || rawRefreshSecret.trim().length < 32) {
     throw new Error('FATAL: JWT_REFRESH_SECRET must be defined with at least 32 characters in production!');
+  }
+  if (!process.env.REDIS_URL || !process.env.REDIS_URL.trim()) {
+    throw new Error('FATAL: REDIS_URL is strictly required in production for distributed locks, BullMQ queues, rate limiting, and critical concurrency!');
+  }
+  if (!process.env.MONGODB_URI || !process.env.MONGODB_URI.trim()) {
+    throw new Error('FATAL: MONGODB_URI is strictly required in production environment!');
   }
 }
 
@@ -29,6 +35,9 @@ const rawOrigins = rawCors
 const appUrl = process.env.APP_URL || 'http://localhost:3000';
 const allowedOrigins = rawOrigins.length > 0 ? rawOrigins : [appUrl];
 
+// Unified driver location freshness threshold (Phase 8 Production Hardening)
+const driverLocationStaleMs = Number(process.env.DRIVER_LOCATION_STALE_MS) || 60000; // 60 seconds default
+
 export const config = {
   port: 3000,
   appEnv: appEnv as 'development' | 'test' | 'production',
@@ -40,6 +49,9 @@ export const config = {
   // Database & Cache
   mongodbUri: process.env.MONGODB_URI || '',
   redisUrl: process.env.REDIS_URL || '',
+
+  // Operational & Geospatial Settings
+  driverLocationStaleMs,
 
   // Authentication & Security
   jwtSecret: rawJwtSecret || 'creemy-secure-dev-jwt-key-2026-very-secret-token-32char',
@@ -63,3 +75,4 @@ export const config = {
   allowedOrigins,
   corsOrigin: allowedOrigins.length === 1 ? allowedOrigins[0] : allowedOrigins,
 };
+

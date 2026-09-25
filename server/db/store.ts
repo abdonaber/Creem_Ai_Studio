@@ -1,4 +1,5 @@
 import mongoose from 'mongoose';
+import { config } from '../config';
 import { logger } from '../utils/logger';
 import { acquireLock, releaseLock, LockAcquisitionResult } from '../redis/redisClient';
 import {
@@ -163,17 +164,24 @@ export interface IDatabaseStore {
     amount: number;
     idempotencyKey?: string;
   }): Promise<{ success: boolean; transactionId: string; platformFee: number; commissionDebt: number }>;
+  settleStripePaymentSucceeded(params: {
+    paymentIntentId: string;
+    eventId: string;
+    amount?: number;
+    metadata?: Record<string, any>;
+  }): Promise<{ success: boolean; paymentId: string; alreadySettled?: boolean }>;
 
   // Financial Reconciliation
   reconcileFinancialIntegrity(): Promise<{
     healthy: boolean;
     discrepanciesCount: number;
     discrepancies: Array<{
-      type: 'WALLET_MISMATCH' | 'PAYMENT_RIDE_MISMATCH' | 'COMMISSION_MISMATCH' | 'DRIVER_DEBT_MISMATCH';
+      type: 'WALLET_MISMATCH' | 'PAYMENT_RIDE_MISMATCH' | 'COMMISSION_MISMATCH' | 'DRIVER_DEBT_MISMATCH' | 'DRIVER_EARNINGS_MISMATCH';
       id: string;
       details: string;
     }>;
   }>;
+
 
   // Paginated Administrative Queries
   getRidesPaginated(options: {
@@ -843,12 +851,13 @@ export class MongoDatabaseStore implements IDatabaseStore {
       isBusy: { $ne: true },
     };
 
-    // Stale driver exclusion (Phase 8 & 9): must have reported location within last 10 minutes
-    const staleCutoff = new Date(Date.now() - 10 * 60 * 1000);
+    // Stale driver exclusion (Phase 8 Production Hardening): unified freshness threshold
+    const staleCutoff = new Date(Date.now() - config.driverLocationStaleMs);
     matchFilter.$or = [
       { lastSeenAt: { $gte: staleCutoff } },
       { 'currentLocation.updatedAt': { $gte: staleCutoff.toISOString() } },
     ];
+
 
     if (excludedDriverIds.length > 0) {
       const validIds = excludedDriverIds
@@ -1407,6 +1416,9 @@ export class MongoDatabaseStore implements IDatabaseStore {
 
         if (result) return result;
       } catch (err: any) {
+        if (config.isProduction) {
+          throw err;
+        }
         if (!err.message?.includes('replica set') && !err.message?.includes('Transactions are not supported')) {
           throw err;
         }
@@ -1415,7 +1427,16 @@ export class MongoDatabaseStore implements IDatabaseStore {
       }
     }
 
+    if (config.isProduction) {
+      throw new AppError(
+        'FATAL: MongoDB transactions are strictly required in production for wallet settlement. Non-transactional fallback is forbidden.',
+        500,
+        'TRANSACTION_UNAVAILABLE_PRODUCTION'
+      );
+    }
+
     // Fallback: atomic serial execution for standalone mongod without replica set
+
     const existingPayment = await PaymentModel.findOne({ rideId, status: 'SUCCEEDED' }).lean();
     if (existingPayment) {
       return { success: true, transactionId: existingPayment._id.toString() };
@@ -1713,6 +1734,9 @@ export class MongoDatabaseStore implements IDatabaseStore {
 
         if (result) return result;
       } catch (err: any) {
+        if (config.isProduction) {
+          throw err;
+        }
         if (!err.message?.includes('replica set') && !err.message?.includes('Transactions are not supported')) {
           throw err;
         }
@@ -1721,7 +1745,16 @@ export class MongoDatabaseStore implements IDatabaseStore {
       }
     }
 
+    if (config.isProduction) {
+      throw new AppError(
+        'FATAL: MongoDB transactions are strictly required in production for cash settlement. Non-transactional fallback is forbidden.',
+        500,
+        'TRANSACTION_UNAVAILABLE_PRODUCTION'
+      );
+    }
+
     // Fallback: atomic serial execution for standalone
+
     const existingPayment = await PaymentModel.findOne({ rideId, status: 'SUCCEEDED' }).lean();
     if (existingPayment) {
       return {
@@ -1954,9 +1987,13 @@ export class MongoDatabaseStore implements IDatabaseStore {
   public async claimWebhookEvent(
     eventId: string,
     source: string,
-    type: string
+    type: string,
+    leaseDurationMs: number = 60000
   ): Promise<{ claimed: boolean; alreadyProcessed: boolean }> {
     this.ensureConnection();
+    const now = new Date();
+    const leaseExpiresAt = new Date(now.getTime() + leaseDurationMs);
+
     try {
       await WebhookEventModel.create({
         _id: new mongoose.Types.ObjectId(),
@@ -1964,6 +2001,7 @@ export class MongoDatabaseStore implements IDatabaseStore {
         source,
         type,
         status: 'PROCESSING',
+        leaseExpiresAt,
       });
       return { claimed: true, alreadyProcessed: false };
     } catch (err: any) {
@@ -1971,6 +2009,28 @@ export class MongoDatabaseStore implements IDatabaseStore {
         const existing = await WebhookEventModel.findOne({ eventId }).lean();
         if (existing?.status === 'PROCESSED') {
           return { claimed: false, alreadyProcessed: true };
+        }
+        // If lease expired due to worker crash, recover lease and process
+        if (existing?.leaseExpiresAt && new Date(existing.leaseExpiresAt) < now) {
+          const updated = await WebhookEventModel.findOneAndUpdate(
+            { eventId, leaseExpiresAt: existing.leaseExpiresAt },
+            { $set: { status: 'PROCESSING', leaseExpiresAt, updatedAt: now } },
+            { new: true }
+          );
+          if (updated) {
+            return { claimed: true, alreadyProcessed: false };
+          }
+        }
+        // If status was FAILED, allow safe retry
+        if (existing?.status === 'FAILED') {
+          const updated = await WebhookEventModel.findOneAndUpdate(
+            { eventId, status: 'FAILED' },
+            { $set: { status: 'PROCESSING', leaseExpiresAt, updatedAt: now } },
+            { new: true }
+          );
+          if (updated) {
+            return { claimed: true, alreadyProcessed: false };
+          }
         }
         return { claimed: false, alreadyProcessed: false };
       }
@@ -1980,8 +2040,8 @@ export class MongoDatabaseStore implements IDatabaseStore {
 
   public async recordProcessedWebhook(
     eventId: string,
-    source: string,
-    type: string,
+    source: string = 'stripe',
+    type: string = 'payment_intent.succeeded',
     payload?: any,
     status: 'PROCESSED' | 'FAILED' = 'PROCESSED',
     errorMessage?: string
@@ -2003,6 +2063,221 @@ export class MongoDatabaseStore implements IDatabaseStore {
       { upsert: true }
     );
   }
+
+  /**
+   * Atomic Stripe Webhook Payment Settlement (Phase 6 Hardening)
+   * Executes payment, ride status, ledger entries, driver earnings, and debt recovery
+   * atomically within a single MongoDB session transaction.
+   */
+  public async settleStripePaymentSucceeded(params: {
+    paymentIntentId: string;
+    eventId: string;
+    amount?: number;
+    metadata?: Record<string, any>;
+  }): Promise<{ success: boolean; paymentId: string; alreadySettled?: boolean }> {
+    this.ensureConnection();
+    const { paymentIntentId, eventId } = params;
+
+    const session = await mongoose.startSession().catch(() => null);
+    if (!session && config.isProduction) {
+      throw new AppError(
+        'FATAL: MongoDB transactions are strictly required in production for Stripe webhook settlement.',
+        500,
+        'TRANSACTION_UNAVAILABLE_PRODUCTION'
+      );
+    }
+
+    if (session) {
+      try {
+        let result: { success: boolean; paymentId: string; alreadySettled?: boolean } | null = null;
+        await session.withTransaction(async () => {
+          const payment = await PaymentModel.findOne({ stripePaymentIntentId: paymentIntentId }).session(session);
+          if (!payment) {
+            throw new AppError(`Payment not found for Stripe intent ${paymentIntentId}`, 404, 'PAYMENT_NOT_FOUND');
+          }
+
+          if (payment.status === 'SUCCEEDED') {
+            result = { success: true, paymentId: payment._id.toString(), alreadySettled: true };
+            return;
+          }
+
+          // 1. Mark payment SUCCEEDED
+          payment.status = 'SUCCEEDED';
+          payment.updatedAt = new Date();
+          await payment.save({ session });
+
+          // 2. Mark ride SUCCEEDED
+          await RideModel.findOneAndUpdate(
+            mongoose.Types.ObjectId.isValid(payment.rideId) ? { _id: payment.rideId } : { id: payment.rideId },
+            {
+              $set: {
+                paymentStatus: 'SUCCEEDED',
+                paymentMethod: 'CREDIT_CARD',
+                finalFare: payment.amount,
+                updatedAt: new Date(),
+              },
+            },
+            { session }
+          );
+
+          // 3. Platform Ledger fare entry
+          await PlatformLedgerModel.create(
+            [
+              {
+                _id: new mongoose.Types.ObjectId(),
+                rideId: payment.rideId,
+                type: 'RIDER_FARE',
+                amount: payment.amount,
+                currency: 'SAR',
+                fromAccount: `rider:${payment.userId}`,
+                toAccount: 'platform:escrow',
+                status: 'SETTLED',
+                idempotencyKey: `webhook_${eventId}_fare`,
+              },
+            ],
+            { session }
+          );
+
+          // 4. Driver earnings, debt recovery, and platform commission
+          const ride = await RideModel.findById(payment.rideId).session(session).lean();
+          if (ride?.driverId) {
+            const driver = await DriverModel.findById(ride.driverId).session(session).lean();
+            if (driver) {
+              const driverEarning = Math.round(payment.amount * 0.8 * 100) / 100;
+              const platformCommission = Math.round((payment.amount - driverEarning) * 100) / 100;
+
+              let debtRecovery = 0;
+              if (driver.outstandingDebt && driver.outstandingDebt > 0) {
+                debtRecovery = Math.min(driverEarning, driver.outstandingDebt);
+              }
+
+              const netPayout = driverEarning - debtRecovery;
+              if (netPayout > 0) {
+                let driverWallet = await WalletModel.findOne({ userId: driver.userId }).session(session).lean();
+                if (!driverWallet) {
+                  const created = await WalletModel.create(
+                    [{ _id: new mongoose.Types.ObjectId(), userId: driver.userId, balance: 0, currency: 'SAR' }],
+                    { session }
+                  );
+                  driverWallet = created[0].toObject();
+                }
+
+                const updatedDriverWallet = await WalletModel.findOneAndUpdate(
+                  { userId: driver.userId },
+                  { $inc: { balance: netPayout }, $set: { updatedAt: new Date() } },
+                  { session, new: true }
+                ).lean();
+
+                await WalletTransactionModel.create(
+                  [
+                    {
+                      _id: new mongoose.Types.ObjectId(),
+                      walletId: updatedDriverWallet!._id.toString(),
+                      userId: driver.userId,
+                      amount: netPayout,
+                      type: 'CREDIT',
+                      balanceAfter: updatedDriverWallet!.balance,
+                      reason: `Net earnings for card ride #${payment.rideId.slice(0, 8)} (minus debt recovery)`,
+                      referenceId: payment.rideId,
+                      idempotencyKey: `webhook_${eventId}_driver_credit`,
+                    },
+                  ],
+                  { session }
+                );
+              }
+
+              if (debtRecovery > 0) {
+                await DriverModel.findByIdAndUpdate(
+                  driver._id,
+                  { $inc: { outstandingDebt: -debtRecovery } },
+                  { session }
+                );
+                await PlatformLedgerModel.create(
+                  [
+                    {
+                      _id: new mongoose.Types.ObjectId(),
+                      rideId: payment.rideId,
+                      type: 'DEBT_RECOVERY',
+                      amount: debtRecovery,
+                      currency: 'SAR',
+                      fromAccount: `driver:${driver._id.toString()}`,
+                      toAccount: 'platform:commission',
+                      status: 'SETTLED',
+                      idempotencyKey: `webhook_${eventId}_debt_rec`,
+                    },
+                  ],
+                  { session }
+                );
+              }
+
+              await PlatformLedgerModel.create(
+                [
+                  {
+                    _id: new mongoose.Types.ObjectId(),
+                    rideId: payment.rideId,
+                    type: 'PLATFORM_COMMISSION',
+                    amount: platformCommission,
+                    currency: 'SAR',
+                    fromAccount: 'platform:escrow',
+                    toAccount: 'platform:revenue',
+                    status: 'COMMITTED',
+                    idempotencyKey: `webhook_${eventId}_ledger_comm`,
+                  },
+                ],
+                { session }
+              );
+
+              await DriverModel.findByIdAndUpdate(
+                driver._id,
+                { $inc: { earningsTotal: driverEarning, totalRides: 1 } },
+                { session }
+              );
+            }
+          }
+
+          result = { success: true, paymentId: payment._id.toString() };
+        });
+
+        if (result) return result;
+      } catch (err: any) {
+        if (config.isProduction) {
+          throw err;
+        }
+        if (!err.message?.includes('replica set') && !err.message?.includes('Transactions are not supported')) {
+          throw err;
+        }
+      } finally {
+        await session.endSession();
+      }
+    }
+
+    if (config.isProduction) {
+      throw new AppError(
+        'FATAL: MongoDB transactions are strictly required in production for Stripe webhook settlement.',
+        500,
+        'TRANSACTION_UNAVAILABLE_PRODUCTION'
+      );
+    }
+
+    // Fallback for standalone Mongo development environment
+    const payment = await this.findPaymentByStripeIntent(paymentIntentId);
+    if (!payment) throw new AppError('Payment not found', 404, 'PAYMENT_NOT_FOUND');
+    if (payment.status === 'SUCCEEDED') return { success: true, paymentId: payment.id, alreadySettled: true };
+    await this.updatePayment(payment.id, { status: 'SUCCEEDED' });
+    await this.updateRide(payment.rideId, { paymentStatus: 'SUCCEEDED', finalFare: payment.amount });
+    await this.recordLedgerEntry({
+      rideId: payment.rideId,
+      type: 'RIDER_FARE',
+      amount: payment.amount,
+      currency: 'SAR',
+      fromAccount: `rider:${payment.userId}`,
+      toAccount: 'platform:escrow',
+      status: 'SETTLED',
+      idempotencyKey: `webhook_${eventId}_fare`,
+    });
+    return { success: true, paymentId: payment.id };
+  }
+
 
   // ==========================================
   // PLATFORM LEDGER OPERATIONS
@@ -2484,17 +2759,18 @@ export class MongoDatabaseStore implements IDatabaseStore {
     healthy: boolean;
     discrepanciesCount: number;
     discrepancies: Array<{
-      type: 'WALLET_MISMATCH' | 'PAYMENT_RIDE_MISMATCH' | 'COMMISSION_MISMATCH' | 'DRIVER_DEBT_MISMATCH';
+      type: 'WALLET_MISMATCH' | 'PAYMENT_RIDE_MISMATCH' | 'COMMISSION_MISMATCH' | 'DRIVER_DEBT_MISMATCH' | 'DRIVER_EARNINGS_MISMATCH';
       id: string;
       details: string;
     }>;
   }> {
     this.ensureConnection();
     const discrepancies: Array<{
-      type: 'WALLET_MISMATCH' | 'PAYMENT_RIDE_MISMATCH' | 'COMMISSION_MISMATCH' | 'DRIVER_DEBT_MISMATCH';
+      type: 'WALLET_MISMATCH' | 'PAYMENT_RIDE_MISMATCH' | 'COMMISSION_MISMATCH' | 'DRIVER_DEBT_MISMATCH' | 'DRIVER_EARNINGS_MISMATCH';
       id: string;
       details: string;
     }> = [];
+
 
     // 1. Audit Wallet Balances against Transactions
     const wallets = await WalletModel.find().lean();
@@ -2557,12 +2833,61 @@ export class MongoDatabaseStore implements IDatabaseStore {
       }
     }
 
+    // 4. Audit Driver Earnings vs Settled Rides (Phase 7 Hardening)
+    const allDrivers = await DriverModel.find({ earningsTotal: { $gt: 0 } }).lean();
+    for (const driver of allDrivers) {
+      const settledDriverRides = await RideModel.find({
+        driverId: driver._id.toString(),
+        status: 'RIDE_COMPLETED',
+        paymentStatus: 'SUCCEEDED',
+      }).lean();
+
+      const expectedEarnings = settledDriverRides.reduce((acc, r) => {
+        const fare = r.finalFare ?? r.estimatedFare ?? 0;
+        return acc + Math.round(fare * 0.8 * 100) / 100;
+      }, 0);
+
+      const diff = Math.abs((driver.earningsTotal || 0) - expectedEarnings);
+      if (diff > 0.1) {
+        discrepancies.push({
+          type: 'DRIVER_EARNINGS_MISMATCH',
+          id: driver._id.toString(),
+          details: `Driver earningsTotal (${(driver.earningsTotal || 0).toFixed(2)} SAR) does not match sum of settled rides (${expectedEarnings.toFixed(2)} SAR). Difference: ${diff.toFixed(2)} SAR.`,
+        });
+      }
+    }
+
+    // 5. Audit Platform Commission in Ledger vs Settled Rides
+    const settledRides = await RideModel.find({
+      status: 'RIDE_COMPLETED',
+      paymentStatus: 'SUCCEEDED',
+    }).lean();
+
+    const expectedTotalCommission = settledRides.reduce((acc, r) => {
+      const fare = r.finalFare ?? r.estimatedFare ?? 0;
+      return acc + Math.round(fare * 0.2 * 100) / 100;
+    }, 0);
+
+    const commissionLedgers = await PlatformLedgerModel.find({
+      type: 'PLATFORM_COMMISSION',
+    }).lean();
+    const recordedCommission = commissionLedgers.reduce((acc, l) => acc + (l.amount || 0), 0);
+
+    if (Math.abs(expectedTotalCommission - recordedCommission) > 0.1) {
+      discrepancies.push({
+        type: 'COMMISSION_MISMATCH',
+        id: 'platform_commission_pool',
+        details: `Platform commission recorded in ledger (${recordedCommission.toFixed(2)} SAR) does not match expected commission on settled rides (${expectedTotalCommission.toFixed(2)} SAR).`,
+      });
+    }
+
     return {
       healthy: discrepancies.length === 0,
       discrepanciesCount: discrepancies.length,
       discrepancies,
     };
   }
+
 
   // ==========================================
   // REFRESH SESSION OPERATIONS (TOKEN ROTATION)

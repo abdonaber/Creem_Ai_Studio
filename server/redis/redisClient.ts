@@ -123,7 +123,13 @@ export async function acquireLock(
     // Redis is configured for distributed cluster but connection is down:
     // Strictly fail-closed for critical locks across instances to prevent double claims!
     logger.warn(`[Redis Lock] Redis cluster unavailable; failing closed for lock ${key}`);
-    return { acquired: false, token };
+    return { acquired: false, token, reason: 'REDIS_CLUSTER_UNAVAILABLE' };
+  }
+
+  // In production, localLockStore is strictly forbidden for critical operations to prevent split-brain states
+  if (config.isProduction) {
+    logger.error(`[Redis Lock] In-memory localLockStore fallback is strictly forbidden in production for key [${key}]`);
+    return { acquired: false, token, reason: 'REDIS_REQUIRED_IN_PRODUCTION' };
   }
 
   // Fallback: in-process mutual exclusion lock store for isolated/unit test runtimes
@@ -138,6 +144,7 @@ export async function acquireLock(
   localLockStore.set(lockKey, { token, expiresAt: now + ttlMs });
   return { acquired: true, token };
 }
+
 
 /**
  * Safe Lock Renewal using atomic Lua script
@@ -299,6 +306,12 @@ export async function claimIdempotencyKey(
     return { claimed: false, reason: 'REDIS_OUTAGE_FAIL_CLOSED' };
   }
 
+  // In production, local in-memory store is strictly forbidden
+  if (config.isProduction) {
+    logger.error(`[Redis Idempotency] In-memory idempotency claim forbidden in production for key [${key}]`);
+    return { claimed: false, reason: 'REDIS_REQUIRED_IN_PRODUCTION' };
+  }
+
   // Fallback for standalone/test environments: in-process memory store
   const now = Date.now();
   const existing = localLockStore.get(claimKey);
@@ -355,6 +368,17 @@ export async function checkRateLimit(
       resetTime: now + windowSeconds * 1000,
     };
   }
+
+  // In production, local rate limiting store fallback is forbidden for security endpoints
+  if (config.isProduction && (isSecurity || mustFailClosed)) {
+    logger.warn(`[Redis RateLimit] Redis cluster unavailable in production for security key [${key}]. Failing closed.`);
+    return {
+      allowed: false,
+      remaining: 0,
+      resetTime: now + windowSeconds * 1000,
+    };
+  }
+
 
   // Local in-memory bounded rate limiter fallback for testing and transient degraded states
   const local = localRateLimitStore.get(rateKey);

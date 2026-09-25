@@ -529,7 +529,8 @@ export interface IWebhookEventDocument extends Document {
   type: string;
   payload?: Record<string, any>;
   processedAt: Date;
-  status: 'CLAIMED' | 'PROCESSING' | 'PROCESSED' | 'FAILED';
+  leaseExpiresAt?: Date;
+  status: 'RECEIVED' | 'CLAIMED' | 'PROCESSING' | 'PROCESSED' | 'FAILED';
   errorMessage?: string;
   createdAt: Date;
 }
@@ -541,9 +542,10 @@ export const WebhookEventSchema = new Schema<IWebhookEventDocument>(
     type: { type: String, required: true },
     payload: Schema.Types.Mixed,
     processedAt: { type: Date, default: Date.now },
+    leaseExpiresAt: { type: Date, index: true },
     status: {
       type: String,
-      enum: ['CLAIMED', 'PROCESSING', 'PROCESSED', 'FAILED'],
+      enum: ['RECEIVED', 'CLAIMED', 'PROCESSING', 'PROCESSED', 'FAILED'],
       default: 'PROCESSING',
       index: true,
     },
@@ -551,6 +553,7 @@ export const WebhookEventSchema = new Schema<IWebhookEventDocument>(
   },
   { timestamps: true }
 );
+
 
 WebhookEventSchema.index({ createdAt: 1 }, { expireAfterSeconds: 30 * 24 * 60 * 60 }); // Auto-expire after 30 days
 

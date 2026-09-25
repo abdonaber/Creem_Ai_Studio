@@ -334,4 +334,349 @@ describe('Production Hardening & Integrity Suite', () => {
       expect(report.discrepancies.some((d) => d.type === 'WALLET_MISMATCH')).toBe(true);
     });
   });
+
+  describe('10. Payment Amount Security & Server-Authoritative Fares (Phase 5)', () => {
+    it('rejects client attempts to pay less than the server-authoritative fare', async () => {
+      const ride = await store.createRide({
+        riderId: riderUser.id,
+        driverId: driverRecord.id,
+        status: 'RIDE_COMPLETED',
+        estimatedFare: 45,
+        finalFare: 45,
+        paymentMethod: 'WALLET',
+        paymentStatus: 'PENDING',
+      });
+
+      // Rider attempts to pay 1 SAR instead of 45 SAR
+      const res = await request(app)
+        .post('/api/v1/payments/process')
+        .set('Authorization', `Bearer ${riderToken}`)
+        .send({
+          rideId: ride.id,
+          amount: 1, // Tampered amount
+        });
+
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe('FARE_MISMATCH');
+    });
+
+    it('rejects client attempts to pay more than the server-authoritative fare', async () => {
+      const ride = await store.createRide({
+        riderId: riderUser.id,
+        driverId: driverRecord.id,
+        status: 'RIDE_COMPLETED',
+        estimatedFare: 45,
+        finalFare: 45,
+        paymentMethod: 'WALLET',
+        paymentStatus: 'PENDING',
+      });
+
+      const res = await request(app)
+        .post('/api/v1/payments/process')
+        .set('Authorization', `Bearer ${riderToken}`)
+        .send({
+          rideId: ride.id,
+          amount: 99999, // Tampered amount
+        });
+
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe('FARE_MISMATCH');
+    });
+
+    it('rejects negative, zero, NaN, huge amounts, and decimal precision abuse', async () => {
+      const ride = await store.createRide({
+        riderId: riderUser.id,
+        driverId: driverRecord.id,
+        status: 'RIDE_COMPLETED',
+        estimatedFare: 50,
+        finalFare: 50,
+        paymentMethod: 'WALLET',
+        paymentStatus: 'PENDING',
+      });
+
+      // Negative amount
+      const resNegative = await request(app)
+        .post('/api/v1/payments/process')
+        .set('Authorization', `Bearer ${riderToken}`)
+        .send({ rideId: ride.id, amount: -50 });
+      expect(resNegative.status).toBe(400);
+
+      // Zero amount
+      const resZero = await request(app)
+        .post('/api/v1/payments/process')
+        .set('Authorization', `Bearer ${riderToken}`)
+        .send({ rideId: ride.id, amount: 0 });
+      expect(resZero.status).toBe(400);
+
+      // Decimal precision abuse (>2 decimal places)
+      const resDecimals = await request(app)
+        .post('/api/v1/payments/process')
+        .set('Authorization', `Bearer ${riderToken}`)
+        .send({ rideId: ride.id, amount: 50.1234 });
+      expect(resDecimals.status).toBe(400);
+      expect(resDecimals.body.code).toBe('DECIMAL_PRECISION_ABUSE');
+    });
+
+    it('defaults to server-authoritative fare when amount is omitted by client', async () => {
+      const riderWallet = await store.getOrCreateWallet(riderUser.id);
+      riderWallet.balance = 100;
+
+      const ride = await store.createRide({
+        riderId: riderUser.id,
+        driverId: driverRecord.id,
+        status: 'RIDE_COMPLETED',
+        estimatedFare: 35,
+        finalFare: 35,
+        paymentMethod: 'WALLET',
+        paymentStatus: 'PENDING',
+      });
+
+      const res = await request(app)
+        .post('/api/v1/payments/process')
+        .set('Authorization', `Bearer ${riderToken}`)
+        .send({ rideId: ride.id }); // No amount sent; server is authoritative
+
+      expect(res.status).toBe(200);
+      expect(res.body.data.success).toBe(true);
+      expect(res.body.data.paymentStatus).toBe('SUCCEEDED');
+    });
+  });
+
+  describe('11. Stripe Webhook Lease Recovery & Failure Resiliency (Phase 6)', () => {
+    it('recovers crashed worker lease when leaseExpiresAt has elapsed', async () => {
+      const eventId = 'evt_lease_recovery_' + generateId('evt');
+
+      // Worker 1 claimed with a 10ms lease then crashed
+      const claim1 = await store.claimWebhookEvent(eventId, 'stripe', 'payment_intent.succeeded', 10);
+      expect(claim1.claimed).toBe(true);
+
+      // Immediate attempt while lease is active -> rejected
+      const immediateClaim = await store.claimWebhookEvent(eventId, 'stripe', 'payment_intent.succeeded');
+      expect(immediateClaim.claimed).toBe(false);
+      expect(immediateClaim.alreadyProcessed).toBe(false);
+
+      // Wait for 20ms until Worker 1 lease expires
+      await new Promise((res) => setTimeout(res, 20));
+
+      // Worker 2 attempts recovery on the abandoned event
+      const recoveryClaim = await store.claimWebhookEvent(eventId, 'stripe', 'payment_intent.succeeded');
+      expect(recoveryClaim.claimed).toBe(true);
+    });
+
+    it('allows retry when previous webhook attempt ended in FAILED status', async () => {
+      const eventId = 'evt_failed_retry_' + generateId('evt');
+
+      await store.claimWebhookEvent(eventId, 'stripe', 'payment_intent.succeeded');
+      await store.recordProcessedWebhook(eventId, 'stripe', 'payment_intent.succeeded', {}, 'FAILED', 'Database timeout');
+
+      // Retried webhook should be allowed to claim
+      const retryClaim = await store.claimWebhookEvent(eventId, 'stripe', 'payment_intent.succeeded');
+      expect(retryClaim.claimed).toBe(true);
+    });
+
+    it('processes refund webhook and records compensating ledger entry', async () => {
+      const ride = await store.createRide({
+        riderId: riderUser.id,
+        driverId: driverRecord.id,
+        status: 'RIDE_COMPLETED',
+        estimatedFare: 60,
+        finalFare: 60,
+        paymentMethod: 'CREDIT_CARD',
+        paymentStatus: 'SUCCEEDED',
+      });
+
+      const intentId = 'pi_refund_test_' + generateId('pi');
+      await store.createPayment({
+        rideId: ride.id,
+        userId: riderUser.id,
+        amount: 60,
+        currency: 'SAR',
+        status: 'SUCCEEDED',
+        paymentMethod: 'CREDIT_CARD',
+        stripePaymentIntentId: intentId,
+      });
+
+      const refundEvent = {
+        id: 'evt_refund_' + generateId('evt'),
+        type: 'charge.refunded',
+        data: {
+          object: {
+            payment_intent: intentId,
+            amount_refunded: 6000,
+          },
+        },
+      };
+
+      const { StripeService } = await import('../server/services/stripeService');
+      const origConstruct = StripeService.constructWebhookEvent;
+      StripeService.constructWebhookEvent = () => refundEvent as any;
+
+      try {
+        await PaymentService.handleWebhook(JSON.stringify(refundEvent), 'test_sig', refundEvent.id);
+
+        const updatedRide = await store.findRideById(ride.id);
+        expect(updatedRide?.paymentStatus).toBe('REFUNDED');
+
+        const refundLedgers = store.ledger.filter(
+          (l) => l.rideId === ride.id && l.type === 'REFUND'
+        );
+        expect(refundLedgers.length).toBe(1);
+        expect(refundLedgers[0].amount).toBe(60);
+      } finally {
+        StripeService.constructWebhookEvent = origConstruct;
+      }
+    });
+  });
+
+  describe('12. Production Guardrails & Fail-Closed Behavior (Phases 2 & 3)', () => {
+    it('QueueManager fails closed in production mode when Redis is unconfigured', async () => {
+      const { QueueManager } = await import('../server/queue/queueManager');
+      const { config } = await import('../server/config');
+
+      const originalIsProd = config.isProduction;
+      (config as any).isProduction = true;
+
+      try {
+        await expect(
+          QueueManager.enqueueRideDispatch('ride_test_prod_fail')
+        ).rejects.toThrow('QUEUE_UNAVAILABLE_PRODUCTION');
+
+        await expect(
+          QueueManager.scheduleOfferExpiration('ride_test_prod_fail', 'offer_123', 5000)
+        ).rejects.toThrow('QUEUE_UNAVAILABLE_PRODUCTION');
+
+        await expect(
+          QueueManager.enqueueSearchRetry('ride_test_prod_fail', 10, 1)
+        ).rejects.toThrow('QUEUE_UNAVAILABLE_PRODUCTION');
+      } finally {
+        (config as any).isProduction = originalIsProd;
+      }
+    });
+
+    it('Distributed lock strictly fails closed in production without Redis', async () => {
+      const { acquireLock, claimIdempotencyKey } = await import('../server/redis/redisClient');
+      const { config } = await import('../server/config');
+
+      const originalIsProd = config.isProduction;
+      (config as any).isProduction = true;
+
+      try {
+        const lockRes = await acquireLock('financial:test_ride_123');
+        expect(lockRes.acquired).toBe(false);
+        expect(lockRes.reason).toBe('REDIS_REQUIRED_IN_PRODUCTION');
+
+        const idempRes = await claimIdempotencyKey('test_idemp_key_123');
+        expect(idempRes.claimed).toBe(false);
+        expect(idempRes.reason).toBe('REDIS_REQUIRED_IN_PRODUCTION');
+      } finally {
+        (config as any).isProduction = originalIsProd;
+      }
+    });
+  });
+
+  describe('13. Driver GPS Freshness & Unified STALE Policy (Phase 8)', () => {
+    it('rejects driver location packets that are older than DRIVER_LOCATION_STALE_MS', async () => {
+      const { LocationService } = await import('../server/services/locationService');
+      const { config } = await import('../server/config');
+
+      const staleTimestamp = Date.now() - (config.driverLocationStaleMs + 5000);
+      const res = await LocationService.processDriverLocationUpdate({
+        driverId: driverRecord.id,
+        userId: driverUser.id,
+        lat: 24.7136,
+        lng: 46.6753,
+        timestamp: staleTimestamp,
+      });
+
+      expect(res.accepted).toBe(false);
+      expect(res.reason).toBe('STALE_LOCATION_REJECTED');
+    });
+
+    it('excludes drivers with stale location from nearby dispatch candidate search', async () => {
+      const { config } = await import('../server/config');
+
+      // Make driver approved and online
+      await store.updateDriver(driverRecord.id, {
+        approvalStatus: 'APPROVED',
+        isOnline: true,
+        isBusy: false,
+        lastSeenAt: new Date(Date.now() - (config.driverLocationStaleMs + 10000)).toISOString(),
+        currentLocation: {
+          lat: 24.7136,
+          lng: 46.6753,
+          heading: 0,
+          updatedAt: new Date(Date.now() - (config.driverLocationStaleMs + 10000)).toISOString(),
+        },
+      });
+
+      const eligible = await store.findNearbyEligibleDrivers({
+        pickupLat: 24.7136,
+        pickupLng: 46.6753,
+        radiusKm: 10,
+      });
+
+      expect(eligible.some((e) => e.driver.id === driverRecord.id)).toBe(false);
+    });
+
+    it('sweeps stale drivers and marks them offline automatically', async () => {
+      const { LocationService } = await import('../server/services/locationService');
+      const { config } = await import('../server/config');
+
+      await store.updateDriver(driverRecord.id, {
+        approvalStatus: 'APPROVED',
+        isOnline: true,
+        isBusy: false,
+        lastSeenAt: new Date(Date.now() - (config.driverLocationStaleMs + 20000)).toISOString(),
+      });
+
+      const swept = await LocationService.sweepStaleDrivers(config.driverLocationStaleMs);
+      expect(swept).toBeGreaterThanOrEqual(1);
+
+      const updated = await store.findDriverById(driverRecord.id);
+      expect(updated?.isOnline).toBe(false);
+    });
+  });
+
+  describe('14. Comprehensive Financial Ledger Reconciliation (Phase 7)', () => {
+    it('detects discrepancy if driver earningsTotal does not match settled rides', async () => {
+      // Create settled ride
+      await store.createRide({
+        riderId: riderUser.id,
+        driverId: driverRecord.id,
+        status: 'RIDE_COMPLETED',
+        paymentStatus: 'SUCCEEDED',
+        estimatedFare: 100,
+        finalFare: 100,
+      });
+
+      // Set incorrect driver earningsTotal (150 instead of 80)
+      await store.updateDriver(driverRecord.id, { earningsTotal: 150 });
+
+      const report = await store.reconcileFinancialIntegrity();
+      expect(report.healthy).toBe(false);
+      expect(report.discrepancies.some((d) => d.type === 'DRIVER_EARNINGS_MISMATCH')).toBe(true);
+    });
+
+    it('detects discrepancy if platform commission in ledger does not match settled rides', async () => {
+      // Create settled ride with 100 SAR fare (expected commission = 20 SAR)
+      await store.createRide({
+        riderId: riderUser.id,
+        driverId: driverRecord.id,
+        status: 'RIDE_COMPLETED',
+        paymentStatus: 'SUCCEEDED',
+        estimatedFare: 100,
+        finalFare: 100,
+      });
+
+      // Driver earnings matched to prevent DRIVER_EARNINGS_MISMATCH
+      await store.updateDriver(driverRecord.id, { earningsTotal: 80 });
+
+      // There is 1 settled ride of 100 SAR (expected 20 SAR commission), but 0 in ledger
+      const report = await store.reconcileFinancialIntegrity();
+      expect(report.healthy).toBe(false);
+      expect(report.discrepancies.some((d) => d.type === 'COMMISSION_MISMATCH')).toBe(true);
+    });
+
+  });
 });
+

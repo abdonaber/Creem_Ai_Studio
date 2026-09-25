@@ -1,7 +1,9 @@
-import { Queue, Worker, Job } from 'bullmq';
+import { Queue, Worker, Job, UnrecoverableError } from 'bullmq';
 import Redis from 'ioredis';
 import { config } from '../config';
 import { logger } from '../utils/logger';
+
+export { UnrecoverableError };
 
 export interface RideDispatchJobData {
   rideId: string;
@@ -36,6 +38,7 @@ export class QueueManager {
   private static sharedRedisConnection: Redis | null = null;
   private static isInitialized = false;
   private static isRedisAvailable = false;
+  private static isShuttingDown = false;
 
   // Queues
   public static rideDispatchQueue: Queue<RideDispatchJobData> | null = null;
@@ -263,6 +266,10 @@ export class QueueManager {
    * Enqueue a ride dispatch job
    */
   public static async enqueueRideDispatch(rideId: string): Promise<void> {
+    if (this.isShuttingDown) {
+      throw new Error('QUEUE_SHUTTING_DOWN: Cannot enqueue ride dispatch during shutdown.');
+    }
+
     if (this.rideDispatchQueue && this.isRedisAvailable) {
       await this.rideDispatchQueue.add(
         'dispatch-ride',
@@ -272,8 +279,11 @@ export class QueueManager {
           attempts: 3,
         }
       );
+    } else if (config.isProduction) {
+      logger.error(`[BullMQ] Redis is unavailable in production. Cannot enqueue ride dispatch for ${rideId}.`);
+      throw new Error(`QUEUE_UNAVAILABLE_PRODUCTION: Cannot enqueue ride dispatch in production without active Redis.`);
     } else if (this.dispatchHandler) {
-      // Fallback: direct asynchronous execution
+      // Fallback allowed ONLY in local non-production/test environments
       setImmediate(() => {
         this.dispatchHandler!(rideId).catch((err) => {
           logger.error(`[Dispatch Direct] Execution failed for ride ${rideId}`, err);
@@ -290,6 +300,10 @@ export class QueueManager {
     offerId: string,
     delayMs: number = 25000
   ): Promise<void> {
+    if (this.isShuttingDown) {
+      throw new Error('QUEUE_SHUTTING_DOWN: Cannot schedule offer expiration during shutdown.');
+    }
+
     if (this.offerExpirationQueue && this.isRedisAvailable) {
       await this.offerExpirationQueue.add(
         'expire-offer',
@@ -300,8 +314,11 @@ export class QueueManager {
           attempts: 2,
         }
       );
+    } else if (config.isProduction) {
+      logger.error(`[BullMQ] Redis is unavailable in production. Cannot schedule offer expiration for ${offerId}.`);
+      throw new Error(`QUEUE_UNAVAILABLE_PRODUCTION: Cannot schedule offer expiration in production without active Redis.`);
     } else if (this.offerTimeoutHandler) {
-      // Fallback: in-memory timer
+      // Fallback allowed ONLY in local non-production/test environments
       setTimeout(() => {
         this.offerTimeoutHandler!(rideId, offerId).catch((err) => {
           logger.error(`[Offer Timeout Direct] Failed for offer ${offerId}`, err);
@@ -319,6 +336,10 @@ export class QueueManager {
     retryCount: number,
     delayMs: number = 0
   ): Promise<void> {
+    if (this.isShuttingDown) {
+      throw new Error('QUEUE_SHUTTING_DOWN: Cannot enqueue search retry during shutdown.');
+    }
+
     if (this.searchRetryQueue && this.isRedisAvailable) {
       await this.searchRetryQueue.add(
         'retry-search',
@@ -329,7 +350,11 @@ export class QueueManager {
           attempts: 3,
         }
       );
+    } else if (config.isProduction) {
+      logger.error(`[BullMQ] Redis is unavailable in production. Cannot enqueue search retry for ride ${rideId}.`);
+      throw new Error(`QUEUE_UNAVAILABLE_PRODUCTION: Cannot enqueue search retry in production without active Redis.`);
     } else if (this.searchRetryHandler) {
+      // Fallback allowed ONLY in local non-production/test environments
       setTimeout(() => {
         this.searchRetryHandler!(rideId, radiusKm).catch((err) => {
           logger.error(`[Search Retry Direct] Failed for ride ${rideId}`, err);
@@ -342,11 +367,19 @@ export class QueueManager {
    * Enqueue notification dispatch
    */
   public static async enqueueNotification(data: NotificationJobData): Promise<void> {
+    if (this.isShuttingDown) {
+      throw new Error('QUEUE_SHUTTING_DOWN: Cannot enqueue notification during shutdown.');
+    }
+
     if (this.notificationQueue && this.isRedisAvailable) {
       await this.notificationQueue.add('send-notification', data, {
         attempts: 3,
       });
+    } else if (config.isProduction) {
+      logger.error(`[BullMQ] Redis is unavailable in production. Cannot enqueue notification for user ${data.userId}.`);
+      throw new Error(`QUEUE_UNAVAILABLE_PRODUCTION: Cannot enqueue notification in production without active Redis.`);
     } else if (this.notificationHandler) {
+      // Fallback allowed ONLY in local non-production/test environments
       setImmediate(() => {
         this.notificationHandler!(data).catch((err) => {
           logger.error(`[Notification Direct] Failed for user ${data.userId}`, err);
@@ -385,7 +418,9 @@ export class QueueManager {
    * Gracefully close all workers and queues (SIGTERM/SIGINT)
    */
   public static async close(): Promise<void> {
+    this.isShuttingDown = true;
     logger.info('[BullMQ] Gracefully shutting down queues and workers...');
+
 
     const workers = [
       this.rideDispatchWorker,
