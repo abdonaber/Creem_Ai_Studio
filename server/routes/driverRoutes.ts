@@ -69,7 +69,7 @@ driverRouter.put('/location', async (req: Request, res: Response, next: NextFunc
     const driver = await db.findDriverByUserId(req.user!.userId);
     if (!driver) throw new AppError('Driver profile not found', 404, 'NOT_FOUND');
 
-    const { lat, lng, heading, timestamp } = req.body;
+    const { lat, lng, heading, timestamp, rideId } = req.body;
 
     const result = await LocationService.processDriverLocationUpdate({
       driverId: driver.id,
@@ -78,9 +78,13 @@ driverRouter.put('/location', async (req: Request, res: Response, next: NextFunc
       lng,
       heading,
       timestamp,
+      rideId,
     });
 
     if (!result.accepted) {
+      if (result.reason === 'RIDE_NOT_ASSOCIATED') {
+        throw new AppError('Driver is not associated with this ride.', 403, 'RIDE_NOT_ASSOCIATED');
+      }
       if (result.reason === 'RATE_LIMIT_EXCEEDED') {
         throw new AppError('Location updates throttled. Maximum 1 update per second.', 429, 'RATE_LIMIT');
       }

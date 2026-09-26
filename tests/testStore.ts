@@ -643,9 +643,62 @@ export class TestDatabaseStore implements IDatabaseStore {
     return { success: true, paymentId: payment.id };
   }
 
+  async settleStripeRefund(params: {
+    paymentIntentId: string;
+    eventId: string;
+    refundAmount?: number;
+    reason?: string;
+  }): Promise<{ success: boolean; paymentId: string; alreadyRefunded?: boolean; refundAmount: number }> {
+    const payment = await this.findPaymentByStripeIntent(params.paymentIntentId);
+    if (!payment) throw new AppError('Payment not found', 404, 'PAYMENT_NOT_FOUND');
+
+    if (payment.status === 'REFUNDED') {
+      return {
+        success: true,
+        paymentId: payment.id,
+        alreadyRefunded: true,
+        refundAmount: (payment as any).refundAmount || payment.amount,
+      };
+    }
+
+    const refundAmount = params.refundAmount !== undefined ? Number(params.refundAmount) : payment.amount;
+
+    // 1. Mark payment REFUNDED
+    await this.updatePayment(payment.id, { status: 'REFUNDED', refundAmount } as any);
+
+    // 2. Mark ride REFUNDED
+    await this.updateRide(payment.rideId, { paymentStatus: 'REFUNDED' });
+
+    // 3. Platform Ledger refund entry
+    await this.recordLedgerEntry({
+      rideId: payment.rideId,
+      type: 'REFUND',
+      amount: refundAmount,
+      currency: payment.currency || 'SAR',
+      fromAccount: 'platform:escrow',
+      toAccount: `rider:${payment.userId}`,
+      status: 'SETTLED',
+      idempotencyKey: `webhook_${params.eventId}_refund`,
+    });
+
+    return {
+      success: true,
+      paymentId: payment.id,
+      alreadyRefunded: false,
+      refundAmount,
+    };
+  }
+
 
   // Ledger & Cash Settlement
   async recordLedgerEntry(entry: Omit<IPlatformLedger, 'id' | 'createdAt'>): Promise<IPlatformLedger> {
+    if (entry.idempotencyKey) {
+      const existing = this.ledger.find((x) => x.idempotencyKey === entry.idempotencyKey);
+      if (existing) {
+        return existing;
+      }
+    }
+
     const l: IPlatformLedger = {
       id: generateId('led'),
       rideId: entry.rideId,

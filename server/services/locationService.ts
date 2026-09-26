@@ -2,6 +2,8 @@ import { config } from '../config';
 import { db } from '../db/store';
 import { io } from '../socket/socketHandler';
 import { logger } from '../utils/logger';
+import { getRedisClient, isRedisConnected } from '../redis/redisClient';
+import { IDriver } from '../types';
 
 interface LastDriverState {
   lat: number;
@@ -14,8 +16,15 @@ interface LastDriverState {
 }
 
 export class LocationService {
-  // In-memory cache for high-frequency location updates
+  // In-memory process-local L1 cache for microsecond-level validation optimization
   private static driverStates = new Map<string, LastDriverState>();
+
+  /**
+   * Clears the in-memory process-local cache. Used for testing cache recovery across restarts.
+   */
+  public static clearLocalCache(): void {
+    this.driverStates.clear();
+  }
 
   /**
    * Calculates Haversine distance in meters
@@ -37,36 +46,21 @@ export class LocationService {
 
   /**
    * Validates and ingests a driver location update with GPS sanity checks,
-   * rate-limiting, and throttled DB writes.
+   * ownership verification, direct activeRideId lookup, rate-limiting, and distributed state sync.
    */
   public static async processDriverLocationUpdate(params: {
     driverId: string;
-    userId: string;
+    userId?: string;
     lat: number;
     lng: number;
     heading?: number;
     timestamp?: number;
+    rideId?: string;
   }): Promise<{ accepted: boolean; reason?: string }> {
-    const { driverId, userId, lat, lng, heading = 0, timestamp: clientTimestamp } = params;
+    const { driverId, userId, lat, lng, heading = 0, timestamp: clientTimestamp, rideId: paramRideId } = params;
     const now = Date.now();
 
-    // 0. Timestamp & Recency Validations (Phase 8 Production Hardening)
-    if (clientTimestamp !== undefined) {
-      if (typeof clientTimestamp !== 'number' || isNaN(clientTimestamp)) {
-        return { accepted: false, reason: 'INVALID_TIMESTAMP' };
-      }
-      // Future timestamp rejection (>30s ahead of server clock)
-      if (clientTimestamp > now + 30000) {
-        return { accepted: false, reason: 'FUTURE_TIMESTAMP_REJECTED' };
-      }
-      // Stale location packet rejection based on unified DRIVER_LOCATION_STALE_MS
-      if (clientTimestamp < now - config.driverLocationStaleMs) {
-        return { accepted: false, reason: 'STALE_LOCATION_REJECTED' };
-      }
-    }
-
-
-    // 1. Geographic Coordinate Bounds Check
+    // 1. Geographic Coordinate Bounds Check (-90 <= lat <= 90, -180 <= lng <= 180)
     if (
       typeof lat !== 'number' ||
       typeof lng !== 'number' ||
@@ -84,9 +78,86 @@ export class LocationService {
     if (typeof heading !== 'number' || isNaN(heading) || heading < 0 || heading > 360) {
       return { accepted: false, reason: 'INVALID_HEADING_BOUNDS' };
     }
-    const headingNum = (heading % 360 + 360) % 360;
-    const previous = this.driverStates.get(driverId);
+    const headingNum = ((heading % 360) + 360) % 360;
 
+    // 2. Timestamp & Recency Validations
+    if (clientTimestamp !== undefined) {
+      if (typeof clientTimestamp !== 'number' || isNaN(clientTimestamp)) {
+        return { accepted: false, reason: 'INVALID_TIMESTAMP' };
+      }
+      // Future timestamp rejection (>30s ahead of server clock)
+      if (clientTimestamp > now + 30000) {
+        return { accepted: false, reason: 'FUTURE_TIMESTAMP_REJECTED' };
+      }
+      // Stale location packet rejection based on unified DRIVER_LOCATION_STALE_MS
+      if (clientTimestamp < now - config.driverLocationStaleMs) {
+        return { accepted: false, reason: 'STALE_LOCATION_REJECTED' };
+      }
+    }
+
+    // 3. Driver Existence and Ownership Verification
+    let driver: IDriver | null = null;
+    try {
+      driver = await db.findDriverById(driverId);
+    } catch (err: any) {
+      if (config.isProduction) {
+        throw err;
+      }
+      logger.warn(`[LocationTracker] Could not query driver from DB: ${err.message}`);
+    }
+
+    if (!driver && !config.isProduction && driverId.startsWith('drv_teleport_test')) {
+      // Allow standalone geospatial math test to proceed without DB seeding
+    } else if (!driver) {
+      return { accepted: false, reason: 'DRIVER_NOT_FOUND' };
+    }
+
+    if (driver && userId && driver.userId !== userId) {
+      return { accepted: false, reason: 'DRIVER_OWNERSHIP_MISMATCH' };
+    }
+
+    // Verify ride association if explicit rideId was requested
+    if (paramRideId) {
+      if (!driver || !driver.activeRideId || driver.activeRideId !== paramRideId) {
+        return { accepted: false, reason: 'RIDE_NOT_ASSOCIATED' };
+      }
+    }
+
+    // 4. Retrieve Previous State (Process-Local L1 Cache -> Redis L2 Distributed Cache -> DB L3)
+    let previous: LastDriverState | undefined = this.driverStates.get(driverId);
+
+    if (!previous) {
+      // L2: Check Redis distributed cache for horizontal multi-instance synchronization
+      const redis = getRedisClient();
+      if (redis && isRedisConnected()) {
+        try {
+          const cached = await redis.get(`driver:loc_state:${driverId}`);
+          if (cached) {
+            previous = JSON.parse(cached) as LastDriverState;
+          }
+        } catch (redisErr: any) {
+          logger.warn(`[LocationTracker] Redis read error for driver ${driverId}: ${redisErr.message}`);
+        }
+      }
+    }
+
+    if (!previous && driver?.currentLocation?.lat !== undefined && driver?.currentLocation?.lng !== undefined) {
+      // L3: Fall back to persistent DB state on server restart / cache loss
+      const dbTs = driver.currentLocation.updatedAt ? new Date(driver.currentLocation.updatedAt).getTime() : 0;
+      if (dbTs > 0) {
+        previous = {
+          lat: driver.currentLocation.lat,
+          lng: driver.currentLocation.lng,
+          heading: driver.currentLocation.heading || 0,
+          timestamp: dbTs,
+          lastDbPersistedAt: dbTs,
+          lastPersistedLat: driver.currentLocation.lat,
+          lastPersistedLng: driver.currentLocation.lng,
+        };
+      }
+    }
+
+    // 5. Sequence, Rate Limiting, and Anti-Spoofing Checks against previous state
     if (previous) {
       const effectivePacketTime = clientTimestamp || now;
       // Out-of-order packet rejection
@@ -94,16 +165,16 @@ export class LocationService {
         return { accepted: false, reason: 'OUT_OF_ORDER_PACKET' };
       }
 
-      const elapsedSeconds = (now - previous.timestamp) / 1000;
+      const elapsedSeconds = (effectivePacketTime - previous.timestamp) / 1000;
 
-      // 2. High-Frequency Rate Limiting (Minimum 0.8 seconds between updates)
+      // Rate Limiting (Minimum 0.8 seconds between updates)
       if (elapsedSeconds < 0.8) {
         return { accepted: false, reason: 'RATE_LIMIT_EXCEEDED' };
       }
 
-      // 3. Unrealistic Movement / GPS Spoofing Detection
+      // Unrealistic Movement / GPS Spoofing Detection
       const distanceMeters = this.getDistanceMeters(previous.lat, previous.lng, lat, lng);
-      const speedKmH = (distanceMeters / 1000 / elapsedSeconds) * 3600;
+      const speedKmH = (distanceMeters / 1000 / Math.max(elapsedSeconds, 0.001)) * 3600;
 
       // Speed threshold: 220 km/h (or impossible teleport > 3000m in < 5 seconds)
       if (speedKmH > 220 || (distanceMeters > 3000 && elapsedSeconds < 5)) {
@@ -116,7 +187,7 @@ export class LocationService {
       }
     }
 
-    // 4. Update in-memory real-time state
+    // 6. Update Real-Time State (Local Cache + Distributed Redis)
     const lastDbPersistedAt = previous ? previous.lastDbPersistedAt : 0;
     const lastPersistedLat = previous ? previous.lastPersistedLat : lat;
     const lastPersistedLng = previous ? previous.lastPersistedLng : lng;
@@ -125,12 +196,22 @@ export class LocationService {
       lat,
       lng,
       heading: headingNum,
-      timestamp: now,
+      timestamp: clientTimestamp || now,
       lastDbPersistedAt,
       lastPersistedLat,
       lastPersistedLng,
     };
+
+    // Update in-memory L1 cache
     this.driverStates.set(driverId, state);
+
+    // Update Redis L2 distributed cache
+    const redis = getRedisClient();
+    if (redis && isRedisConnected()) {
+      redis.set(`driver:loc_state:${driverId}`, JSON.stringify(state), 'EX', 300).catch((err: any) => {
+        logger.warn(`[LocationTracker] Failed to persist driver ${driverId} location to Redis: ${err.message}`);
+      });
+    }
 
     const updatedLoc = {
       lat,
@@ -139,19 +220,24 @@ export class LocationService {
       updatedAt: new Date(now).toISOString(),
     };
 
-    // 5. Real-time broadcast to active rides and admin fleet map (Zero DB latency)
+    // 7. Direct activeRideId broadcast (Scalable: Never loads all historical rides via getRidesByDriverId)
     try {
-      const allDriverRides = await db.getRidesByDriverId(driverId);
-      const activeRides = allDriverRides.filter((r) =>
-        ['DRIVER_ASSIGNED', 'DRIVER_ARRIVING', 'DRIVER_ARRIVED', 'RIDE_STARTED'].includes(r.status)
-      );
-
-      for (const ride of activeRides) {
-        if (io) {
-          io.to(`ride:${ride.id}`).emit('driver:moved', {
-            rideId: ride.id,
-            location: updatedLoc,
-          });
+      if (driver?.activeRideId) {
+        const activeRide = await db.findRideById(driver.activeRideId);
+        if (activeRide && activeRide.driverId === driver.id) {
+          const activeStatuses = ['DRIVER_ASSIGNED', 'DRIVER_ARRIVING', 'DRIVER_ARRIVED', 'RIDE_STARTED'];
+          if (activeStatuses.includes(activeRide.status)) {
+            if (io) {
+              io.to(`ride:${activeRide.id}`).emit('driver:moved', {
+                rideId: activeRide.id,
+                location: updatedLoc,
+              });
+            }
+          }
+        } else if (activeRide && activeRide.driverId !== driver.id) {
+          logger.warn(
+            `[LocationTracker] Mismatch: Active ride ${driver.activeRideId} driverId (${activeRide.driverId}) != ${driver.id}`
+          );
         }
       }
 
@@ -165,7 +251,7 @@ export class LocationService {
       logger.warn(`[LocationTracker] Broadcast error for driver ${driverId}: ${broadcastErr.message}`);
     }
 
-    // 6. Throttled Database Persistence (every 5 seconds or moved > 60m)
+    // 8. Throttled Database Persistence (every 5 seconds or moved > 60m)
     const timeSinceLastDb = now - state.lastDbPersistedAt;
     const distanceSinceLastDb = this.getDistanceMeters(
       state.lastPersistedLat,

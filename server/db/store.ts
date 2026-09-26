@@ -170,6 +170,13 @@ export interface IDatabaseStore {
     amount?: number;
     metadata?: Record<string, any>;
   }): Promise<{ success: boolean; paymentId: string; alreadySettled?: boolean }>;
+  settleStripeRefund(params: {
+    paymentIntentId: string;
+    eventId: string;
+    refundAmount?: number;
+    reason?: string;
+  }): Promise<{ success: boolean; paymentId: string; alreadyRefunded?: boolean; refundAmount: number }>;
+
 
   // Financial Reconciliation
   reconcileFinancialIntegrity(): Promise<{
@@ -2276,6 +2283,144 @@ export class MongoDatabaseStore implements IDatabaseStore {
       idempotencyKey: `webhook_${eventId}_fare`,
     });
     return { success: true, paymentId: payment.id };
+  }
+
+  public async settleStripeRefund(params: {
+    paymentIntentId: string;
+    eventId: string;
+    refundAmount?: number;
+    reason?: string;
+  }): Promise<{ success: boolean; paymentId: string; alreadyRefunded?: boolean; refundAmount: number }> {
+    this.ensureConnection();
+    const { paymentIntentId, eventId } = params;
+
+    const session = await mongoose.startSession().catch(() => null);
+    if (!session && config.isProduction) {
+      throw new AppError(
+        'FATAL: MongoDB transactions are strictly required in production for Stripe webhook refund.',
+        500,
+        'TRANSACTION_UNAVAILABLE_PRODUCTION'
+      );
+    }
+
+    if (session) {
+      try {
+        let result: { success: boolean; paymentId: string; alreadyRefunded?: boolean; refundAmount: number } | null = null;
+        await session.withTransaction(async () => {
+          const payment = await PaymentModel.findOne({ stripePaymentIntentId: paymentIntentId }).session(session);
+          if (!payment) {
+            throw new AppError(`Payment not found for Stripe intent ${paymentIntentId}`, 404, 'PAYMENT_NOT_FOUND');
+          }
+
+          if (payment.status === 'REFUNDED') {
+            result = {
+              success: true,
+              paymentId: payment._id.toString(),
+              alreadyRefunded: true,
+              refundAmount: payment.refundAmount || payment.amount,
+            };
+            return;
+          }
+
+          const refundAmount = params.refundAmount !== undefined ? Number(params.refundAmount) : payment.amount;
+
+          // 1. Mark payment REFUNDED
+          payment.status = 'REFUNDED';
+          payment.refundAmount = refundAmount;
+          payment.updatedAt = new Date();
+          await payment.save({ session });
+
+          // 2. Mark ride REFUNDED
+          await RideModel.findOneAndUpdate(
+            mongoose.Types.ObjectId.isValid(payment.rideId) ? { _id: payment.rideId } : { id: payment.rideId },
+            {
+              $set: {
+                paymentStatus: 'REFUNDED',
+                updatedAt: new Date(),
+              },
+            },
+            { session }
+          );
+
+          // 3. Platform Ledger refund entry
+          await PlatformLedgerModel.create(
+            [
+              {
+                _id: new mongoose.Types.ObjectId(),
+                rideId: payment.rideId,
+                type: 'REFUND',
+                amount: refundAmount,
+                currency: payment.currency || 'SAR',
+                fromAccount: 'platform:escrow',
+                toAccount: `rider:${payment.userId}`,
+                status: 'SETTLED',
+                idempotencyKey: `webhook_${eventId}_refund`,
+              },
+            ],
+            { session }
+          );
+
+          result = {
+            success: true,
+            paymentId: payment._id.toString(),
+            alreadyRefunded: false,
+            refundAmount,
+          };
+        });
+
+        if (result) return result;
+      } catch (err: any) {
+        if (config.isProduction) {
+          throw err;
+        }
+        if (!err.message?.includes('replica set') && !err.message?.includes('Transactions are not supported')) {
+          throw err;
+        }
+      } finally {
+        await session.endSession();
+      }
+    }
+
+    if (config.isProduction) {
+      throw new AppError(
+        'FATAL: MongoDB transactions are strictly required in production for Stripe webhook refund.',
+        500,
+        'TRANSACTION_UNAVAILABLE_PRODUCTION'
+      );
+    }
+
+    // Fallback for standalone Mongo development environment
+    const payment = await this.findPaymentByStripeIntent(paymentIntentId);
+    if (!payment) throw new AppError('Payment not found', 404, 'PAYMENT_NOT_FOUND');
+    if (payment.status === 'REFUNDED') {
+      return {
+        success: true,
+        paymentId: payment.id,
+        alreadyRefunded: true,
+        refundAmount: (payment as any).refundAmount || payment.amount,
+      };
+    }
+
+    const refundAmount = params.refundAmount !== undefined ? Number(params.refundAmount) : payment.amount;
+    await this.updatePayment(payment.id, { status: 'REFUNDED', refundAmount } as any);
+    await this.updateRide(payment.rideId, { paymentStatus: 'REFUNDED' });
+    await this.recordLedgerEntry({
+      rideId: payment.rideId,
+      type: 'REFUND',
+      amount: refundAmount,
+      currency: payment.currency || 'SAR',
+      fromAccount: 'platform:escrow',
+      toAccount: `rider:${payment.userId}`,
+      status: 'SETTLED',
+      idempotencyKey: `webhook_${eventId}_refund`,
+    });
+
+    return {
+      success: true,
+      paymentId: payment.id,
+      alreadyRefunded: false,
+      refundAmount,
+    };
   }
 
 

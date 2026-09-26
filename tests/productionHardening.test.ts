@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import request from 'supertest';
 import { app } from '../server';
 import { setDatabaseStore } from '../server/db/store';
@@ -49,7 +49,12 @@ describe('Production Hardening & Integrity Suite', () => {
       userId: driverUser.id,
       approvalStatus: 'PENDING',
       isOnline: true,
-      currentLocation: { lat: 24.7136, lng: 46.6753, heading: 90, updatedAt: new Date().toISOString() },
+      currentLocation: {
+        lat: 24.7136,
+        lng: 46.6753,
+        heading: 90,
+        updatedAt: new Date(Date.now() - 15000).toISOString(),
+      },
     });
     driverToken = createAuthToken({ userId: driverUser.id, role: 'DRIVER', email: driverUser.email });
   });
@@ -676,7 +681,342 @@ describe('Production Hardening & Integrity Suite', () => {
       expect(report.healthy).toBe(false);
       expect(report.discrepancies.some((d) => d.type === 'COMMISSION_MISMATCH')).toBe(true);
     });
+  });
 
+  describe('15. GPS / Driver Location Scalability & Correctness', () => {
+    it('accepts valid location and rejects invalid bounds and heading', async () => {
+      const { LocationService } = await import('../server/services/locationService');
+
+      // Valid location
+      const validRes = await LocationService.processDriverLocationUpdate({
+        driverId: driverRecord.id,
+        userId: driverUser.id,
+        lat: 24.7136,
+        lng: 46.6753,
+        heading: 90,
+      });
+      expect(validRes.accepted).toBe(true);
+
+      // Invalid latitude
+      const invLat = await LocationService.processDriverLocationUpdate({
+        driverId: driverRecord.id,
+        userId: driverUser.id,
+        lat: 91.5,
+        lng: 46.6753,
+      });
+      expect(invLat.accepted).toBe(false);
+      expect(invLat.reason).toBe('INVALID_COORDINATES_BOUNDS');
+
+      // Invalid longitude
+      const invLng = await LocationService.processDriverLocationUpdate({
+        driverId: driverRecord.id,
+        userId: driverUser.id,
+        lat: 24.7136,
+        lng: 181.5,
+      });
+      expect(invLng.accepted).toBe(false);
+      expect(invLng.reason).toBe('INVALID_COORDINATES_BOUNDS');
+
+      // Invalid heading
+      const invHeading = await LocationService.processDriverLocationUpdate({
+        driverId: driverRecord.id,
+        userId: driverUser.id,
+        lat: 24.7136,
+        lng: 46.6753,
+        heading: 400,
+      });
+      expect(invHeading.accepted).toBe(false);
+      expect(invHeading.reason).toBe('INVALID_HEADING_BOUNDS');
+    });
+
+    it('rejects future timestamps and stale timestamps', async () => {
+      const { LocationService } = await import('../server/services/locationService');
+      const now = Date.now();
+
+      // Future timestamp > 30s
+      const futureRes = await LocationService.processDriverLocationUpdate({
+        driverId: driverRecord.id,
+        userId: driverUser.id,
+        lat: 24.7136,
+        lng: 46.6753,
+        timestamp: now + 45000,
+      });
+      expect(futureRes.accepted).toBe(false);
+      expect(futureRes.reason).toBe('FUTURE_TIMESTAMP_REJECTED');
+
+      // Stale timestamp > 5 mins
+      const staleRes = await LocationService.processDriverLocationUpdate({
+        driverId: driverRecord.id,
+        userId: driverUser.id,
+        lat: 24.7136,
+        lng: 46.6753,
+        timestamp: now - (5 * 60 * 1000 + 10000),
+      });
+      expect(staleRes.accepted).toBe(false);
+      expect(staleRes.reason).toBe('STALE_LOCATION_REJECTED');
+    });
+
+    it('rejects out-of-order packets and throttles too-frequent updates', async () => {
+      const { LocationService } = await import('../server/services/locationService');
+      const now = Date.now();
+
+      // Clear local cache to establish known baseline
+      LocationService.clearLocalCache();
+
+      const p1 = await LocationService.processDriverLocationUpdate({
+        driverId: driverRecord.id,
+        userId: driverUser.id,
+        lat: 24.7136,
+        lng: 46.6753,
+        timestamp: now - 5000,
+      });
+      expect(p1.accepted).toBe(true);
+
+      // Out-of-order packet (timestamp earlier than p1)
+      const outOfOrder = await LocationService.processDriverLocationUpdate({
+        driverId: driverRecord.id,
+        userId: driverUser.id,
+        lat: 24.7138,
+        lng: 46.6755,
+        timestamp: now - 6000,
+      });
+      expect(outOfOrder.accepted).toBe(false);
+      expect(outOfOrder.reason).toBe('OUT_OF_ORDER_PACKET');
+
+      // Too-frequent update (within 0.5s of p1)
+      const tooFast = await LocationService.processDriverLocationUpdate({
+        driverId: driverRecord.id,
+        userId: driverUser.id,
+        lat: 24.7138,
+        lng: 46.6755,
+        timestamp: now - 4700,
+      });
+      expect(tooFast.accepted).toBe(false);
+      expect(tooFast.reason).toBe('RATE_LIMIT_EXCEEDED');
+    });
+
+    it('handles driver without active ride vs driver with activeRideId without loading full history', async () => {
+      const { LocationService } = await import('../server/services/locationService');
+      const now = Date.now();
+
+      // Spy on store.getRidesByDriverId to ensure it is NOT called
+      const getRidesSpy = vi.spyOn(store, 'getRidesByDriverId');
+
+      // 1. Driver without active ride
+      await store.updateDriver(driverRecord.id, { activeRideId: undefined });
+      const noRideRes = await LocationService.processDriverLocationUpdate({
+        driverId: driverRecord.id,
+        userId: driverUser.id,
+        lat: 24.7150,
+        lng: 46.6760,
+        timestamp: now + 1000,
+      });
+      expect(noRideRes.accepted).toBe(true);
+      expect(getRidesSpy).not.toHaveBeenCalled();
+
+      // 2. Driver with activeRideId (direct lookup)
+      const activeRide = await store.createRide({
+        riderId: riderUser.id,
+        driverId: driverRecord.id,
+        status: 'DRIVER_ARRIVING',
+        estimatedFare: 40,
+        distanceKm: 5,
+        durationMinutes: 10,
+      });
+      await store.updateDriver(driverRecord.id, { activeRideId: activeRide.id });
+
+      const findRideSpy = vi.spyOn(store, 'findRideById');
+      const withRideRes = await LocationService.processDriverLocationUpdate({
+        driverId: driverRecord.id,
+        userId: driverUser.id,
+        lat: 24.7155,
+        lng: 46.6765,
+        timestamp: now + 3000,
+      });
+      expect(withRideRes.accepted).toBe(true);
+      expect(getRidesSpy).not.toHaveBeenCalled();
+      expect(findRideSpy).toHaveBeenCalledWith(activeRide.id);
+
+      // Clean up spies
+      getRidesSpy.mockRestore();
+      findRideSpy.mockRestore();
+    });
+
+    it('rejects location update for an unrelated ride', async () => {
+      const { LocationService } = await import('../server/services/locationService');
+      const now = Date.now();
+
+      // Create an unrelated ride belonging to another driver
+      const otherRide = await store.createRide({
+        riderId: riderUser.id,
+        driverId: 'drv_other_driver_123',
+        status: 'DRIVER_ARRIVING',
+        estimatedFare: 40,
+      });
+
+      const res = await LocationService.processDriverLocationUpdate({
+        driverId: driverRecord.id,
+        userId: driverUser.id,
+        lat: 24.7160,
+        lng: 46.6770,
+        timestamp: now + 5000,
+        rideId: otherRide.id,
+      });
+
+      expect(res.accepted).toBe(false);
+      expect(res.reason).toBe('RIDE_NOT_ASSOCIATED');
+    });
+
+    it('recovers state across simulated server restart / cache loss from persistent DB', async () => {
+      const { LocationService } = await import('../server/services/locationService');
+      const now = Date.now();
+
+      // Seed driver's location in persistent DB
+      await store.updateDriver(driverRecord.id, {
+        currentLocation: {
+          lat: 24.7100,
+          lng: 46.6700,
+          heading: 0,
+          updatedAt: new Date(now - 2000).toISOString(),
+        },
+      });
+
+      // Clear process-local cache (simulates server restart)
+      LocationService.clearLocalCache();
+
+      // Send out-of-order packet (earlier than DB timestamp)
+      const outOfOrderRes = await LocationService.processDriverLocationUpdate({
+        driverId: driverRecord.id,
+        userId: driverUser.id,
+        lat: 24.7105,
+        lng: 46.6705,
+        timestamp: now - 3000,
+      });
+      expect(outOfOrderRes.accepted).toBe(false);
+      expect(outOfOrderRes.reason).toBe('OUT_OF_ORDER_PACKET');
+
+      // Send impossible hop from DB coordinate (> 220 km/h)
+      const spoofRes = await LocationService.processDriverLocationUpdate({
+        driverId: driverRecord.id,
+        userId: driverUser.id,
+        lat: 21.5433, // Jeddah (~850km away)
+        lng: 39.1728,
+        timestamp: now,
+      });
+      expect(spoofRes.accepted).toBe(false);
+      expect(spoofRes.reason).toBe('UNREALISTIC_MOVEMENT_SPOOFING');
+    });
+  });
+
+  describe('16. Stripe Refund Atomic & Idempotent', () => {
+    it('settles refund atomically across payment, ride, and platform ledger', async () => {
+      const ride = await store.createRide({
+        riderId: riderUser.id,
+        driverId: driverRecord.id,
+        status: 'RIDE_COMPLETED',
+        estimatedFare: 75,
+        finalFare: 75,
+        paymentMethod: 'CREDIT_CARD',
+        paymentStatus: 'SUCCEEDED',
+      });
+
+      const intentId = 'pi_atomic_refund_' + generateId('pi');
+      await store.createPayment({
+        rideId: ride.id,
+        userId: riderUser.id,
+        amount: 75,
+        currency: 'SAR',
+        status: 'SUCCEEDED',
+        paymentMethod: 'CREDIT_CARD',
+        stripePaymentIntentId: intentId,
+      });
+
+      const eventId = 'evt_atomic_refund_' + generateId('evt');
+
+      const refundResult = await store.settleStripeRefund({
+        paymentIntentId: intentId,
+        eventId,
+        refundAmount: 75,
+      });
+
+      expect(refundResult.success).toBe(true);
+      expect(refundResult.alreadyRefunded).toBe(false);
+      expect(refundResult.refundAmount).toBe(75);
+
+      // Verify payment was marked REFUNDED
+      const updatedPayment = await store.findPaymentByStripeIntent(intentId);
+      expect(updatedPayment?.status).toBe('REFUNDED');
+      expect((updatedPayment as any)?.refundAmount).toBe(75);
+
+      // Verify ride was marked REFUNDED
+      const updatedRide = await store.findRideById(ride.id);
+      expect(updatedRide?.paymentStatus).toBe('REFUNDED');
+
+      // Verify PlatformLedger has exactly 1 REFUND entry
+      const refundEntries = store.ledger.filter((l) => l.rideId === ride.id && l.type === 'REFUND');
+      expect(refundEntries.length).toBe(1);
+      expect(refundEntries[0].amount).toBe(75);
+      expect(refundEntries[0].fromAccount).toBe('platform:escrow');
+      expect(refundEntries[0].toAccount).toBe(`rider:${riderUser.id}`);
+    });
+
+    it('is strictly idempotent on duplicate refund webhooks (no double ledger, no double refund)', async () => {
+      const ride = await store.createRide({
+        riderId: riderUser.id,
+        driverId: driverRecord.id,
+        status: 'RIDE_COMPLETED',
+        estimatedFare: 80,
+        finalFare: 80,
+        paymentMethod: 'CREDIT_CARD',
+        paymentStatus: 'SUCCEEDED',
+      });
+
+      const intentId = 'pi_duplicate_refund_' + generateId('pi');
+      await store.createPayment({
+        rideId: ride.id,
+        userId: riderUser.id,
+        amount: 80,
+        currency: 'SAR',
+        status: 'SUCCEEDED',
+        paymentMethod: 'CREDIT_CARD',
+        stripePaymentIntentId: intentId,
+      });
+
+      const eventId = 'evt_duplicate_refund_' + generateId('evt');
+
+      // Fire 5 duplicate refund operations concurrently
+      const results = await Promise.all([
+        store.settleStripeRefund({ paymentIntentId: intentId, eventId, refundAmount: 80 }),
+        store.settleStripeRefund({ paymentIntentId: intentId, eventId, refundAmount: 80 }),
+        store.settleStripeRefund({ paymentIntentId: intentId, eventId, refundAmount: 80 }),
+        store.settleStripeRefund({ paymentIntentId: intentId, eventId, refundAmount: 80 }),
+        store.settleStripeRefund({ paymentIntentId: intentId, eventId, refundAmount: 80 }),
+      ]);
+
+      // All calls succeed
+      for (const res of results) {
+        expect(res.success).toBe(true);
+        expect(res.refundAmount).toBe(80);
+      }
+
+      // Exactly 1 ledger entry exists
+      const refundLedgers = store.ledger.filter((l) => l.rideId === ride.id && l.type === 'REFUND');
+      expect(refundLedgers.length).toBe(1);
+
+      // Payment remains REFUNDED with 80
+      const payment = await store.findPaymentByStripeIntent(intentId);
+      expect(payment?.status).toBe('REFUNDED');
+      expect((payment as any)?.refundAmount).toBe(80);
+    });
+
+    it('rejects unknown paymentIntentId gracefully with PAYMENT_NOT_FOUND', async () => {
+      await expect(
+        store.settleStripeRefund({
+          paymentIntentId: 'pi_unknown_nonexistent',
+          eventId: 'evt_test_nonexistent',
+        })
+      ).rejects.toThrow('Payment not found');
+    });
   });
 });
 

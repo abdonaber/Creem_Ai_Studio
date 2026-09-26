@@ -246,26 +246,27 @@ export class PaymentService {
       } else if (event.type === 'charge.refunded' || event.type === 'payment_intent.canceled') {
         const obj = event.data.object as any;
         const paymentIntentId = obj.payment_intent || obj.id;
-        const payment = await db.findPaymentByStripeIntent(paymentIntentId);
-        if (payment) {
-          const refundAmount = obj.amount_refunded ? obj.amount_refunded / 100 : payment.amount;
-          await db.updatePayment(payment.id, { status: 'REFUNDED', refundAmount });
-          await db.updateRide(payment.rideId, { paymentStatus: 'REFUNDED' });
-          await db.recordLedgerEntry({
-            rideId: payment.rideId,
-            type: 'REFUND',
-            amount: refundAmount,
-            currency: 'SAR',
-            fromAccount: 'platform:escrow',
-            toAccount: `rider:${payment.userId}`,
-            status: 'SETTLED',
-            idempotencyKey: `webhook_${effectiveEventId}_refund`,
-          });
-          if (io) {
+        const refundAmount = obj.amount_refunded
+          ? obj.amount_refunded / 100
+          : obj.amount
+          ? obj.amount / 100
+          : undefined;
+
+        const settleResult = await db.settleStripeRefund({
+          paymentIntentId,
+          eventId: effectiveEventId,
+          refundAmount,
+          reason: obj.cancellation_reason || obj.reason,
+        });
+
+        // Only emit socket side-effect once (idempotent, no double socket emits on duplicate webhooks)
+        if (io && settleResult.success && !settleResult.alreadyRefunded) {
+          const payment = await db.findPaymentByStripeIntent(paymentIntentId);
+          if (payment) {
             io.to(`ride:${payment.rideId}`).emit('ride:payment_refunded', {
               rideId: payment.rideId,
               status: 'REFUNDED',
-              amount: refundAmount,
+              amount: settleResult.refundAmount,
             });
           }
         }
