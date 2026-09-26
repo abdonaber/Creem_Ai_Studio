@@ -364,9 +364,19 @@ export interface IPaymentDocument extends Document {
     | 'REQUIRES_RECONCILIATION';
   paymentMethod: 'WALLET' | 'CASH' | 'CREDIT_CARD';
   stripePaymentIntentId?: string;
+  stripeChargeId?: string;
   stripeClientSecret?: string;
   idempotencyKey?: string;
   refundAmount?: number;
+  refunds?: Array<{
+    stripeRefundId: string;
+    amount: number;
+    status: string;
+    eventId?: string;
+    reason?: string;
+    createdAt: Date;
+    updatedAt?: Date;
+  }>;
   metadata?: Record<string, any>;
   createdAt: Date;
   updatedAt: Date;
@@ -398,9 +408,21 @@ export const PaymentSchema = new Schema<IPaymentDocument>(
       required: true,
     },
     stripePaymentIntentId: { type: String, sparse: true, index: true },
+    stripeChargeId: { type: String, sparse: true, index: true },
     stripeClientSecret: String,
     idempotencyKey: { type: String, sparse: true, unique: true },
     refundAmount: { type: Number, default: 0 },
+    refunds: [
+      {
+        stripeRefundId: { type: String, required: true },
+        amount: { type: Number, required: true },
+        status: { type: String, default: 'succeeded' },
+        eventId: String,
+        reason: String,
+        createdAt: { type: Date, default: Date.now },
+        updatedAt: { type: Date, default: Date.now },
+      },
+    ],
     metadata: Schema.Types.Mixed,
   },
   { timestamps: true }
@@ -408,6 +430,7 @@ export const PaymentSchema = new Schema<IPaymentDocument>(
 
 PaymentSchema.index({ rideId: 1 });
 PaymentSchema.index({ userId: 1, createdAt: -1 });
+PaymentSchema.index({ 'refunds.stripeRefundId': 1 });
 
 // 8. Rating Schema
 export interface IRatingDocument extends Document {

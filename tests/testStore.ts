@@ -503,6 +503,52 @@ export class TestDatabaseStore implements IDatabaseStore {
     return updated;
   }
 
+  async findPaymentByStripeCharge(chargeId: string): Promise<IPayment | null> {
+    for (const payment of this.payments.values()) {
+      if ((payment as any).stripeChargeId === chargeId || (payment.metadata as any)?.chargeId === chargeId) {
+        return payment;
+      }
+    }
+    return null;
+  }
+
+  async trackRefundState(params: {
+    paymentIntentId: string;
+    refundId: string;
+    amount: number;
+    status: 'pending' | 'succeeded' | 'failed' | 'canceled' | 'requires_action';
+    eventId?: string;
+    reason?: string;
+  }): Promise<void> {
+    const payment = await this.findPaymentByStripeIntent(params.paymentIntentId);
+    if (!payment) return;
+    const refunds = (payment as any).refunds ? [...(payment as any).refunds] : [];
+    const idx = refunds.findIndex((r: any) => r.stripeRefundId === params.refundId);
+    if (idx >= 0) {
+      refunds[idx] = { ...refunds[idx], ...params, updatedAt: new Date().toISOString() };
+    } else {
+      refunds.push({
+        stripeRefundId: params.refundId,
+        amount: params.amount,
+        status: params.status,
+        eventId: params.eventId,
+        reason: params.reason,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+    }
+    (payment as any).refunds = refunds;
+    this.payments.set(payment.id, payment);
+  }
+
+  async recordReconciliationDiscrepancy(discrepancy: {
+    type: string;
+    id: string;
+    details: string;
+  }): Promise<void> {
+    await this.logAudit('system', `RECONCILIATION_FLAG:${discrepancy.type}`, discrepancy);
+  }
+
   // Webhooks
   async isWebhookProcessed(eventId: string): Promise<boolean> {
     return this.processedWebhooks.has(eventId);
@@ -540,7 +586,7 @@ export class TestDatabaseStore implements IDatabaseStore {
     source?: string,
     type?: string,
     payload?: any,
-    status: 'PROCESSED' | 'FAILED' = 'PROCESSED',
+    status: 'PROCESSED' | 'FAILED' | 'REQUIRES_RECONCILIATION' = 'PROCESSED',
     errorMessage?: string
   ): Promise<void> {
     const existing = this.webhookEvents.get(eventId) || { status: 'PROCESSING', leaseExpiresAt: 0 };
@@ -676,6 +722,25 @@ export class TestDatabaseStore implements IDatabaseStore {
     const existingRefunded = Math.round(((payment as any).refundAmount || 0) * 100) / 100;
     const totalAmount = Math.round(payment.amount * 100) / 100;
 
+    // Unique Stripe Refund ID check to prevent duplicate settlements
+    if (params.refundId && (payment as any).refunds) {
+      const alreadyProcessedRefund = ((payment as any).refunds as any[]).find(
+        (r) => r.stripeRefundId === params.refundId && r.status === 'succeeded'
+      );
+      if (alreadyProcessedRefund) {
+        const isCurrentPartial = existingRefunded < totalAmount && payment.status === 'PARTIALLY_REFUNDED';
+        return {
+          success: true,
+          paymentId: payment.id,
+          alreadyRefunded: true,
+          refundAmount: existingRefunded,
+          refundDelta: 0,
+          isPartial: isCurrentPartial,
+          status: payment.status,
+        };
+      }
+    }
+
     let targetCumulative: number;
     let delta: number;
 
@@ -724,6 +789,15 @@ export class TestDatabaseStore implements IDatabaseStore {
       };
     }
 
+    // Decimal precision validation
+    const decimalPart = String(delta).split('.')[1];
+    if (decimalPart && decimalPart.length > 2) {
+      throw new AppError('Refund amount precision abuse: maximum 2 decimal places allowed for SAR', 400, 'INVALID_REFUND_PRECISION');
+    }
+    if (delta < 0.01) {
+      throw new AppError('Refund amount must be at least 0.01 SAR (smallest currency unit)', 400, 'INVALID_REFUND_AMOUNT');
+    }
+
     if (targetCumulative > totalAmount) {
       throw new AppError(
         `Refund cumulative amount (${targetCumulative} SAR) exceeds original payment amount (${totalAmount} SAR)`,
@@ -743,15 +817,115 @@ export class TestDatabaseStore implements IDatabaseStore {
 
     const isPartial = targetCumulative < totalAmount;
     const newStatus: PaymentStatus = isPartial ? 'PARTIALLY_REFUNDED' : 'REFUNDED';
+    const keySuffix = params.refundId ? `ref_${params.refundId}` : `c_${Math.round(targetCumulative * 100)}`;
 
-    // 1. Mark payment status and update cumulative refundAmount
-    await this.updatePayment(payment.id, { status: newStatus, refundAmount: targetCumulative } as any);
+    // Reversal of Driver Earnings and Platform Commission if ride had a driver
+    const ride = await this.findRideById(payment.rideId);
+    const fareSettled = payment.status === 'SUCCEEDED' || payment.status === 'PARTIALLY_REFUNDED';
+
+    if (fareSettled && ride?.driverId) {
+      const driver = await this.findDriverById(ride.driverId);
+      if (driver) {
+        const driverReversal = Math.round(delta * 0.8 * 100) / 100;
+        const platformReversal = Math.round((delta - driverReversal) * 100) / 100;
+
+        // Decrement driver earningsTotal
+        const newEarningsTotal = Math.max(0, (driver.earningsTotal || 0) - driverReversal);
+        await this.updateDriver(driver.id, { earningsTotal: newEarningsTotal });
+
+        // Adjust driver wallet / debt
+        const driverWallet = await this.getOrCreateWallet(driver.userId);
+        const availableBalance = Math.max(0, driverWallet?.balance || 0);
+
+        if (availableBalance >= driverReversal) {
+          await this.debitWallet(
+            driver.userId,
+            driverReversal,
+            `Earnings reversal on refund for ride #${payment.rideId.slice(0, 8)}`,
+            payment.rideId,
+            `webhook_${params.eventId}_driver_wal_${keySuffix}`
+          );
+        } else {
+          if (availableBalance > 0) {
+            await this.debitWallet(
+              driver.userId,
+              availableBalance,
+              `Partial earnings reversal on refund for ride #${payment.rideId.slice(0, 8)}`,
+              payment.rideId,
+              `webhook_${params.eventId}_driver_wal_part_${keySuffix}`
+            );
+          }
+          const debtIncurred = Math.round((driverReversal - availableBalance) * 100) / 100;
+          await this.updateDriver(driver.id, {
+            outstandingDebt: (driver.outstandingDebt || 0) + debtIncurred,
+          });
+          await this.recordLedgerEntry({
+            rideId: payment.rideId,
+            type: 'COMMISSION_DEBT',
+            amount: debtIncurred,
+            currency: payment.currency || 'SAR',
+            fromAccount: `driver:${driver.id}`,
+            toAccount: 'platform:debt',
+            status: 'OUTSTANDING',
+            idempotencyKey: `webhook_${params.eventId}_driver_debt_${keySuffix}`,
+          });
+        }
+
+        // Compensating Driver Reversal entry into PlatformLedger
+        await this.recordLedgerEntry({
+          rideId: payment.rideId,
+          type: 'DRIVER_EARNING',
+          amount: driverReversal,
+          currency: payment.currency || 'SAR',
+          fromAccount: `driver:${driver.id}`,
+          toAccount: 'platform:escrow',
+          status: 'SETTLED',
+          idempotencyKey: `webhook_${params.eventId}_driver_rev_${keySuffix}`,
+        });
+
+        // Platform Commission Reversal into PlatformLedger
+        await this.recordLedgerEntry({
+          rideId: payment.rideId,
+          type: 'PLATFORM_COMMISSION',
+          amount: platformReversal,
+          currency: payment.currency || 'SAR',
+          fromAccount: 'platform:revenue',
+          toAccount: 'platform:escrow',
+          status: 'SETTLED',
+          idempotencyKey: `webhook_${params.eventId}_comm_rev_${keySuffix}`,
+        });
+      }
+    }
+
+    // 1. Mark payment status, update cumulative refundAmount, and track refund id
+    const currentRefunds = (payment as any).refunds ? [...(payment as any).refunds] : [];
+    const rIdx = currentRefunds.findIndex((r: any) => r.stripeRefundId === (params.refundId || keySuffix));
+    if (rIdx >= 0) {
+      currentRefunds[rIdx].status = 'succeeded';
+      currentRefunds[rIdx].amount = delta;
+      currentRefunds[rIdx].updatedAt = new Date().toISOString();
+    } else {
+      currentRefunds.push({
+        stripeRefundId: params.refundId || keySuffix,
+        amount: delta,
+        status: 'succeeded',
+        eventId: params.eventId,
+        reason: params.reason,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+    }
+
+    await this.updatePayment(payment.id, {
+      status: newStatus,
+      refundAmount: targetCumulative,
+      refunds: currentRefunds,
+    } as any);
 
     // 2. Mark ride paymentStatus
     await this.updateRide(payment.rideId, { paymentStatus: newStatus });
 
     // 3. Platform Ledger refund entry recording incremental delta
-    const keySuffix = params.refundId ? `ref_${params.refundId}` : `c_${Math.round(targetCumulative * 100)}`;
     const idempotencyKey = `webhook_${params.eventId}_refund_${keySuffix}`;
 
     await this.recordLedgerEntry({

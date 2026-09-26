@@ -120,4 +120,26 @@ export class StripeService {
       amountRefunded: refund.amount ? refund.amount / 100 : undefined,
     };
   }
+
+  /**
+   * Retrieves a charge by ID from Stripe
+   */
+  public static async retrieveCharge(chargeId: string): Promise<any> {
+    if (!chargeId || typeof chargeId !== 'string') {
+      throw new AppError('chargeId is required', 400, 'INVALID_CHARGE_ID');
+    }
+    const stripe = getStripe();
+    return await stripe.charges.retrieve(chargeId.trim());
+  }
+
+  /**
+   * Retrieves a payment intent by ID from Stripe
+   */
+  public static async retrievePaymentIntent(paymentIntentId: string): Promise<any> {
+    if (!paymentIntentId || typeof paymentIntentId !== 'string') {
+      throw new AppError('paymentIntentId is required', 400, 'INVALID_PAYMENT_INTENT');
+    }
+    const stripe = getStripe();
+    return await stripe.paymentIntents.retrieve(paymentIntentId.trim());
+  }
 }

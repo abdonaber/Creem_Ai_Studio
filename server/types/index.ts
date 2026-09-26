@@ -195,6 +195,16 @@ export interface IAuditLog {
   timestamp: string;
 }
 
+export interface IPaymentRefund {
+  stripeRefundId: string;
+  amount: number;
+  status: 'pending' | 'succeeded' | 'failed' | 'canceled' | 'requires_action';
+  eventId?: string;
+  reason?: string;
+  createdAt: string;
+  updatedAt?: string;
+}
+
 export interface IPayment {
   id: string;
   rideId: string;
@@ -204,9 +214,11 @@ export interface IPayment {
   status: PaymentStatus;
   paymentMethod: PaymentMethod;
   stripePaymentIntentId?: string;
+  stripeChargeId?: string;
   stripeClientSecret?: string;
   idempotencyKey?: string;
   refundAmount?: number;
+  refunds?: IPaymentRefund[];
   metadata?: Record<string, any>;
   createdAt: string;
 }

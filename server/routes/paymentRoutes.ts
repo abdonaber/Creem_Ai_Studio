@@ -37,6 +37,28 @@ paymentRouter.post('/process', authenticate, async (req: Request, res: Response,
   }
 });
 
+// Request refund for a ride
+paymentRouter.post('/refund', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { rideId, paymentIntentId, amount, reason } = req.body;
+    if (!rideId && !paymentIntentId) {
+      throw new AppError('rideId or paymentIntentId is required', 400, 'INVALID_INPUT');
+    }
+
+    const result = await PaymentService.refundRidePayment({
+      rideId,
+      paymentIntentId,
+      amount,
+      reason,
+      requestedByUserId: req.user!.userId,
+    });
+
+    res.json({ success: true, data: result });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // Secure Payment Gateway Webhook
 paymentRouter.post('/webhook', async (req: Request, res: Response, next: NextFunction) => {
   try {

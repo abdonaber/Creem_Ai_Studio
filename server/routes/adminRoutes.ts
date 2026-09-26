@@ -4,6 +4,7 @@ import { db } from '../db/store';
 import { AppError } from '../middleware/errorHandler';
 import { io } from '../socket/socketHandler';
 import { generateId } from '../utils/id';
+import { PaymentService } from '../services/paymentService';
 
 export const adminRouter = Router();
 
@@ -290,6 +291,30 @@ adminRouter.get('/audit-logs', async (req: Request, res: Response, next: NextFun
     const limit = Number(req.query.limit) || 100;
     const logs = await db.getAuditLogs(limit);
     res.json({ success: true, data: logs });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Admin Refund Route for Ride
+adminRouter.post('/rides/:id/refund', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { amount, reason } = req.body;
+    const result = await PaymentService.refundRidePayment({
+      rideId: req.params.id,
+      amount,
+      reason,
+      requestedByUserId: req.user!.userId,
+    });
+
+    await db.logAudit(req.user!.userId, 'ADMIN_RIDE_REFUND_ISSUED', {
+      rideId: req.params.id,
+      amount,
+      refundId: result.refundId,
+      status: result.status,
+    });
+
+    res.json({ success: true, data: result });
   } catch (err) {
     next(err);
   }

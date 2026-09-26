@@ -1,9 +1,11 @@
 import { config } from '../config';
+import { PaymentStatus } from '../types';
 import { db } from '../db/store';
 import { AppError } from '../middleware/errorHandler';
 import { StripeService } from './stripeService';
 import { io } from '../socket/socketHandler';
 import { acquireLock, releaseLock } from '../redis/redisClient';
+import { logger } from '../utils/logger';
 
 export class PaymentService {
   public static async processRidePayment(
@@ -258,9 +260,75 @@ export class PaymentService {
             });
           }
         }
-      } else if (event.type === 'charge.refunded' || event.type === 'refund.created' || event.type === 'refund.updated') {
+      } else if (
+        event.type === 'charge.refunded' ||
+        event.type === 'refund.created' ||
+        event.type === 'refund.updated'
+      ) {
         const obj = event.data.object as any;
-        const paymentIntentId = obj.payment_intent || (obj.object === 'payment_intent' ? obj.id : undefined) || obj.id;
+
+        // 1. RULE: Only record financial refund if confirmed 'succeeded' by Stripe
+        // pending, requires_action, failed, canceled must never create ledger refund mutations
+        if (event.type === 'refund.created' || event.type === 'refund.updated') {
+          if (obj.status !== 'succeeded') {
+            logger.info(`Stripe refund event ${event.type} status is '${obj.status}'. Skipping ledger settlement until succeeded.`, {
+              refundId: obj.id,
+              status: obj.status,
+            });
+            if (effectiveEventId) {
+              await db.recordProcessedWebhook(
+                effectiveEventId,
+                'stripe',
+                event.type,
+                { id: event.id, type: event.type, refundId: obj.id, status: obj.status },
+                obj.status === 'failed' || obj.status === 'canceled' ? 'FAILED' : 'PROCESSED'
+              );
+            }
+            return true;
+          }
+        }
+
+        // 2. RULE: Never use refund ID (re_*) as PaymentIntent ID!
+        let paymentIntentId: string | undefined = undefined;
+        if (typeof obj.payment_intent === 'string' && obj.payment_intent.startsWith('pi_')) {
+          paymentIntentId = obj.payment_intent;
+        } else if (obj.object === 'payment_intent' && typeof obj.id === 'string' && obj.id.startsWith('pi_')) {
+          paymentIntentId = obj.id;
+        } else if (obj.charge && typeof obj.charge === 'string') {
+          // Resolve PaymentIntent via charge retrieval from Stripe or DB
+          try {
+            const charge = await StripeService.retrieveCharge(obj.charge);
+            if (typeof charge?.payment_intent === 'string') {
+              paymentIntentId = charge.payment_intent;
+            } else if (charge?.payment_intent?.id) {
+              paymentIntentId = charge.payment_intent.id;
+            }
+          } catch (e: any) {
+            logger.warn(`Could not retrieve charge ${obj.charge} to resolve payment_intent: ${e.message}`);
+          }
+        }
+
+        // 3. RULE: If PaymentIntent cannot be safely determined, do NOT settle financially.
+        // Route to safe reconciliation / recovery path!
+        if (!paymentIntentId) {
+          logger.error('CRITICAL: Refund webhook received without valid payment_intent and charge resolution failed. Sending to reconciliation.', {
+            eventId: effectiveEventId,
+            eventType: event.type,
+            refundId: obj.id,
+            chargeId: obj.charge,
+          });
+          if (effectiveEventId) {
+            await db.recordProcessedWebhook(
+              effectiveEventId,
+              'stripe',
+              event.type,
+              { id: event.id, type: event.type, refundId: obj.id, charge: obj.charge },
+              'REQUIRES_RECONCILIATION',
+              'Missing or unresolvable payment_intent'
+            );
+          }
+          return true;
+        }
 
         // Stripe is the source of truth for refund amounts
         let cumulativeAmountRefunded: number | undefined = undefined;
@@ -329,6 +397,99 @@ export class PaymentService {
       }
       throw err;
     }
+  }
+
+  /**
+   * Initiates a verified refund for a ride's payment
+   */
+  public static async refundRidePayment(params: {
+    rideId?: string;
+    paymentIntentId?: string;
+    amount?: number;
+    reason?: 'duplicate' | 'fraudulent' | 'requested_by_customer';
+    requestedByUserId?: string;
+  }): Promise<{
+    success: boolean;
+    refundId: string;
+    status: string;
+    amountRefunded?: number;
+    paymentStatus: PaymentStatus;
+  }> {
+    const { rideId, paymentIntentId, amount, reason } = params;
+
+    let payment: any = null;
+    if (paymentIntentId) {
+      payment = await db.findPaymentByStripeIntent(paymentIntentId);
+    } else if (rideId) {
+      payment = await db.findPaymentByRideId(rideId);
+    }
+
+    if (!payment) {
+      throw new AppError('Payment not found for refund request', 404, 'PAYMENT_NOT_FOUND');
+    }
+
+    if (payment.status !== 'SUCCEEDED' && payment.status !== 'PARTIALLY_REFUNDED') {
+      throw new AppError(
+        `Cannot refund payment in '${payment.status}' status. Only SUCCEEDED or PARTIALLY_REFUNDED payments can be refunded.`,
+        400,
+        'INVALID_PAYMENT_STATUS_FOR_REFUND'
+      );
+    }
+
+    const totalAmount = Math.round(payment.amount * 100) / 100;
+    const existingRefunded = Math.round((payment.refundAmount || 0) * 100) / 100;
+    const remainingBalance = Math.round((totalAmount - existingRefunded) * 100) / 100;
+
+    if (remainingBalance <= 0) {
+      throw new AppError('Payment is already fully refunded', 400, 'PAYMENT_ALREADY_REFUNDED');
+    }
+
+    let parsedAmount: number | undefined = undefined;
+    if (amount !== undefined && amount !== null) {
+      if (typeof amount !== 'number' || isNaN(amount) || !isFinite(amount)) {
+        throw new AppError('Refund amount must be a finite, valid number', 400, 'INVALID_REFUND_AMOUNT');
+      }
+      if (amount <= 0) {
+        throw new AppError('Refund amount must be greater than 0', 400, 'INVALID_REFUND_AMOUNT');
+      }
+      // Decimal precision validation
+      const decimalStr = String(amount).split('.')[1];
+      if (decimalStr && decimalStr.length > 2) {
+        throw new AppError('Refund amount cannot have more than 2 decimal places', 400, 'INVALID_REFUND_PRECISION');
+      }
+      parsedAmount = Math.round(amount * 100) / 100;
+
+      if (parsedAmount > totalAmount) {
+        throw new AppError(
+          `Refund amount (${parsedAmount} ${payment.currency}) exceeds original payment amount (${totalAmount} ${payment.currency})`,
+          400,
+          'REFUND_AMOUNT_EXCEEDS_BALANCE'
+        );
+      }
+      if (parsedAmount > remainingBalance) {
+        throw new AppError(
+          `Refund amount (${parsedAmount} ${payment.currency}) exceeds remaining refundable balance (${remainingBalance} ${payment.currency})`,
+          400,
+          'REFUND_AMOUNT_EXCEEDS_BALANCE'
+        );
+      }
+    }
+
+    const intentToRefund = payment.stripePaymentIntentId;
+    if (!intentToRefund) {
+      throw new AppError('Payment does not have an associated Stripe payment intent', 400, 'STRIPE_INTENT_MISSING');
+    }
+
+    // Process refund through Stripe (source of truth)
+    const stripeResult = await StripeService.refundPayment(intentToRefund, parsedAmount, reason);
+
+    return {
+      success: true,
+      refundId: stripeResult.refundId,
+      status: stripeResult.status,
+      amountRefunded: stripeResult.amountRefunded || parsedAmount || remainingBalance,
+      paymentStatus: payment.status,
+    };
   }
 }
 

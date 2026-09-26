@@ -1360,6 +1360,246 @@ describe('Production Hardening & Integrity Suite', () => {
       await expect(StripeService.refundPayment('pi_test', NaN)).rejects.toThrow('valid, finite number');
       await expect(StripeService.refundPayment('pi_test', Infinity)).rejects.toThrow('valid, finite number');
     });
+
+    it('correctly reverses driver earnings and platform commission across multiple partial refunds (30 -> 20 -> 50)', async () => {
+      // 1. Setup driver and rider
+      const initialDriverEarnings = driverRecord.earningsTotal || 0;
+      const initialDriverWallet = await store.getOrCreateWallet(driverRecord.userId);
+      const initialBalance = initialDriverWallet.balance;
+
+      const ride = await store.createRide({
+        riderId: riderUser.id,
+        driverId: driverRecord.id,
+        status: 'RIDE_COMPLETED',
+        estimatedFare: 100,
+        finalFare: 100,
+        paymentMethod: 'CREDIT_CARD',
+        paymentStatus: 'SUCCEEDED',
+      });
+
+      const intentId = 'pi_multirev_100_' + generateId('pi');
+      await store.createPayment({
+        rideId: ride.id,
+        userId: riderUser.id,
+        amount: 100,
+        currency: 'SAR',
+        status: 'PENDING',
+        paymentMethod: 'CREDIT_CARD',
+        stripePaymentIntentId: intentId,
+      });
+
+      // Settle original payment to driver (80 SAR) & platform (20 SAR)
+      await store.settleStripePaymentSucceeded({
+        paymentIntentId: intentId,
+        eventId: 'evt_orig_settle_' + generateId('evt'),
+      });
+
+      const afterPaymentDriver = await store.findDriverById(driverRecord.id);
+      expect(afterPaymentDriver?.earningsTotal).toBe(initialDriverEarnings + 80);
+
+      // --- Partial Refund #1: 30 SAR ---
+      const ref1 = await store.settleStripeRefund({
+        paymentIntentId: intentId,
+        eventId: 'evt_ref1_' + generateId('evt'),
+        cumulativeAmountRefunded: 30,
+        refundId: 're_1_' + generateId('re'),
+      });
+
+      expect(ref1.success).toBe(true);
+      expect(ref1.isPartial).toBe(true);
+      expect(ref1.status).toBe('PARTIALLY_REFUNDED');
+      expect(ref1.refundDelta).toBe(30);
+
+      const driverAfterRef1 = await store.findDriverById(driverRecord.id);
+      // Driver earnings reversed by 80% of 30 = 24 SAR (new earnings = initial + 80 - 24 = 56)
+      expect(driverAfterRef1?.earningsTotal).toBe(initialDriverEarnings + 56);
+
+      // --- Partial Refund #2: 20 SAR (cumulative 50 SAR) ---
+      const ref2 = await store.settleStripeRefund({
+        paymentIntentId: intentId,
+        eventId: 'evt_ref2_' + generateId('evt'),
+        cumulativeAmountRefunded: 50,
+        refundId: 're_2_' + generateId('re'),
+      });
+
+      expect(ref2.success).toBe(true);
+      expect(ref2.isPartial).toBe(true);
+      expect(ref2.status).toBe('PARTIALLY_REFUNDED');
+      expect(ref2.refundDelta).toBe(20);
+
+      const driverAfterRef2 = await store.findDriverById(driverRecord.id);
+      // Driver earnings reversed by another 80% of 20 = 16 SAR (new earnings = initial + 56 - 16 = 40)
+      expect(driverAfterRef2?.earningsTotal).toBe(initialDriverEarnings + 40);
+
+      // --- Final Refund #3: 50 SAR (cumulative 100 SAR) ---
+      const ref3 = await store.settleStripeRefund({
+        paymentIntentId: intentId,
+        eventId: 'evt_ref3_' + generateId('evt'),
+        cumulativeAmountRefunded: 100,
+        refundId: 're_3_' + generateId('re'),
+      });
+
+      expect(ref3.success).toBe(true);
+      expect(ref3.isPartial).toBe(false);
+      expect(ref3.status).toBe('REFUNDED');
+      expect(ref3.refundDelta).toBe(50);
+
+      const driverAfterRef3 = await store.findDriverById(driverRecord.id);
+      // Full driver earnings reversed back to initial
+      expect(driverAfterRef3?.earningsTotal).toBe(initialDriverEarnings);
+
+      // Check PlatformLedger entries: exactly 3 refund entries with sum = 100
+      const refundLedgers = store.ledger.filter((l) => l.rideId === ride.id && l.type === 'REFUND');
+      expect(refundLedgers.length).toBe(3);
+      expect(refundLedgers[0].amount).toBe(30);
+      expect(refundLedgers[1].amount).toBe(20);
+      expect(refundLedgers[2].amount).toBe(50);
+      const totalRefundedLedger = refundLedgers.reduce((acc, curr) => acc + curr.amount, 0);
+      expect(totalRefundedLedger).toBe(100);
+    });
+
+    it('does NOT create financial refund mutations for pending, failed, or canceled refund webhooks', async () => {
+      const ride = await store.createRide({
+        riderId: riderUser.id,
+        driverId: driverRecord.id,
+        status: 'RIDE_COMPLETED',
+        estimatedFare: 60,
+        finalFare: 60,
+        paymentMethod: 'CREDIT_CARD',
+        paymentStatus: 'SUCCEEDED',
+      });
+
+      const intentId = 'pi_pending_ref_' + generateId('pi');
+      await store.createPayment({
+        rideId: ride.id,
+        userId: riderUser.id,
+        amount: 60,
+        currency: 'SAR',
+        status: 'SUCCEEDED',
+        paymentMethod: 'CREDIT_CARD',
+        stripePaymentIntentId: intentId,
+      });
+
+      const { StripeService } = await import('../server/services/stripeService');
+      const origConstruct = StripeService.constructWebhookEvent;
+
+      // 1. Pending refund webhook
+      const pendingEvent = {
+        id: 'evt_pending_' + generateId('evt'),
+        type: 'refund.created',
+        data: {
+          object: {
+            id: 're_pending_1',
+            object: 'refund',
+            payment_intent: intentId,
+            amount: 6000,
+            status: 'pending',
+          },
+        },
+      };
+
+      StripeService.constructWebhookEvent = () => pendingEvent as any;
+      try {
+        await PaymentService.handleWebhook(JSON.stringify(pendingEvent), 'test_sig', pendingEvent.id);
+
+        // No ledger refund entries must exist
+        let refundLedgers = store.ledger.filter((l) => l.rideId === ride.id && l.type === 'REFUND');
+        expect(refundLedgers.length).toBe(0);
+
+        // Payment status must remain SUCCEEDED
+        let payment = await store.findPaymentByStripeIntent(intentId);
+        expect(payment?.status).toBe('SUCCEEDED');
+
+        // 2. Failed refund webhook
+        const failedEvent = {
+          id: 'evt_failed_' + generateId('evt'),
+          type: 'refund.updated',
+          data: {
+            object: {
+              id: 're_failed_1',
+              object: 'refund',
+              payment_intent: intentId,
+              amount: 6000,
+              status: 'failed',
+            },
+          },
+        };
+        StripeService.constructWebhookEvent = () => failedEvent as any;
+        await PaymentService.handleWebhook(JSON.stringify(failedEvent), 'test_sig', failedEvent.id);
+
+        refundLedgers = store.ledger.filter((l) => l.rideId === ride.id && l.type === 'REFUND');
+        expect(refundLedgers.length).toBe(0);
+
+        // 3. Succeeded refund webhook -> confirms financial mutation!
+        const succeededEvent = {
+          id: 'evt_succeeded_' + generateId('evt'),
+          type: 'refund.updated',
+          data: {
+            object: {
+              id: 're_succeeded_1',
+              object: 'refund',
+              payment_intent: intentId,
+              amount: 6000,
+              status: 'succeeded',
+            },
+          },
+        };
+        StripeService.constructWebhookEvent = () => succeededEvent as any;
+        await PaymentService.handleWebhook(JSON.stringify(succeededEvent), 'test_sig', succeededEvent.id);
+
+        refundLedgers = store.ledger.filter((l) => l.rideId === ride.id && l.type === 'REFUND');
+        expect(refundLedgers.length).toBe(1);
+        expect(refundLedgers[0].amount).toBe(60);
+
+        payment = await store.findPaymentByStripeIntent(intentId);
+        expect(payment?.status).toBe('REFUNDED');
+      } finally {
+        StripeService.constructWebhookEvent = origConstruct;
+      }
+    });
+
+    it('safely routes refund webhook without valid payment_intent to reconciliation (never uses refund.id as intent)', async () => {
+      const { StripeService } = await import('../server/services/stripeService');
+      const origConstruct = StripeService.constructWebhookEvent;
+      const origRetrieve = StripeService.retrieveCharge;
+
+      StripeService.retrieveCharge = async () => {
+        throw new Error('Charge retrieval simulated network error');
+      };
+
+      const orphanRefundEvent = {
+        id: 'evt_orphan_' + generateId('evt'),
+        type: 'refund.updated',
+        data: {
+          object: {
+            id: 're_orphan_refund_id_123',
+            object: 'refund',
+            charge: 'ch_unresolvable',
+            amount: 5000,
+            status: 'succeeded',
+          },
+        },
+      };
+
+      StripeService.constructWebhookEvent = () => orphanRefundEvent as any;
+
+      try {
+        await PaymentService.handleWebhook(JSON.stringify(orphanRefundEvent), 'test_sig', orphanRefundEvent.id);
+
+        // Must NOT create any ledger entry with 're_orphan_refund_id_123'
+        const corruptedLedgers = store.ledger.filter(
+          (l) => l.idempotencyKey?.includes('re_orphan') || l.fromAccount === 're_orphan_refund_id_123'
+        );
+        expect(corruptedLedgers.length).toBe(0);
+
+        // Webhook recorded as REQUIRES_RECONCILIATION
+        const processedEvent = store.webhookEvents.get(orphanRefundEvent.id);
+        expect(processedEvent?.status).toBe('REQUIRES_RECONCILIATION');
+      } finally {
+        StripeService.constructWebhookEvent = origConstruct;
+        StripeService.retrieveCharge = origRetrieve;
+      }
+    });
   });
 });
 

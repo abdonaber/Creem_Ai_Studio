@@ -137,6 +137,7 @@ export interface IDatabaseStore {
   findPaymentById(id: string): Promise<IPayment | null>;
   findPaymentByRideId(rideId: string): Promise<IPayment | null>;
   findPaymentByStripeIntent(intentId: string): Promise<IPayment | null>;
+  findPaymentByStripeCharge(chargeId: string): Promise<IPayment | null>;
   updatePayment(id: string, updates: Partial<IPayment>): Promise<IPayment | null>;
 
   // Webhook Deduplication & Idempotency
@@ -151,7 +152,7 @@ export interface IDatabaseStore {
     source: string,
     type: string,
     payload?: any,
-    status?: 'PROCESSED' | 'FAILED',
+    status?: 'PROCESSED' | 'FAILED' | 'REQUIRES_RECONCILIATION',
     errorMessage?: string
   ): Promise<void>;
 
@@ -189,9 +190,21 @@ export interface IDatabaseStore {
     isPartial: boolean;
     status: PaymentStatus;
   }>;
-
+  trackRefundState(params: {
+    paymentIntentId: string;
+    refundId: string;
+    amount: number;
+    status: 'pending' | 'succeeded' | 'failed' | 'canceled' | 'requires_action';
+    eventId?: string;
+    reason?: string;
+  }): Promise<void>;
 
   // Financial Reconciliation
+  recordReconciliationDiscrepancy(discrepancy: {
+    type: string;
+    id: string;
+    details: string;
+  }): Promise<void>;
   reconcileFinancialIntegrity(): Promise<{
     healthy: boolean;
     discrepanciesCount: number;
@@ -1917,11 +1930,7 @@ export class MongoDatabaseStore implements IDatabaseStore {
     };
   }
 
-  public async findPaymentById(id: string): Promise<IPayment | null> {
-    this.ensureConnection();
-    const query = mongoose.Types.ObjectId.isValid(id) ? { _id: id } : { id };
-    const doc = await PaymentModel.findOne(query).lean();
-    if (!doc) return null;
+  private docToPayment(doc: any): IPayment {
     return {
       id: doc._id.toString(),
       rideId: doc.rideId,
@@ -1931,68 +1940,109 @@ export class MongoDatabaseStore implements IDatabaseStore {
       status: doc.status,
       paymentMethod: doc.paymentMethod,
       stripePaymentIntentId: doc.stripePaymentIntentId,
+      stripeChargeId: doc.stripeChargeId,
       stripeClientSecret: doc.stripeClientSecret,
       idempotencyKey: doc.idempotencyKey,
-      createdAt: doc.createdAt.toISOString(),
+      refundAmount: doc.refundAmount,
+      refunds: doc.refunds?.map((r: any) => ({
+        stripeRefundId: r.stripeRefundId,
+        amount: r.amount,
+        status: r.status,
+        eventId: r.eventId,
+        reason: r.reason,
+        createdAt: r.createdAt instanceof Date ? r.createdAt.toISOString() : String(r.createdAt),
+        updatedAt: r.updatedAt instanceof Date ? r.updatedAt.toISOString() : undefined,
+      })),
+      metadata: doc.metadata,
+      createdAt: doc.createdAt instanceof Date ? doc.createdAt.toISOString() : String(doc.createdAt),
     };
+  }
+
+  public async findPaymentById(id: string): Promise<IPayment | null> {
+    this.ensureConnection();
+    const query = mongoose.Types.ObjectId.isValid(id) ? { _id: id } : { id };
+    const doc = await PaymentModel.findOne(query).lean();
+    return doc ? this.docToPayment(doc) : null;
   }
 
   public async findPaymentByRideId(rideId: string): Promise<IPayment | null> {
     this.ensureConnection();
     const doc = await PaymentModel.findOne({ rideId }).sort({ createdAt: -1 }).lean();
-    if (!doc) return null;
-    return {
-      id: doc._id.toString(),
-      rideId: doc.rideId,
-      userId: doc.userId,
-      amount: doc.amount,
-      currency: doc.currency,
-      status: doc.status,
-      paymentMethod: doc.paymentMethod,
-      stripePaymentIntentId: doc.stripePaymentIntentId,
-      stripeClientSecret: doc.stripeClientSecret,
-      idempotencyKey: doc.idempotencyKey,
-      createdAt: doc.createdAt.toISOString(),
-    };
+    return doc ? this.docToPayment(doc) : null;
   }
 
   public async findPaymentByStripeIntent(intentId: string): Promise<IPayment | null> {
     this.ensureConnection();
     const doc = await PaymentModel.findOne({ stripePaymentIntentId: intentId }).lean();
-    if (!doc) return null;
-    return {
-      id: doc._id.toString(),
-      rideId: doc.rideId,
-      userId: doc.userId,
-      amount: doc.amount,
-      currency: doc.currency,
-      status: doc.status,
-      paymentMethod: doc.paymentMethod,
-      stripePaymentIntentId: doc.stripePaymentIntentId,
-      stripeClientSecret: doc.stripeClientSecret,
-      idempotencyKey: doc.idempotencyKey,
-      createdAt: doc.createdAt.toISOString(),
-    };
+    return doc ? this.docToPayment(doc) : null;
+  }
+
+  public async findPaymentByStripeCharge(chargeId: string): Promise<IPayment | null> {
+    this.ensureConnection();
+    const doc = await PaymentModel.findOne({
+      $or: [
+        { stripeChargeId: chargeId },
+        { 'metadata.stripeChargeId': chargeId },
+        { stripePaymentIntentId: chargeId },
+      ],
+    }).lean();
+    return doc ? this.docToPayment(doc) : null;
+  }
+
+  public async trackRefundState(params: {
+    paymentIntentId: string;
+    refundId: string;
+    amount: number;
+    status: 'pending' | 'succeeded' | 'failed' | 'canceled' | 'requires_action';
+    eventId?: string;
+    reason?: string;
+  }): Promise<void> {
+    this.ensureConnection();
+    const { paymentIntentId, refundId, amount, status, eventId, reason } = params;
+
+    const payment = await PaymentModel.findOne({ stripePaymentIntentId: paymentIntentId });
+    if (!payment) return;
+
+    if (!payment.refunds) payment.refunds = [] as any;
+    const existingIdx = payment.refunds.findIndex((r: any) => r.stripeRefundId === refundId);
+    if (existingIdx >= 0) {
+      payment.refunds[existingIdx].status = status;
+      payment.refunds[existingIdx].amount = amount;
+      if (reason) payment.refunds[existingIdx].reason = reason;
+      if (eventId) payment.refunds[existingIdx].eventId = eventId;
+      payment.refunds[existingIdx].updatedAt = new Date();
+    } else {
+      payment.refunds.push({
+        stripeRefundId: refundId,
+        amount,
+        status,
+        eventId,
+        reason,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      } as any);
+    }
+    await payment.save();
+  }
+
+  public async recordReconciliationDiscrepancy(discrepancy: {
+    type: string;
+    id: string;
+    details: string;
+  }): Promise<void> {
+    this.ensureConnection();
+    await this.logAudit(
+      'system',
+      `RECONCILIATION_FLAG:${discrepancy.type}`,
+      { ...discrepancy }
+    );
   }
 
   public async updatePayment(id: string, updates: Partial<IPayment>): Promise<IPayment | null> {
     this.ensureConnection();
     const query = mongoose.Types.ObjectId.isValid(id) ? { _id: id } : { id };
     const doc = await PaymentModel.findOneAndUpdate(query, { $set: updates }, { new: true }).lean();
-    if (!doc) return null;
-    return {
-      id: doc._id.toString(),
-      rideId: doc.rideId,
-      userId: doc.userId,
-      amount: doc.amount,
-      currency: doc.currency,
-      status: doc.status,
-      paymentMethod: doc.paymentMethod,
-      stripePaymentIntentId: doc.stripePaymentIntentId,
-      stripeClientSecret: doc.stripeClientSecret,
-      idempotencyKey: doc.idempotencyKey,
-      createdAt: doc.createdAt.toISOString(),
-    };
+    return doc ? this.docToPayment(doc) : null;
   }
 
   // ==========================================
@@ -2063,7 +2113,7 @@ export class MongoDatabaseStore implements IDatabaseStore {
     source: string = 'stripe',
     type: string = 'payment_intent.succeeded',
     payload?: any,
-    status: 'PROCESSED' | 'FAILED' = 'PROCESSED',
+    status: 'PROCESSED' | 'FAILED' | 'REQUIRES_RECONCILIATION' = 'PROCESSED',
     errorMessage?: string
   ): Promise<void> {
     this.ensureConnection();
@@ -2357,6 +2407,26 @@ export class MongoDatabaseStore implements IDatabaseStore {
           const existingRefunded = Math.round((payment.refundAmount || 0) * 100) / 100;
           const totalAmount = Math.round(payment.amount * 100) / 100;
 
+          // Unique Stripe Refund ID check to prevent duplicate settlements
+          if (params.refundId && payment.refunds) {
+            const alreadyProcessedRefund = (payment.refunds as any[]).find(
+              (r) => r.stripeRefundId === params.refundId && r.status === 'succeeded'
+            );
+            if (alreadyProcessedRefund) {
+              const isCurrentPartial = existingRefunded < totalAmount && payment.status === 'PARTIALLY_REFUNDED';
+              result = {
+                success: true,
+                paymentId: payment._id.toString(),
+                alreadyRefunded: true,
+                refundAmount: existingRefunded,
+                refundDelta: 0,
+                isPartial: isCurrentPartial,
+                status: payment.status,
+              };
+              return;
+            }
+          }
+
           let targetCumulative: number;
           let delta: number;
 
@@ -2407,6 +2477,15 @@ export class MongoDatabaseStore implements IDatabaseStore {
             return;
           }
 
+          // Strict validation: Decimal precision (maximum 2 decimal places)
+          const decimalPart = String(delta).split('.')[1];
+          if (decimalPart && decimalPart.length > 2) {
+            throw new AppError('Refund amount precision abuse: maximum 2 decimal places allowed for SAR', 400, 'INVALID_REFUND_PRECISION');
+          }
+          if (delta < 0.01) {
+            throw new AppError('Refund amount must be at least 0.01 SAR (smallest currency unit)', 400, 'INVALID_REFUND_AMOUNT');
+          }
+
           if (targetCumulative > totalAmount) {
             throw new AppError(
               `Refund cumulative amount (${targetCumulative} SAR) exceeds original payment amount (${totalAmount} SAR)`,
@@ -2426,29 +2505,151 @@ export class MongoDatabaseStore implements IDatabaseStore {
 
           const isPartial = targetCumulative < totalAmount;
           const newStatus: PaymentStatus = isPartial ? 'PARTIALLY_REFUNDED' : 'REFUNDED';
-
-          // 1. Update Payment status and cumulative refundAmount
-          payment.status = newStatus;
-          payment.refundAmount = targetCumulative;
-          payment.updatedAt = new Date();
-          await payment.save({ session });
-
-          // 2. Update Ride paymentStatus
-          await RideModel.findOneAndUpdate(
-            mongoose.Types.ObjectId.isValid(payment.rideId) ? { _id: payment.rideId } : { id: payment.rideId },
-            {
-              $set: {
-                paymentStatus: newStatus,
-                updatedAt: new Date(),
-              },
-            },
-            { session }
-          );
-
-          // 3. Platform Ledger refund entry recording incremental delta
           const keySuffix = params.refundId ? `ref_${params.refundId}` : `c_${Math.round(targetCumulative * 100)}`;
-          const idempotencyKey = `webhook_${eventId}_refund_${keySuffix}`;
 
+          // Reversal of Driver Earnings and Platform Commission when fare was settled
+          const ride = await RideModel.findById(payment.rideId).session(session);
+          const fareSettled = payment.status === 'SUCCEEDED' || payment.status === 'PARTIALLY_REFUNDED' || (payment.metadata as any)?.settledToDriver;
+
+          if (fareSettled && ride?.driverId) {
+            const driver = await DriverModel.findById(ride.driverId).session(session);
+            if (driver) {
+              const driverReversal = Math.round(delta * 0.8 * 100) / 100;
+              const platformReversal = Math.round((delta - driverReversal) * 100) / 100;
+
+              // 1. Decrement driver earningsTotal
+              const newEarningsTotal = Math.max(0, (driver.earningsTotal || 0) - driverReversal);
+              await DriverModel.findByIdAndUpdate(
+                driver._id,
+                { $set: { earningsTotal: newEarningsTotal } },
+                { session }
+              );
+
+              // 2. Adjust driver wallet or record debt
+              let driverWallet = await WalletModel.findOne({ userId: driver.userId }).session(session);
+              if (!driverWallet) {
+                const created = await WalletModel.create(
+                  [{ _id: new mongoose.Types.ObjectId(), userId: driver.userId, balance: 0, currency: 'SAR' }],
+                  { session }
+                );
+                driverWallet = created[0];
+              }
+
+              const availableWallet = Math.max(0, driverWallet.balance);
+              if (availableWallet >= driverReversal) {
+                const updatedWallet = await WalletModel.findOneAndUpdate(
+                  { userId: driver.userId },
+                  { $inc: { balance: -driverReversal }, $set: { updatedAt: new Date() } },
+                  { session, new: true }
+                );
+
+                await WalletTransactionModel.create(
+                  [
+                    {
+                      _id: new mongoose.Types.ObjectId(),
+                      walletId: updatedWallet!._id.toString(),
+                      userId: driver.userId,
+                      amount: driverReversal,
+                      type: 'DEBIT',
+                      balanceAfter: updatedWallet!.balance,
+                      reason: `Earnings reversal on refund for ride #${payment.rideId.slice(0, 8)}`,
+                      referenceId: payment.rideId,
+                      idempotencyKey: `webhook_${eventId}_driver_wal_${keySuffix}`,
+                    },
+                  ],
+                  { session }
+                );
+              } else {
+                if (availableWallet > 0) {
+                  await WalletModel.findOneAndUpdate(
+                    { userId: driver.userId },
+                    { $set: { balance: 0, updatedAt: new Date() } },
+                    { session }
+                  );
+
+                  await WalletTransactionModel.create(
+                    [
+                      {
+                        _id: new mongoose.Types.ObjectId(),
+                        walletId: driverWallet._id.toString(),
+                        userId: driver.userId,
+                        amount: availableWallet,
+                        type: 'DEBIT',
+                        balanceAfter: 0,
+                        reason: `Partial earnings reversal on refund for ride #${payment.rideId.slice(0, 8)}`,
+                        referenceId: payment.rideId,
+                        idempotencyKey: `webhook_${eventId}_driver_wal_part_${keySuffix}`,
+                      },
+                    ],
+                    { session }
+                  );
+                }
+
+                const debtIncurred = Math.round((driverReversal - availableWallet) * 100) / 100;
+                await DriverModel.findByIdAndUpdate(
+                  driver._id,
+                  { $inc: { outstandingDebt: debtIncurred } },
+                  { session }
+                );
+
+                await PlatformLedgerModel.create(
+                  [
+                    {
+                      _id: new mongoose.Types.ObjectId(),
+                      rideId: payment.rideId,
+                      type: 'COMMISSION_DEBT',
+                      amount: debtIncurred,
+                      currency: payment.currency || 'SAR',
+                      fromAccount: `driver:${driver._id.toString()}`,
+                      toAccount: 'platform:debt',
+                      status: 'OUTSTANDING',
+                      idempotencyKey: `webhook_${eventId}_driver_debt_${keySuffix}`,
+                    },
+                  ],
+                  { session }
+                );
+              }
+
+              // 3. Compensating Driver Reversal entry into PlatformLedger (funds return to escrow)
+              await PlatformLedgerModel.create(
+                [
+                  {
+                    _id: new mongoose.Types.ObjectId(),
+                    rideId: payment.rideId,
+                    type: 'DRIVER_EARNING',
+                    amount: driverReversal,
+                    currency: payment.currency || 'SAR',
+                    fromAccount: `driver:${driver._id.toString()}`,
+                    toAccount: 'platform:escrow',
+                    status: 'SETTLED',
+                    idempotencyKey: `webhook_${eventId}_driver_rev_${keySuffix}`,
+                  },
+                ],
+                { session }
+              );
+
+              // 4. Platform Commission Reversal into PlatformLedger (funds return to escrow)
+              await PlatformLedgerModel.create(
+                [
+                  {
+                    _id: new mongoose.Types.ObjectId(),
+                    rideId: payment.rideId,
+                    type: 'PLATFORM_COMMISSION',
+                    amount: platformReversal,
+                    currency: payment.currency || 'SAR',
+                    fromAccount: 'platform:revenue',
+                    toAccount: 'platform:escrow',
+                    status: 'SETTLED',
+                    idempotencyKey: `webhook_${eventId}_comm_rev_${keySuffix}`,
+                  },
+                ],
+                { session }
+              );
+            }
+          }
+
+          // 5. Rider Refund entry from escrow
+          const idempotencyKey = `webhook_${eventId}_refund_${keySuffix}`;
           await PlatformLedgerModel.create(
             [
               {
@@ -2463,6 +2664,45 @@ export class MongoDatabaseStore implements IDatabaseStore {
                 idempotencyKey,
               },
             ],
+            { session }
+          );
+
+          // 6. Update Payment status and cumulative refundAmount and track refunds array
+          payment.status = newStatus;
+          payment.refundAmount = targetCumulative;
+          payment.updatedAt = new Date();
+
+          if (!payment.refunds) payment.refunds = [] as any;
+          const rIdx = payment.refunds.findIndex(
+            (r: any) => r.stripeRefundId === (params.refundId || keySuffix)
+          );
+          if (rIdx >= 0) {
+            payment.refunds[rIdx].status = 'succeeded';
+            payment.refunds[rIdx].amount = delta;
+            payment.refunds[rIdx].updatedAt = new Date();
+          } else {
+            payment.refunds.push({
+              stripeRefundId: params.refundId || keySuffix,
+              amount: delta,
+              status: 'succeeded',
+              eventId,
+              reason: params.reason,
+              createdAt: new Date(),
+              updatedAt: new Date(),
+            } as any);
+          }
+
+          await payment.save({ session });
+
+          // 7. Update Ride paymentStatus
+          await RideModel.findOneAndUpdate(
+            mongoose.Types.ObjectId.isValid(payment.rideId) ? { _id: payment.rideId } : { id: payment.rideId },
+            {
+              $set: {
+                paymentStatus: newStatus,
+                updatedAt: new Date(),
+              },
+            },
             { session }
           );
 
@@ -2513,6 +2753,25 @@ export class MongoDatabaseStore implements IDatabaseStore {
     const existingRefunded = Math.round(((payment as any).refundAmount || 0) * 100) / 100;
     const totalAmount = Math.round(payment.amount * 100) / 100;
 
+    // Unique Stripe Refund ID check to prevent duplicate settlements
+    if (params.refundId && payment.refunds) {
+      const alreadyProcessedRefund = (payment.refunds as any[]).find(
+        (r) => r.stripeRefundId === params.refundId && r.status === 'succeeded'
+      );
+      if (alreadyProcessedRefund) {
+        const isCurrentPartial = existingRefunded < totalAmount && payment.status === 'PARTIALLY_REFUNDED';
+        return {
+          success: true,
+          paymentId: payment.id,
+          alreadyRefunded: true,
+          refundAmount: existingRefunded,
+          refundDelta: 0,
+          isPartial: isCurrentPartial,
+          status: payment.status,
+        };
+      }
+    }
+
     let targetCumulative: number;
     let delta: number;
 
@@ -2561,6 +2820,14 @@ export class MongoDatabaseStore implements IDatabaseStore {
       };
     }
 
+    const decimalPart = String(delta).split('.')[1];
+    if (decimalPart && decimalPart.length > 2) {
+      throw new AppError('Refund amount precision abuse: maximum 2 decimal places allowed for SAR', 400, 'INVALID_REFUND_PRECISION');
+    }
+    if (delta < 0.01) {
+      throw new AppError('Refund amount must be at least 0.01 SAR (smallest currency unit)', 400, 'INVALID_REFUND_AMOUNT');
+    }
+
     if (targetCumulative > totalAmount) {
       throw new AppError(
         `Refund cumulative amount (${targetCumulative} SAR) exceeds original payment amount (${totalAmount} SAR)`,
@@ -2580,13 +2847,82 @@ export class MongoDatabaseStore implements IDatabaseStore {
 
     const isPartial = targetCumulative < totalAmount;
     const newStatus: PaymentStatus = isPartial ? 'PARTIALLY_REFUNDED' : 'REFUNDED';
-
-    await this.updatePayment(payment.id, { status: newStatus, refundAmount: targetCumulative } as any);
-    await this.updateRide(payment.rideId, { paymentStatus: newStatus });
-
     const keySuffix = params.refundId ? `ref_${params.refundId}` : `c_${Math.round(targetCumulative * 100)}`;
-    const idempotencyKey = `webhook_${eventId}_refund_${keySuffix}`;
 
+    const ride = await this.findRideById(payment.rideId);
+    const fareSettled = payment.status === 'SUCCEEDED' || payment.status === 'PARTIALLY_REFUNDED' || (payment.metadata as any)?.settledToDriver;
+
+    if (fareSettled && ride?.driverId) {
+      const driver = await this.findDriverById(ride.driverId);
+      if (driver) {
+        const driverReversal = Math.round(delta * 0.8 * 100) / 100;
+        const platformReversal = Math.round((delta - driverReversal) * 100) / 100;
+
+        const newEarningsTotal = Math.max(0, (driver.earningsTotal || 0) - driverReversal);
+        await this.updateDriver(driver.id, { earningsTotal: newEarningsTotal });
+
+        const driverWallet = await this.getOrCreateWallet(driver.userId);
+        if (driverWallet.balance >= driverReversal) {
+          await this.debitWallet(
+            driver.userId,
+            driverReversal,
+            `Earnings reversal on refund for ride #${payment.rideId.slice(0, 8)}`,
+            payment.rideId,
+            `webhook_${eventId}_driver_wal_${keySuffix}`
+          );
+        } else {
+          const available = Math.max(0, driverWallet.balance);
+          if (available > 0) {
+            await this.debitWallet(
+              driver.userId,
+              available,
+              `Partial earnings reversal on refund for ride #${payment.rideId.slice(0, 8)}`,
+              payment.rideId,
+              `webhook_${eventId}_driver_wal_part_${keySuffix}`
+            );
+          }
+          const debtIncurred = Math.round((driverReversal - available) * 100) / 100;
+          await this.updateDriver(driver.id, {
+            outstandingDebt: (driver.outstandingDebt || 0) + debtIncurred,
+          });
+
+          await this.recordLedgerEntry({
+            rideId: payment.rideId,
+            type: 'COMMISSION_DEBT',
+            amount: debtIncurred,
+            currency: payment.currency || 'SAR',
+            fromAccount: `driver:${driver.id}`,
+            toAccount: 'platform:debt',
+            status: 'OUTSTANDING',
+            idempotencyKey: `webhook_${eventId}_driver_debt_${keySuffix}`,
+          });
+        }
+
+        await this.recordLedgerEntry({
+          rideId: payment.rideId,
+          type: 'DRIVER_EARNING',
+          amount: driverReversal,
+          currency: payment.currency || 'SAR',
+          fromAccount: `driver:${driver.id}`,
+          toAccount: 'platform:escrow',
+          status: 'SETTLED',
+          idempotencyKey: `webhook_${eventId}_driver_rev_${keySuffix}`,
+        });
+
+        await this.recordLedgerEntry({
+          rideId: payment.rideId,
+          type: 'PLATFORM_COMMISSION',
+          amount: platformReversal,
+          currency: payment.currency || 'SAR',
+          fromAccount: 'platform:revenue',
+          toAccount: 'platform:escrow',
+          status: 'SETTLED',
+          idempotencyKey: `webhook_${eventId}_comm_rev_${keySuffix}`,
+        });
+      }
+    }
+
+    const idempotencyKey = `webhook_${eventId}_refund_${keySuffix}`;
     await this.recordLedgerEntry({
       rideId: payment.rideId,
       type: 'REFUND',
@@ -2597,6 +2933,29 @@ export class MongoDatabaseStore implements IDatabaseStore {
       status: 'SETTLED',
       idempotencyKey,
     });
+
+    const refundsList = payment.refunds ? [...payment.refunds] : [];
+    const rIdx = refundsList.findIndex((r) => r.stripeRefundId === (params.refundId || keySuffix));
+    if (rIdx >= 0) {
+      refundsList[rIdx].status = 'succeeded';
+      refundsList[rIdx].amount = delta;
+    } else {
+      refundsList.push({
+        stripeRefundId: params.refundId || keySuffix,
+        amount: delta,
+        status: 'succeeded',
+        eventId,
+        reason: params.reason,
+        createdAt: new Date().toISOString(),
+      });
+    }
+
+    await this.updatePayment(payment.id, {
+      status: newStatus,
+      refundAmount: targetCumulative,
+      refunds: refundsList,
+    } as any);
+    await this.updateRide(payment.rideId, { paymentStatus: newStatus });
 
     return {
       success: true,
@@ -3170,13 +3529,17 @@ export class MongoDatabaseStore implements IDatabaseStore {
       const settledDriverRides = await RideModel.find({
         driverId: driver._id.toString(),
         status: 'RIDE_COMPLETED',
-        paymentStatus: 'SUCCEEDED',
+        paymentStatus: { $in: ['SUCCEEDED', 'PARTIALLY_REFUNDED'] },
       }).lean();
 
-      const expectedEarnings = settledDriverRides.reduce((acc, r) => {
+      let expectedEarnings = 0;
+      for (const r of settledDriverRides) {
+        const payment = await PaymentModel.findOne({ rideId: r._id.toString() }).lean();
         const fare = r.finalFare ?? r.estimatedFare ?? 0;
-        return acc + Math.round(fare * 0.8 * 100) / 100;
-      }, 0);
+        const refunded = payment?.refundAmount || 0;
+        const netFare = Math.max(0, fare - refunded);
+        expectedEarnings += Math.round(netFare * 0.8 * 100) / 100;
+      }
 
       const diff = Math.abs((driver.earningsTotal || 0) - expectedEarnings);
       if (diff > 0.1) {
@@ -3191,18 +3554,27 @@ export class MongoDatabaseStore implements IDatabaseStore {
     // 5. Audit Platform Commission in Ledger vs Settled Rides
     const settledRides = await RideModel.find({
       status: 'RIDE_COMPLETED',
-      paymentStatus: 'SUCCEEDED',
+      paymentStatus: { $in: ['SUCCEEDED', 'PARTIALLY_REFUNDED'] },
     }).lean();
 
-    const expectedTotalCommission = settledRides.reduce((acc, r) => {
+    let expectedTotalCommission = 0;
+    for (const r of settledRides) {
+      const payment = await PaymentModel.findOne({ rideId: r._id.toString() }).lean();
       const fare = r.finalFare ?? r.estimatedFare ?? 0;
-      return acc + Math.round(fare * 0.2 * 100) / 100;
-    }, 0);
+      const refunded = payment?.refundAmount || 0;
+      const netFare = Math.max(0, fare - refunded);
+      expectedTotalCommission += Math.round(netFare * 0.2 * 100) / 100;
+    }
 
     const commissionLedgers = await PlatformLedgerModel.find({
       type: 'PLATFORM_COMMISSION',
     }).lean();
-    const recordedCommission = commissionLedgers.reduce((acc, l) => acc + (l.amount || 0), 0);
+    const recordedCommission = commissionLedgers.reduce((acc, l) => {
+      if (l.fromAccount === 'platform:revenue' && l.toAccount === 'platform:escrow') {
+        return acc - (l.amount || 0); // Commission reversal on refund
+      }
+      return acc + (l.amount || 0);
+    }, 0);
 
     if (Math.abs(expectedTotalCommission - recordedCommission) > 0.1) {
       discrepancies.push({
