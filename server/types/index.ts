@@ -14,7 +14,15 @@ export type RideStatus =
   | 'CANCELLED'
   | 'NO_DRIVER_FOUND';
 
-export type PaymentStatus = 'PENDING' | 'PROCESSING' | 'SUCCEEDED' | 'FAILED' | 'REFUNDED' | 'REQUIRES_RECONCILIATION';
+export type PaymentStatus =
+  | 'PENDING'
+  | 'PROCESSING'
+  | 'SUCCEEDED'
+  | 'FAILED'
+  | 'REFUNDED'
+  | 'PARTIALLY_REFUNDED'
+  | 'CANCELED'
+  | 'REQUIRES_RECONCILIATION';
 export type PaymentMethod = 'WALLET' | 'CASH' | 'CREDIT_CARD';
 
 export interface LocationCoordinate {

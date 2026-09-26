@@ -243,30 +243,63 @@ export class PaymentService {
             });
           }
         }
-      } else if (event.type === 'charge.refunded' || event.type === 'payment_intent.canceled') {
+      } else if (event.type === 'payment_intent.canceled') {
+        // CANCELLATION IS NOT A REFUND: Never record a REFUND ledger entry for an uncaptured/canceled PaymentIntent
+        const paymentIntent = event.data.object as any;
+        const payment = await db.findPaymentByStripeIntent(paymentIntent.id);
+        if (payment && payment.status !== 'SUCCEEDED' && payment.status !== 'REFUNDED' && payment.status !== 'PARTIALLY_REFUNDED') {
+          await db.updatePayment(payment.id, { status: 'CANCELED' });
+          await db.updateRide(payment.rideId, { paymentStatus: 'FAILED' });
+          if (io) {
+            io.to(`ride:${payment.rideId}`).emit('ride:payment_failed', {
+              rideId: payment.rideId,
+              status: 'CANCELED',
+              reason: paymentIntent.cancellation_reason || 'Payment intent was canceled',
+            });
+          }
+        }
+      } else if (event.type === 'charge.refunded' || event.type === 'refund.created' || event.type === 'refund.updated') {
         const obj = event.data.object as any;
-        const paymentIntentId = obj.payment_intent || obj.id;
-        const refundAmount = obj.amount_refunded
-          ? obj.amount_refunded / 100
-          : obj.amount
-          ? obj.amount / 100
-          : undefined;
+        const paymentIntentId = obj.payment_intent || (obj.object === 'payment_intent' ? obj.id : undefined) || obj.id;
+
+        // Stripe is the source of truth for refund amounts
+        let cumulativeAmountRefunded: number | undefined = undefined;
+        let refundDelta: number | undefined = undefined;
+
+        if (obj.amount_refunded !== undefined && obj.amount_refunded !== null) {
+          // Stripe Charge object provides cumulative amount_refunded in cents
+          cumulativeAmountRefunded = Math.round(Number(obj.amount_refunded)) / 100;
+        } else if (obj.object === 'refund' && obj.amount !== undefined) {
+          // Stripe Refund object provides individual refund amount in cents
+          refundDelta = Math.round(Number(obj.amount)) / 100;
+        } else if (obj.amount !== undefined) {
+          refundDelta = Math.round(Number(obj.amount)) / 100;
+        }
+
+        const refundId = obj.refunds?.data?.[0]?.id || (obj.object === 'refund' ? obj.id : undefined);
+        const currency = obj.currency ? String(obj.currency).toUpperCase() : undefined;
 
         const settleResult = await db.settleStripeRefund({
           paymentIntentId,
           eventId: effectiveEventId,
-          refundAmount,
-          reason: obj.cancellation_reason || obj.reason,
+          cumulativeAmountRefunded,
+          refundDelta,
+          refundAmount: cumulativeAmountRefunded,
+          currency,
+          refundId,
+          reason: obj.cancellation_reason || obj.reason || obj.failure_reason,
         });
 
-        // Only emit socket side-effect once (idempotent, no double socket emits on duplicate webhooks)
-        if (io && settleResult.success && !settleResult.alreadyRefunded) {
+        // Only emit socket side-effect once per real financial mutation (strictly idempotent)
+        if (io && settleResult.success && !settleResult.alreadyRefunded && (settleResult.refundDelta ?? 1) > 0) {
           const payment = await db.findPaymentByStripeIntent(paymentIntentId);
           if (payment) {
             io.to(`ride:${payment.rideId}`).emit('ride:payment_refunded', {
               rideId: payment.rideId,
-              status: 'REFUNDED',
+              status: settleResult.status || payment.status,
               amount: settleResult.refundAmount,
+              refundDelta: settleResult.refundDelta,
+              isPartial: settleResult.isPartial,
             });
           }
         }

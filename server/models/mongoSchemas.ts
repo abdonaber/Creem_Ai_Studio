@@ -232,7 +232,7 @@ export const RideSchema = new Schema<IRideDocument>(
     },
     paymentStatus: {
       type: String,
-      enum: ['PENDING', 'PROCESSING', 'SUCCEEDED', 'FAILED', 'REFUNDED', 'REQUIRES_RECONCILIATION'],
+      enum: ['PENDING', 'PROCESSING', 'SUCCEEDED', 'FAILED', 'REFUNDED', 'PARTIALLY_REFUNDED', 'CANCELED', 'REQUIRES_RECONCILIATION'],
       default: 'PENDING',
     },
     cancellationReason: String,
@@ -353,7 +353,15 @@ export interface IPaymentDocument extends Document {
   userId: string;
   amount: number;
   currency: string;
-  status: 'PENDING' | 'SUCCEEDED' | 'FAILED' | 'REFUNDED';
+  status:
+    | 'PENDING'
+    | 'PROCESSING'
+    | 'SUCCEEDED'
+    | 'FAILED'
+    | 'REFUNDED'
+    | 'PARTIALLY_REFUNDED'
+    | 'CANCELED'
+    | 'REQUIRES_RECONCILIATION';
   paymentMethod: 'WALLET' | 'CASH' | 'CREDIT_CARD';
   stripePaymentIntentId?: string;
   stripeClientSecret?: string;
@@ -372,7 +380,16 @@ export const PaymentSchema = new Schema<IPaymentDocument>(
     currency: { type: String, default: 'SAR' },
     status: {
       type: String,
-      enum: ['PENDING', 'PROCESSING', 'SUCCEEDED', 'FAILED', 'REFUNDED', 'REQUIRES_RECONCILIATION'],
+      enum: [
+        'PENDING',
+        'PROCESSING',
+        'SUCCEEDED',
+        'FAILED',
+        'REFUNDED',
+        'PARTIALLY_REFUNDED',
+        'CANCELED',
+        'REQUIRES_RECONCILIATION',
+      ],
       default: 'PENDING',
     },
     paymentMethod: {

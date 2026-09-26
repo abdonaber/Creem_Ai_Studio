@@ -36,6 +36,7 @@ import {
   IPlatformLedger,
   RideStatus,
   VehicleCategory,
+  PaymentStatus,
 } from '../types';
 import { AppError } from '../middleware/errorHandler';
 
@@ -174,8 +175,20 @@ export interface IDatabaseStore {
     paymentIntentId: string;
     eventId: string;
     refundAmount?: number;
+    cumulativeAmountRefunded?: number;
+    refundDelta?: number;
     reason?: string;
-  }): Promise<{ success: boolean; paymentId: string; alreadyRefunded?: boolean; refundAmount: number }>;
+    currency?: string;
+    refundId?: string;
+  }): Promise<{
+    success: boolean;
+    paymentId: string;
+    alreadyRefunded?: boolean;
+    refundAmount: number;
+    refundDelta: number;
+    isPartial: boolean;
+    status: PaymentStatus;
+  }>;
 
 
   // Financial Reconciliation
@@ -2289,8 +2302,20 @@ export class MongoDatabaseStore implements IDatabaseStore {
     paymentIntentId: string;
     eventId: string;
     refundAmount?: number;
+    cumulativeAmountRefunded?: number;
+    refundDelta?: number;
     reason?: string;
-  }): Promise<{ success: boolean; paymentId: string; alreadyRefunded?: boolean; refundAmount: number }> {
+    currency?: string;
+    refundId?: string;
+  }): Promise<{
+    success: boolean;
+    paymentId: string;
+    alreadyRefunded?: boolean;
+    refundAmount: number;
+    refundDelta: number;
+    isPartial: boolean;
+    status: PaymentStatus;
+  }> {
     this.ensureConnection();
     const { paymentIntentId, eventId } = params;
 
@@ -2305,56 +2330,137 @@ export class MongoDatabaseStore implements IDatabaseStore {
 
     if (session) {
       try {
-        let result: { success: boolean; paymentId: string; alreadyRefunded?: boolean; refundAmount: number } | null = null;
+        let result: {
+          success: boolean;
+          paymentId: string;
+          alreadyRefunded?: boolean;
+          refundAmount: number;
+          refundDelta: number;
+          isPartial: boolean;
+          status: PaymentStatus;
+        } | null = null;
+
         await session.withTransaction(async () => {
           const payment = await PaymentModel.findOne({ stripePaymentIntentId: paymentIntentId }).session(session);
           if (!payment) {
             throw new AppError(`Payment not found for Stripe intent ${paymentIntentId}`, 404, 'PAYMENT_NOT_FOUND');
           }
 
-          if (payment.status === 'REFUNDED') {
+          if (params.currency && payment.currency && params.currency.toUpperCase() !== payment.currency.toUpperCase()) {
+            throw new AppError(
+              `Refund currency ${params.currency} does not match payment currency ${payment.currency}`,
+              400,
+              'CURRENCY_MISMATCH'
+            );
+          }
+
+          const existingRefunded = Math.round((payment.refundAmount || 0) * 100) / 100;
+          const totalAmount = Math.round(payment.amount * 100) / 100;
+
+          let targetCumulative: number;
+          let delta: number;
+
+          if (params.cumulativeAmountRefunded !== undefined && params.cumulativeAmountRefunded !== null) {
+            if (typeof params.cumulativeAmountRefunded !== 'number' || isNaN(params.cumulativeAmountRefunded) || !isFinite(params.cumulativeAmountRefunded)) {
+              throw new AppError('Provided refund amount must be a finite, valid number', 400, 'INVALID_REFUND_AMOUNT');
+            }
+            if (params.cumulativeAmountRefunded < 0) {
+              throw new AppError('Refund amount cannot be negative', 400, 'INVALID_REFUND_AMOUNT');
+            }
+            targetCumulative = Math.round(params.cumulativeAmountRefunded * 100) / 100;
+            delta = Math.round((targetCumulative - existingRefunded) * 100) / 100;
+          } else if (params.refundDelta !== undefined && params.refundDelta !== null) {
+            if (typeof params.refundDelta !== 'number' || isNaN(params.refundDelta) || !isFinite(params.refundDelta)) {
+              throw new AppError('Provided refund delta must be a finite, valid number', 400, 'INVALID_REFUND_AMOUNT');
+            }
+            if (params.refundDelta <= 0) {
+              throw new AppError('Refund delta must be greater than 0', 400, 'INVALID_REFUND_AMOUNT');
+            }
+            delta = Math.round(params.refundDelta * 100) / 100;
+            targetCumulative = Math.round((existingRefunded + delta) * 100) / 100;
+          } else if (params.refundAmount !== undefined && params.refundAmount !== null) {
+            if (typeof params.refundAmount !== 'number' || isNaN(params.refundAmount) || !isFinite(params.refundAmount)) {
+              throw new AppError('Provided refund amount must be a finite, valid number', 400, 'INVALID_REFUND_AMOUNT');
+            }
+            if (params.refundAmount <= 0) {
+              throw new AppError('Refund amount must be greater than 0', 400, 'INVALID_REFUND_AMOUNT');
+            }
+            targetCumulative = Math.round(params.refundAmount * 100) / 100;
+            delta = Math.round((targetCumulative - existingRefunded) * 100) / 100;
+          } else {
+            delta = Math.round((totalAmount - existingRefunded) * 100) / 100;
+            targetCumulative = totalAmount;
+          }
+
+          // Idempotency: If delta <= 0 or already fully refunded, no mutation
+          if (delta <= 0 || (payment.status === 'REFUNDED' && existingRefunded >= totalAmount)) {
+            const isCurrentPartial = existingRefunded < totalAmount && payment.status === 'PARTIALLY_REFUNDED';
             result = {
               success: true,
               paymentId: payment._id.toString(),
               alreadyRefunded: true,
-              refundAmount: payment.refundAmount || payment.amount,
+              refundAmount: existingRefunded,
+              refundDelta: 0,
+              isPartial: isCurrentPartial,
+              status: payment.status,
             };
             return;
           }
 
-          const refundAmount = params.refundAmount !== undefined ? Number(params.refundAmount) : payment.amount;
+          if (targetCumulative > totalAmount) {
+            throw new AppError(
+              `Refund cumulative amount (${targetCumulative} SAR) exceeds original payment amount (${totalAmount} SAR)`,
+              400,
+              'REFUND_AMOUNT_EXCEEDS_BALANCE'
+            );
+          }
 
-          // 1. Mark payment REFUNDED
-          payment.status = 'REFUNDED';
-          payment.refundAmount = refundAmount;
+          const remainingBalance = Math.round((totalAmount - existingRefunded) * 100) / 100;
+          if (delta > remainingBalance) {
+            throw new AppError(
+              `Refund delta (${delta} SAR) exceeds remaining refundable balance (${remainingBalance} SAR)`,
+              400,
+              'REFUND_AMOUNT_EXCEEDS_BALANCE'
+            );
+          }
+
+          const isPartial = targetCumulative < totalAmount;
+          const newStatus: PaymentStatus = isPartial ? 'PARTIALLY_REFUNDED' : 'REFUNDED';
+
+          // 1. Update Payment status and cumulative refundAmount
+          payment.status = newStatus;
+          payment.refundAmount = targetCumulative;
           payment.updatedAt = new Date();
           await payment.save({ session });
 
-          // 2. Mark ride REFUNDED
+          // 2. Update Ride paymentStatus
           await RideModel.findOneAndUpdate(
             mongoose.Types.ObjectId.isValid(payment.rideId) ? { _id: payment.rideId } : { id: payment.rideId },
             {
               $set: {
-                paymentStatus: 'REFUNDED',
+                paymentStatus: newStatus,
                 updatedAt: new Date(),
               },
             },
             { session }
           );
 
-          // 3. Platform Ledger refund entry
+          // 3. Platform Ledger refund entry recording incremental delta
+          const keySuffix = params.refundId ? `ref_${params.refundId}` : `c_${Math.round(targetCumulative * 100)}`;
+          const idempotencyKey = `webhook_${eventId}_refund_${keySuffix}`;
+
           await PlatformLedgerModel.create(
             [
               {
                 _id: new mongoose.Types.ObjectId(),
                 rideId: payment.rideId,
                 type: 'REFUND',
-                amount: refundAmount,
+                amount: delta,
                 currency: payment.currency || 'SAR',
                 fromAccount: 'platform:escrow',
                 toAccount: `rider:${payment.userId}`,
                 status: 'SETTLED',
-                idempotencyKey: `webhook_${eventId}_refund`,
+                idempotencyKey,
               },
             ],
             { session }
@@ -2364,7 +2470,10 @@ export class MongoDatabaseStore implements IDatabaseStore {
             success: true,
             paymentId: payment._id.toString(),
             alreadyRefunded: false,
-            refundAmount,
+            refundAmount: targetCumulative,
+            refundDelta: delta,
+            isPartial,
+            status: newStatus,
           };
         });
 
@@ -2391,35 +2500,112 @@ export class MongoDatabaseStore implements IDatabaseStore {
 
     // Fallback for standalone Mongo development environment
     const payment = await this.findPaymentByStripeIntent(paymentIntentId);
-    if (!payment) throw new AppError('Payment not found', 404, 'PAYMENT_NOT_FOUND');
-    if (payment.status === 'REFUNDED') {
+    if (!payment) throw new AppError(`Payment not found for Stripe intent ${paymentIntentId}`, 404, 'PAYMENT_NOT_FOUND');
+
+    if (params.currency && payment.currency && params.currency.toUpperCase() !== payment.currency.toUpperCase()) {
+      throw new AppError(
+        `Refund currency ${params.currency} does not match payment currency ${payment.currency}`,
+        400,
+        'CURRENCY_MISMATCH'
+      );
+    }
+
+    const existingRefunded = Math.round(((payment as any).refundAmount || 0) * 100) / 100;
+    const totalAmount = Math.round(payment.amount * 100) / 100;
+
+    let targetCumulative: number;
+    let delta: number;
+
+    if (params.cumulativeAmountRefunded !== undefined && params.cumulativeAmountRefunded !== null) {
+      if (typeof params.cumulativeAmountRefunded !== 'number' || isNaN(params.cumulativeAmountRefunded) || !isFinite(params.cumulativeAmountRefunded)) {
+        throw new AppError('Provided refund amount must be a finite, valid number', 400, 'INVALID_REFUND_AMOUNT');
+      }
+      if (params.cumulativeAmountRefunded < 0) {
+        throw new AppError('Refund amount cannot be negative', 400, 'INVALID_REFUND_AMOUNT');
+      }
+      targetCumulative = Math.round(params.cumulativeAmountRefunded * 100) / 100;
+      delta = Math.round((targetCumulative - existingRefunded) * 100) / 100;
+    } else if (params.refundDelta !== undefined && params.refundDelta !== null) {
+      if (typeof params.refundDelta !== 'number' || isNaN(params.refundDelta) || !isFinite(params.refundDelta)) {
+        throw new AppError('Provided refund delta must be a finite, valid number', 400, 'INVALID_REFUND_AMOUNT');
+      }
+      if (params.refundDelta <= 0) {
+        throw new AppError('Refund delta must be greater than 0', 400, 'INVALID_REFUND_AMOUNT');
+      }
+      delta = Math.round(params.refundDelta * 100) / 100;
+      targetCumulative = Math.round((existingRefunded + delta) * 100) / 100;
+    } else if (params.refundAmount !== undefined && params.refundAmount !== null) {
+      if (typeof params.refundAmount !== 'number' || isNaN(params.refundAmount) || !isFinite(params.refundAmount)) {
+        throw new AppError('Provided refund amount must be a finite, valid number', 400, 'INVALID_REFUND_AMOUNT');
+      }
+      if (params.refundAmount <= 0) {
+        throw new AppError('Refund amount must be greater than 0', 400, 'INVALID_REFUND_AMOUNT');
+      }
+      targetCumulative = Math.round(params.refundAmount * 100) / 100;
+      delta = Math.round((targetCumulative - existingRefunded) * 100) / 100;
+    } else {
+      delta = Math.round((totalAmount - existingRefunded) * 100) / 100;
+      targetCumulative = totalAmount;
+    }
+
+    if (delta <= 0 || (payment.status === 'REFUNDED' && existingRefunded >= totalAmount)) {
+      const isCurrentPartial = existingRefunded < totalAmount && payment.status === 'PARTIALLY_REFUNDED';
       return {
         success: true,
         paymentId: payment.id,
         alreadyRefunded: true,
-        refundAmount: (payment as any).refundAmount || payment.amount,
+        refundAmount: existingRefunded,
+        refundDelta: 0,
+        isPartial: isCurrentPartial,
+        status: payment.status,
       };
     }
 
-    const refundAmount = params.refundAmount !== undefined ? Number(params.refundAmount) : payment.amount;
-    await this.updatePayment(payment.id, { status: 'REFUNDED', refundAmount } as any);
-    await this.updateRide(payment.rideId, { paymentStatus: 'REFUNDED' });
+    if (targetCumulative > totalAmount) {
+      throw new AppError(
+        `Refund cumulative amount (${targetCumulative} SAR) exceeds original payment amount (${totalAmount} SAR)`,
+        400,
+        'REFUND_AMOUNT_EXCEEDS_BALANCE'
+      );
+    }
+
+    const remainingBalance = Math.round((totalAmount - existingRefunded) * 100) / 100;
+    if (delta > remainingBalance) {
+      throw new AppError(
+        `Refund delta (${delta} SAR) exceeds remaining refundable balance (${remainingBalance} SAR)`,
+        400,
+        'REFUND_AMOUNT_EXCEEDS_BALANCE'
+      );
+    }
+
+    const isPartial = targetCumulative < totalAmount;
+    const newStatus: PaymentStatus = isPartial ? 'PARTIALLY_REFUNDED' : 'REFUNDED';
+
+    await this.updatePayment(payment.id, { status: newStatus, refundAmount: targetCumulative } as any);
+    await this.updateRide(payment.rideId, { paymentStatus: newStatus });
+
+    const keySuffix = params.refundId ? `ref_${params.refundId}` : `c_${Math.round(targetCumulative * 100)}`;
+    const idempotencyKey = `webhook_${eventId}_refund_${keySuffix}`;
+
     await this.recordLedgerEntry({
       rideId: payment.rideId,
       type: 'REFUND',
-      amount: refundAmount,
+      amount: delta,
       currency: payment.currency || 'SAR',
       fromAccount: 'platform:escrow',
       toAccount: `rider:${payment.userId}`,
       status: 'SETTLED',
-      idempotencyKey: `webhook_${eventId}_refund`,
+      idempotencyKey,
     });
 
     return {
       success: true,
       paymentId: payment.id,
       alreadyRefunded: false,
-      refundAmount,
+      refundAmount: targetCumulative,
+      refundDelta: delta,
+      isPartial,
+      status: newStatus,
     };
   }
 

@@ -1017,6 +1017,349 @@ describe('Production Hardening & Integrity Suite', () => {
         })
       ).rejects.toThrow('Payment not found');
     });
+
+    it('handles multiple partial refunds correctly with incremental deltas (mandatory specification)', async () => {
+      // Payment = 100 SAR
+      const ride = await store.createRide({
+        riderId: riderUser.id,
+        driverId: driverRecord.id,
+        status: 'RIDE_COMPLETED',
+        estimatedFare: 100,
+        finalFare: 100,
+        paymentMethod: 'CREDIT_CARD',
+        paymentStatus: 'SUCCEEDED',
+      });
+
+      const intentId = 'pi_multi_partial_' + generateId('pi');
+      await store.createPayment({
+        rideId: ride.id,
+        userId: riderUser.id,
+        amount: 100,
+        currency: 'SAR',
+        status: 'SUCCEEDED',
+        paymentMethod: 'CREDIT_CARD',
+        stripePaymentIntentId: intentId,
+      });
+
+      // Refund #1: Stripe cumulative = 30 SAR
+      const res1 = await store.settleStripeRefund({
+        paymentIntentId: intentId,
+        eventId: 'evt_partial_1',
+        cumulativeAmountRefunded: 30,
+      });
+
+      expect(res1.success).toBe(true);
+      expect(res1.refundAmount).toBe(30);
+      expect(res1.refundDelta).toBe(30);
+      expect(res1.isPartial).toBe(true);
+      expect(res1.status).toBe('PARTIALLY_REFUNDED');
+
+      const paymentAfter1 = await store.findPaymentByStripeIntent(intentId);
+      expect(paymentAfter1?.status).toBe('PARTIALLY_REFUNDED');
+      expect((paymentAfter1 as any)?.refundAmount).toBe(30);
+
+      const rideAfter1 = await store.findRideById(ride.id);
+      expect(rideAfter1?.paymentStatus).toBe('PARTIALLY_REFUNDED');
+
+      const ledgersAfter1 = store.ledger.filter((l) => l.rideId === ride.id && l.type === 'REFUND');
+      expect(ledgersAfter1.length).toBe(1);
+      expect(ledgersAfter1[0].amount).toBe(30);
+
+      // Refund #2: Stripe cumulative = 50 SAR (incremental delta = 20 SAR)
+      const res2 = await store.settleStripeRefund({
+        paymentIntentId: intentId,
+        eventId: 'evt_partial_2',
+        cumulativeAmountRefunded: 50,
+      });
+
+      expect(res2.success).toBe(true);
+      expect(res2.refundAmount).toBe(50);
+      expect(res2.refundDelta).toBe(20); // Exactly 20, NOT 50
+      expect(res2.isPartial).toBe(true);
+      expect(res2.status).toBe('PARTIALLY_REFUNDED');
+
+      const paymentAfter2 = await store.findPaymentByStripeIntent(intentId);
+      expect(paymentAfter2?.status).toBe('PARTIALLY_REFUNDED');
+      expect((paymentAfter2 as any)?.refundAmount).toBe(50);
+
+      const rideAfter2 = await store.findRideById(ride.id);
+      expect(rideAfter2?.paymentStatus).toBe('PARTIALLY_REFUNDED');
+
+      const ledgersAfter2 = store.ledger.filter((l) => l.rideId === ride.id && l.type === 'REFUND');
+      expect(ledgersAfter2.length).toBe(2);
+      expect(ledgersAfter2[0].amount).toBe(30);
+      expect(ledgersAfter2[1].amount).toBe(20); // Incremental 20 recorded
+
+      // Replay Refund #2 (duplicate webhook with cumulative 50)
+      const res2Replay = await store.settleStripeRefund({
+        paymentIntentId: intentId,
+        eventId: 'evt_partial_2',
+        cumulativeAmountRefunded: 50,
+      });
+      expect(res2Replay.alreadyRefunded).toBe(true);
+      expect(res2Replay.refundDelta).toBe(0);
+
+      // No new ledger entries created on replay
+      const ledgersAfterReplay = store.ledger.filter((l) => l.rideId === ride.id && l.type === 'REFUND');
+      expect(ledgersAfterReplay.length).toBe(2);
+
+      // Refund #3: Final full refund (cumulative = 100 SAR, incremental delta = 50 SAR)
+      const res3 = await store.settleStripeRefund({
+        paymentIntentId: intentId,
+        eventId: 'evt_partial_3',
+        cumulativeAmountRefunded: 100,
+      });
+
+      expect(res3.success).toBe(true);
+      expect(res3.refundAmount).toBe(100);
+      expect(res3.refundDelta).toBe(50);
+      expect(res3.isPartial).toBe(false);
+      expect(res3.status).toBe('REFUNDED');
+
+      const paymentAfter3 = await store.findPaymentByStripeIntent(intentId);
+      expect(paymentAfter3?.status).toBe('REFUNDED');
+      expect((paymentAfter3 as any)?.refundAmount).toBe(100);
+
+      const rideAfter3 = await store.findRideById(ride.id);
+      expect(rideAfter3?.paymentStatus).toBe('REFUNDED');
+
+      // Final ledger audit: exactly 3 entries summing to 100 SAR (30 + 20 + 50)
+      const finalLedgers = store.ledger.filter((l) => l.rideId === ride.id && l.type === 'REFUND');
+      expect(finalLedgers.length).toBe(3);
+      const totalRefundLedger = finalLedgers.reduce((acc, l) => acc + l.amount, 0);
+      expect(totalRefundLedger).toBe(100);
+    });
+
+    it('safely ignores out-of-order refund webhooks with lower cumulative amounts', async () => {
+      const ride = await store.createRide({
+        riderId: riderUser.id,
+        driverId: driverRecord.id,
+        status: 'RIDE_COMPLETED',
+        estimatedFare: 100,
+        finalFare: 100,
+        paymentMethod: 'CREDIT_CARD',
+        paymentStatus: 'SUCCEEDED',
+      });
+
+      const intentId = 'pi_out_of_order_' + generateId('pi');
+      await store.createPayment({
+        rideId: ride.id,
+        userId: riderUser.id,
+        amount: 100,
+        currency: 'SAR',
+        status: 'SUCCEEDED',
+        paymentMethod: 'CREDIT_CARD',
+        stripePaymentIntentId: intentId,
+      });
+
+      // Cumulative 70 arrives first
+      await store.settleStripeRefund({
+        paymentIntentId: intentId,
+        eventId: 'evt_late_70',
+        cumulativeAmountRefunded: 70,
+      });
+
+      // Out-of-order cumulative 40 arrives afterwards
+      const outOfOrderRes = await store.settleStripeRefund({
+        paymentIntentId: intentId,
+        eventId: 'evt_stale_40',
+        cumulativeAmountRefunded: 40,
+      });
+
+      expect(outOfOrderRes.alreadyRefunded).toBe(true);
+      expect(outOfOrderRes.refundDelta).toBe(0);
+      expect(outOfOrderRes.refundAmount).toBe(70);
+
+      // Ledger only has the 70 SAR entry
+      const ledgers = store.ledger.filter((l) => l.rideId === ride.id && l.type === 'REFUND');
+      expect(ledgers.length).toBe(1);
+      expect(ledgers[0].amount).toBe(70);
+    });
+
+    it('strictly handles 20 concurrent duplicate webhooks without double mutations', async () => {
+      const ride = await store.createRide({
+        riderId: riderUser.id,
+        driverId: driverRecord.id,
+        status: 'RIDE_COMPLETED',
+        estimatedFare: 120,
+        finalFare: 120,
+        paymentMethod: 'CREDIT_CARD',
+        paymentStatus: 'SUCCEEDED',
+      });
+
+      const intentId = 'pi_concurrent_20_' + generateId('pi');
+      await store.createPayment({
+        rideId: ride.id,
+        userId: riderUser.id,
+        amount: 120,
+        currency: 'SAR',
+        status: 'SUCCEEDED',
+        paymentMethod: 'CREDIT_CARD',
+        stripePaymentIntentId: intentId,
+      });
+
+      const eventId = 'evt_concurrent_20_' + generateId('evt');
+
+      // Fire 20 duplicate refund operations simultaneously
+      const results = await Promise.all(
+        Array.from({ length: 20 }, () =>
+          store.settleStripeRefund({ paymentIntentId: intentId, eventId, refundAmount: 120 })
+        )
+      );
+
+      expect(results.length).toBe(20);
+      for (const res of results) {
+        expect(res.success).toBe(true);
+        expect(res.refundAmount).toBe(120);
+      }
+
+      // Exactly 1 ledger entry exists
+      const refundLedgers = store.ledger.filter((l) => l.rideId === ride.id && l.type === 'REFUND');
+      expect(refundLedgers.length).toBe(1);
+      expect(refundLedgers[0].amount).toBe(120);
+    });
+
+    it('strictly separates payment_intent.canceled from refunds (no REFUND ledger entry created)', async () => {
+      const ride = await store.createRide({
+        riderId: riderUser.id,
+        driverId: driverRecord.id,
+        status: 'REQUESTED',
+        estimatedFare: 50,
+        paymentMethod: 'CREDIT_CARD',
+        paymentStatus: 'PENDING',
+      });
+
+      const intentId = 'pi_canceled_intent_' + generateId('pi');
+      await store.createPayment({
+        rideId: ride.id,
+        userId: riderUser.id,
+        amount: 50,
+        currency: 'SAR',
+        status: 'PENDING',
+        paymentMethod: 'CREDIT_CARD',
+        stripePaymentIntentId: intentId,
+      });
+
+      const cancelEvent = {
+        id: 'evt_cancel_' + generateId('evt'),
+        type: 'payment_intent.canceled',
+        data: {
+          object: {
+            id: intentId,
+            cancellation_reason: 'abandoned',
+          },
+        },
+      };
+
+      const { StripeService } = await import('../server/services/stripeService');
+      const origConstruct = StripeService.constructWebhookEvent;
+      StripeService.constructWebhookEvent = () => cancelEvent as any;
+
+      try {
+        await PaymentService.handleWebhook(JSON.stringify(cancelEvent), 'test_sig', cancelEvent.id);
+
+        const updatedPayment = await store.findPaymentByStripeIntent(intentId);
+        expect(updatedPayment?.status).toBe('CANCELED');
+
+        // ZERO REFUND ledger entries must be created for a cancellation!
+        const refundLedgers = store.ledger.filter(
+          (l) => l.rideId === ride.id && l.type === 'REFUND'
+        );
+        expect(refundLedgers.length).toBe(0);
+      } finally {
+        StripeService.constructWebhookEvent = origConstruct;
+      }
+    });
+
+    it('rejects refund amounts exceeding original payment or remaining balance', async () => {
+      const ride = await store.createRide({
+        riderId: riderUser.id,
+        status: 'RIDE_COMPLETED',
+        estimatedFare: 50,
+        finalFare: 50,
+        paymentMethod: 'CREDIT_CARD',
+        paymentStatus: 'SUCCEEDED',
+      });
+
+      const intentId = 'pi_excess_refund_' + generateId('pi');
+      await store.createPayment({
+        rideId: ride.id,
+        userId: riderUser.id,
+        amount: 50,
+        currency: 'SAR',
+        status: 'SUCCEEDED',
+        paymentMethod: 'CREDIT_CARD',
+        stripePaymentIntentId: intentId,
+      });
+
+      // Try refunding 100 on a 50 SAR payment
+      await expect(
+        store.settleStripeRefund({
+          paymentIntentId: intentId,
+          eventId: 'evt_excess',
+          cumulativeAmountRefunded: 100,
+        })
+      ).rejects.toThrow('exceeds original payment amount');
+
+      // Try negative refund amount
+      await expect(
+        store.settleStripeRefund({
+          paymentIntentId: intentId,
+          eventId: 'evt_negative',
+          cumulativeAmountRefunded: -20,
+        })
+      ).rejects.toThrow('cannot be negative');
+
+      // Try currency mismatch
+      await expect(
+        store.settleStripeRefund({
+          paymentIntentId: intentId,
+          eventId: 'evt_usd_mismatch',
+          cumulativeAmountRefunded: 30,
+          currency: 'USD',
+        })
+      ).rejects.toThrow('does not match payment currency');
+    });
+
+    it('recovers webhook lease on worker crash and successfully completes retry', async () => {
+      const eventId = 'evt_crash_recovery_' + generateId('evt');
+
+      // 1. Initial worker claims event
+      const initialClaim = await store.claimWebhookEvent(eventId, 'stripe', 'charge.refunded', 100);
+      expect(initialClaim.claimed).toBe(true);
+
+      // 2. Immediate duplicate claim while lease is active is rejected
+      const concurrentClaim = await store.claimWebhookEvent(eventId, 'stripe', 'charge.refunded', 100);
+      expect(concurrentClaim.claimed).toBe(false);
+      expect(concurrentClaim.alreadyProcessed).toBe(false);
+
+      // 3. Worker crashed. Fast-forward past lease expiration
+      const existing = store.webhookEvents.get(eventId);
+      if (existing) {
+        existing.leaseExpiresAt = Date.now() - 5000; // Expired 5 seconds ago
+      }
+
+      // 4. Retried webhook recovers lease
+      const recoveredClaim = await store.claimWebhookEvent(eventId, 'stripe', 'charge.refunded', 60000);
+      expect(recoveredClaim.claimed).toBe(true);
+
+      // 5. Worker finishes and marks PROCESSED
+      await store.recordProcessedWebhook(eventId, 'stripe', 'charge.refunded', {}, 'PROCESSED');
+
+      // 6. Future replay sees alreadyProcessed
+      const replayClaim = await store.claimWebhookEvent(eventId, 'stripe', 'charge.refunded', 60000);
+      expect(replayClaim.claimed).toBe(false);
+      expect(replayClaim.alreadyProcessed).toBe(true);
+    });
+
+    it('validates StripeService.refundPayment arguments strictly', async () => {
+      const { StripeService } = await import('../server/services/stripeService');
+
+      await expect(StripeService.refundPayment('')).rejects.toThrow('paymentIntentId is required');
+      await expect(StripeService.refundPayment('pi_test', -10)).rejects.toThrow('greater than 0');
+      await expect(StripeService.refundPayment('pi_test', NaN)).rejects.toThrow('valid, finite number');
+      await expect(StripeService.refundPayment('pi_test', Infinity)).rejects.toThrow('valid, finite number');
+    });
   });
 });
 

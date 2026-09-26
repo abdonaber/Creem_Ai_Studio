@@ -83,18 +83,41 @@ export class StripeService {
   }
 
   /**
-   * Refunds a payment intent
+   * Refunds a payment intent with robust validation
    */
-  public static async refundPayment(paymentIntentId: string, amount?: number): Promise<{ refundId: string; status: string }> {
+  public static async refundPayment(
+    paymentIntentId: string,
+    amount?: number,
+    reason?: 'duplicate' | 'fraudulent' | 'requested_by_customer'
+  ): Promise<{ refundId: string; status: string; amountRefunded?: number }> {
+    if (!paymentIntentId || typeof paymentIntentId !== 'string' || paymentIntentId.trim().length === 0) {
+      throw new AppError('paymentIntentId is required for refund', 400, 'INVALID_PAYMENT_INTENT');
+    }
+
+    let parsedAmountCents: number | undefined = undefined;
+    if (amount !== undefined && amount !== null) {
+      if (typeof amount !== 'number' || isNaN(amount) || !isFinite(amount)) {
+        throw new AppError('Refund amount must be a valid, finite number', 400, 'INVALID_REFUND_AMOUNT');
+      }
+      if (amount <= 0) {
+        throw new AppError('Refund amount must be greater than 0', 400, 'INVALID_REFUND_AMOUNT');
+      }
+      // Enforce 2 decimal places precision
+      const roundedAmount = Math.round(amount * 100) / 100;
+      parsedAmountCents = Math.round(roundedAmount * 100);
+    }
+
     const stripe = getStripe();
     const refund = await stripe.refunds.create({
-      payment_intent: paymentIntentId,
-      amount: amount ? Math.round(amount * 100) : undefined,
+      payment_intent: paymentIntentId.trim(),
+      amount: parsedAmountCents,
+      reason,
     });
 
     return {
       refundId: refund.id,
       status: refund.status || 'succeeded',
+      amountRefunded: refund.amount ? refund.amount / 100 : undefined,
     };
   }
 }
