@@ -1600,6 +1600,306 @@ describe('Production Hardening & Integrity Suite', () => {
         StripeService.retrieveCharge = origRetrieve;
       }
     });
+
+    it('dynamically reverses driver and platform shares based on actual recorded split (e.g. 85/15 promotional)', async () => {
+      // Create ride with special promo split: 85 SAR driver, 15 SAR platform
+      const ride = await store.createRide({
+        riderId: riderUser.id,
+        driverId: driverRecord.id,
+        status: 'RIDE_COMPLETED',
+        estimatedFare: 100,
+        finalFare: 100,
+        paymentMethod: 'CREDIT_CARD',
+        paymentStatus: 'SUCCEEDED',
+      });
+
+      const intentId = 'pi_promo_85_15_' + generateId('pi');
+      const payment = await store.createPayment({
+        rideId: ride.id,
+        userId: riderUser.id,
+        amount: 100,
+        currency: 'SAR',
+        status: 'SUCCEEDED',
+        paymentMethod: 'CREDIT_CARD',
+        stripePaymentIntentId: intentId,
+        metadata: {
+          driverEarning: 85,
+          platformCommission: 15,
+          originalTotal: 100,
+          settledToDriver: true,
+        },
+      });
+
+      // Record original platform commission entry in ledger matching 15 SAR
+      await store.recordLedgerEntry({
+        rideId: ride.id,
+        type: 'PLATFORM_COMMISSION',
+        amount: 15,
+        currency: 'SAR',
+        fromAccount: 'platform:escrow',
+        toAccount: 'platform:revenue',
+        status: 'COMMITTED',
+      });
+
+      const initialDriverEarnings = (await store.findDriverById(driverRecord.id))?.earningsTotal || 0;
+      await store.updateDriver(driverRecord.id, { earningsTotal: initialDriverEarnings + 85 });
+
+      // Partial refund: 40 SAR
+      // Proportional driver reversal = 40 * (85/100) = 34 SAR
+      // Platform reversal = 40 - 34 = 6 SAR (NOT 8 SAR from 20%)
+      const ref1 = await store.settleStripeRefund({
+        paymentIntentId: intentId,
+        eventId: 'evt_promo_ref1_' + generateId('evt'),
+        refundDelta: 40,
+        refundId: 're_promo_1_' + generateId('re'),
+      });
+
+      expect(ref1.success).toBe(true);
+      expect(ref1.refundDelta).toBe(40);
+
+      const driverAfter1 = await store.findDriverById(driverRecord.id);
+      expect(driverAfter1?.earningsTotal).toBe(initialDriverEarnings + 85 - 34);
+
+      const commReversals1 = store.ledger.filter(
+        (l) => l.rideId === ride.id && l.type === 'PLATFORM_COMMISSION' && l.fromAccount === 'platform:revenue'
+      );
+      expect(commReversals1.length).toBe(1);
+      expect(commReversals1[0].amount).toBe(6); // Exactly 15% of 40 = 6 SAR!
+
+      // Final refund: remaining 60 SAR
+      // Driver reversal = 85 - 34 = 51 SAR
+      // Platform reversal = 15 - 6 = 9 SAR
+      const ref2 = await store.settleStripeRefund({
+        paymentIntentId: intentId,
+        eventId: 'evt_promo_ref2_' + generateId('evt'),
+        refundDelta: 60,
+        refundId: 're_promo_2_' + generateId('re'),
+      });
+
+      expect(ref2.success).toBe(true);
+      expect(ref2.status).toBe('REFUNDED');
+
+      const driverAfter2 = await store.findDriverById(driverRecord.id);
+      expect(driverAfter2?.earningsTotal).toBe(initialDriverEarnings); // Full 85 SAR reversed!
+
+      const commReversals2 = store.ledger.filter(
+        (l) => l.rideId === ride.id && l.type === 'PLATFORM_COMMISSION' && l.fromAccount === 'platform:revenue'
+      );
+      expect(commReversals2.length).toBe(2);
+      expect(commReversals2[1].amount).toBe(9); // Remaining 9 SAR
+      const totalCommReversed = commReversals2.reduce((s, e) => s + e.amount, 0);
+      expect(totalCommReversed).toBe(15); // Total platform commission reversed matches EXACTLY 15 SAR!
+    });
+
+    it('strictly rejects invalid precision without rounding to hide bad amounts', async () => {
+      const intentId = 'pi_precision_test_' + generateId('pi');
+      await store.createPayment({
+        rideId: 'ride_precision_1',
+        userId: riderUser.id,
+        amount: 50,
+        currency: 'SAR',
+        status: 'SUCCEEDED',
+        paymentMethod: 'CREDIT_CARD',
+        stripePaymentIntentId: intentId,
+      });
+
+      // 50.005 has 3 decimal places -> must be rejected as precision abuse, not rounded to 50.01!
+      await expect(
+        store.settleStripeRefund({
+          paymentIntentId: intentId,
+          eventId: 'evt_prec_1',
+          refundDelta: 20.005,
+        })
+      ).rejects.toThrow('maximum 2 decimal places allowed');
+
+      await expect(
+        store.settleStripeRefund({
+          paymentIntentId: intentId,
+          eventId: 'evt_prec_2',
+          cumulativeAmountRefunded: 25.123,
+        })
+      ).rejects.toThrow('maximum 2 decimal places allowed');
+    });
+
+    it('enforces IDOR security on POST /api/v1/payments/refund', async () => {
+      // 1. Create ride for Rider 1
+      const ride = await store.createRide({
+        riderId: riderUser.id,
+        driverId: driverRecord.id,
+        status: 'RIDE_COMPLETED',
+        estimatedFare: 45,
+        finalFare: 45,
+        paymentMethod: 'CREDIT_CARD',
+        paymentStatus: 'SUCCEEDED',
+      });
+
+      const intentId = 'pi_idor_test_' + generateId('pi');
+      await store.createPayment({
+        rideId: ride.id,
+        userId: riderUser.id,
+        amount: 45,
+        currency: 'SAR',
+        status: 'SUCCEEDED',
+        paymentMethod: 'CREDIT_CARD',
+        stripePaymentIntentId: intentId,
+      });
+
+      // 2. Create another unrelated Rider 2
+      const otherRider = await store.createUser({
+        name: 'Attacker Rider',
+        email: 'attacker@evil.com',
+        role: 'RIDER',
+        status: 'ACTIVE',
+      });
+      const otherRiderToken = createAuthToken({ userId: otherRider.id, role: 'RIDER', email: otherRider.email });
+
+      // 3. Other Rider attempts to refund Rider 1's payment -> 403 FORBIDDEN
+      const resOther = await request(app)
+        .post('/api/v1/payments/refund')
+        .set('Authorization', `Bearer ${otherRiderToken}`)
+        .send({
+          rideId: ride.id,
+          amount: 20,
+        });
+
+      expect(resOther.status).toBe(403);
+      expect(resOther.body.code).toBe('FORBIDDEN');
+
+      // 4. Admin CAN refund the payment
+      const { StripeService } = await import('../server/services/stripeService');
+      const origRefund = StripeService.refundPayment;
+      StripeService.refundPayment = async () => ({
+        refundId: 're_mock_admin_123',
+        status: 'succeeded',
+        amountRefunded: 20,
+      });
+
+      try {
+        const resAdmin = await request(app)
+          .post('/api/v1/payments/refund')
+          .set('Authorization', `Bearer ${adminToken}`)
+          .send({
+            rideId: ride.id,
+            amount: 20,
+          });
+
+        expect(resAdmin.status).toBe(200);
+        expect(resAdmin.body.success).toBe(true);
+        expect(resAdmin.body.data.refundId).toBe('re_mock_admin_123');
+      } finally {
+        StripeService.refundPayment = origRefund;
+      }
+    });
+
+    it('guarantees stripeRefundId deduplication across different webhook event IDs', async () => {
+      const ride = await store.createRide({
+        riderId: riderUser.id,
+        driverId: driverRecord.id,
+        status: 'RIDE_COMPLETED',
+        estimatedFare: 100,
+        finalFare: 100,
+        paymentMethod: 'CREDIT_CARD',
+        paymentStatus: 'SUCCEEDED',
+      });
+
+      const intentId = 'pi_dedup_cross_events_' + generateId('pi');
+      await store.createPayment({
+        rideId: ride.id,
+        userId: riderUser.id,
+        amount: 100,
+        currency: 'SAR',
+        status: 'SUCCEEDED',
+        paymentMethod: 'CREDIT_CARD',
+        stripePaymentIntentId: intentId,
+      });
+
+      const stripeRefundId = 're_unique_trans_id_999';
+
+      // First webhook with eventId evt_alpha
+      const res1 = await store.settleStripeRefund({
+        paymentIntentId: intentId,
+        eventId: 'evt_alpha',
+        refundDelta: 50,
+        refundId: stripeRefundId,
+      });
+      expect(res1.success).toBe(true);
+      expect(res1.alreadyRefunded).toBeFalsy();
+      expect(res1.refundDelta).toBe(50);
+
+      // Second webhook with completely different eventId evt_beta referencing the SAME stripeRefundId
+      const res2 = await store.settleStripeRefund({
+        paymentIntentId: intentId,
+        eventId: 'evt_beta',
+        refundDelta: 50,
+        refundId: stripeRefundId,
+      });
+      expect(res2.success).toBe(true);
+      expect(res2.alreadyRefunded).toBe(true);
+      expect(res2.refundDelta).toBe(0);
+
+      // Ledger must have exactly ONE refund entry for this ride
+      const refundEntries = store.ledger.filter((l) => l.rideId === ride.id && l.type === 'REFUND');
+      expect(refundEntries.length).toBe(1);
+      expect(refundEntries[0].amount).toBe(50);
+    });
+
+    it('directly processes refund.failed event by updating state without financial ledger mutation', async () => {
+      const intentId = 'pi_failed_evt_test_' + generateId('pi');
+      await store.createPayment({
+        rideId: 'ride_fail_evt',
+        userId: riderUser.id,
+        amount: 80,
+        currency: 'SAR',
+        status: 'SUCCEEDED',
+        paymentMethod: 'CREDIT_CARD',
+        stripePaymentIntentId: intentId,
+      });
+
+      const { StripeService } = await import('../server/services/stripeService');
+      const origConstruct = StripeService.constructWebhookEvent;
+
+      const failedWebhookEvent = {
+        id: 'evt_failed_direct_' + generateId('evt'),
+        type: 'refund.failed',
+        data: {
+          object: {
+            id: 're_charge_declined_123',
+            object: 'refund',
+            payment_intent: intentId,
+            amount: 8000,
+            status: 'failed',
+            failure_reason: 'expired_or_canceled_card',
+          },
+        },
+      };
+
+      StripeService.constructWebhookEvent = () => failedWebhookEvent as any;
+
+      try {
+        const handled = await PaymentService.handleWebhook(
+          JSON.stringify(failedWebhookEvent),
+          'test_sig',
+          failedWebhookEvent.id
+        );
+        expect(handled).toBe(true);
+
+        // Payment status must remain SUCCEEDED
+        const payment = await store.findPaymentByStripeIntent(intentId);
+        expect(payment?.status).toBe('SUCCEEDED');
+        expect(payment?.refundAmount).toBeFalsy();
+
+        // Refund status must be recorded as failed in refunds array
+        const refundObj = payment?.refunds?.find((r) => r.stripeRefundId === 're_charge_declined_123');
+        expect(refundObj?.status).toBe('failed');
+
+        // Zero refund ledger entries
+        const refundLedgers = store.ledger.filter((l) => l.rideId === 'ride_fail_evt');
+        expect(refundLedgers.length).toBe(0);
+      } finally {
+        StripeService.constructWebhookEvent = origConstruct;
+      }
+    });
   });
 });
+
 

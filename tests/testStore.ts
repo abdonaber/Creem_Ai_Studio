@@ -684,6 +684,17 @@ export class TestDatabaseStore implements IDatabaseStore {
           earningsTotal: (driver.earningsTotal || 0) + driverEarning,
           totalRides: (driver.totalRides || 0) + 1,
         });
+
+        // Store metadata with actual financial allocation for future reversal auditing
+        await this.updatePayment(payment.id, {
+          metadata: {
+            ...(payment.metadata || {}),
+            driverEarning,
+            platformCommission,
+            originalTotal: payment.amount,
+            settledToDriver: true,
+          },
+        });
       }
     }
 
@@ -744,12 +755,17 @@ export class TestDatabaseStore implements IDatabaseStore {
     let targetCumulative: number;
     let delta: number;
 
+    // Strict validation: check precision and invalid amounts BEFORE any rounding
     if (params.cumulativeAmountRefunded !== undefined && params.cumulativeAmountRefunded !== null) {
       if (typeof params.cumulativeAmountRefunded !== 'number' || isNaN(params.cumulativeAmountRefunded) || !isFinite(params.cumulativeAmountRefunded)) {
         throw new AppError('Provided refund amount must be a finite, valid number', 400, 'INVALID_REFUND_AMOUNT');
       }
       if (params.cumulativeAmountRefunded < 0) {
         throw new AppError('Refund amount cannot be negative', 400, 'INVALID_REFUND_AMOUNT');
+      }
+      const decStr = String(params.cumulativeAmountRefunded).split('.')[1];
+      if (decStr && decStr.length > 2) {
+        throw new AppError('Refund amount precision abuse: maximum 2 decimal places allowed for SAR', 400, 'INVALID_REFUND_PRECISION');
       }
       targetCumulative = Math.round(params.cumulativeAmountRefunded * 100) / 100;
       delta = Math.round((targetCumulative - existingRefunded) * 100) / 100;
@@ -760,6 +776,10 @@ export class TestDatabaseStore implements IDatabaseStore {
       if (params.refundDelta <= 0) {
         throw new AppError('Refund delta must be greater than 0', 400, 'INVALID_REFUND_AMOUNT');
       }
+      const decStr = String(params.refundDelta).split('.')[1];
+      if (decStr && decStr.length > 2) {
+        throw new AppError('Refund amount precision abuse: maximum 2 decimal places allowed for SAR', 400, 'INVALID_REFUND_PRECISION');
+      }
       delta = Math.round(params.refundDelta * 100) / 100;
       targetCumulative = Math.round((existingRefunded + delta) * 100) / 100;
     } else if (params.refundAmount !== undefined && params.refundAmount !== null) {
@@ -768,6 +788,10 @@ export class TestDatabaseStore implements IDatabaseStore {
       }
       if (params.refundAmount <= 0) {
         throw new AppError('Refund amount must be greater than 0', 400, 'INVALID_REFUND_AMOUNT');
+      }
+      const decStr = String(params.refundAmount).split('.')[1];
+      if (decStr && decStr.length > 2) {
+        throw new AppError('Refund amount precision abuse: maximum 2 decimal places allowed for SAR', 400, 'INVALID_REFUND_PRECISION');
       }
       targetCumulative = Math.round(params.refundAmount * 100) / 100;
       delta = Math.round((targetCumulative - existingRefunded) * 100) / 100;
@@ -789,11 +813,6 @@ export class TestDatabaseStore implements IDatabaseStore {
       };
     }
 
-    // Decimal precision validation
-    const decimalPart = String(delta).split('.')[1];
-    if (decimalPart && decimalPart.length > 2) {
-      throw new AppError('Refund amount precision abuse: maximum 2 decimal places allowed for SAR', 400, 'INVALID_REFUND_PRECISION');
-    }
     if (delta < 0.01) {
       throw new AppError('Refund amount must be at least 0.01 SAR (smallest currency unit)', 400, 'INVALID_REFUND_AMOUNT');
     }
@@ -818,16 +837,58 @@ export class TestDatabaseStore implements IDatabaseStore {
     const isPartial = targetCumulative < totalAmount;
     const newStatus: PaymentStatus = isPartial ? 'PARTIALLY_REFUNDED' : 'REFUNDED';
     const keySuffix = params.refundId ? `ref_${params.refundId}` : `c_${Math.round(targetCumulative * 100)}`;
+    const payId = payment.id;
 
     // Reversal of Driver Earnings and Platform Commission if ride had a driver
     const ride = await this.findRideById(payment.rideId);
-    const fareSettled = payment.status === 'SUCCEEDED' || payment.status === 'PARTIALLY_REFUNDED';
+    const fareSettled = payment.status === 'SUCCEEDED' || payment.status === 'PARTIALLY_REFUNDED' || (payment.metadata as any)?.settledToDriver;
 
     if (fareSettled && ride?.driverId) {
       const driver = await this.findDriverById(ride.driverId);
       if (driver) {
-        const driverReversal = Math.round(delta * 0.8 * 100) / 100;
-        const platformReversal = Math.round((delta - driverReversal) * 100) / 100;
+        // 1. Determine ACTUAL original financial distribution recorded for this ride
+        let originalCommission: number;
+        let originalDriverEarning: number;
+
+        if (payment.metadata?.platformCommission !== undefined && payment.metadata?.driverEarning !== undefined) {
+          originalCommission = Number(payment.metadata.platformCommission);
+          originalDriverEarning = Number(payment.metadata.driverEarning);
+        } else {
+          const commEntry = this.ledger.find(
+            (e) => e.rideId === payment.rideId && e.type === 'PLATFORM_COMMISSION' && e.fromAccount === 'platform:escrow' && e.toAccount === 'platform:revenue'
+          );
+          if (commEntry) {
+            originalCommission = commEntry.amount;
+            originalDriverEarning = Math.round((totalAmount - originalCommission) * 100) / 100;
+          } else {
+            originalDriverEarning = Math.round(totalAmount * 0.8 * 100) / 100;
+            originalCommission = Math.round((totalAmount - originalDriverEarning) * 100) / 100;
+          }
+        }
+
+        // 2. Query cumulative already-reversed amounts from ledger
+        const alreadyReversedDriver = this.ledger
+          .filter((e) => e.rideId === payment.rideId && e.type === 'DRIVER_EARNING' && e.toAccount === 'platform:escrow')
+          .reduce((sum, e) => sum + (e.amount || 0), 0);
+        const alreadyReversedComm = this.ledger
+          .filter((e) => e.rideId === payment.rideId && e.type === 'PLATFORM_COMMISSION' && e.fromAccount === 'platform:revenue' && e.toAccount === 'platform:escrow')
+          .reduce((sum, e) => sum + (e.amount || 0), 0);
+
+        // 3. Compute exact reversal delta for THIS refund (zero penny drift)
+        const isFinal = targetCumulative >= totalAmount || delta >= remainingBalance;
+        let driverReversal: number;
+        let platformReversal: number;
+
+        if (isFinal) {
+          driverReversal = Math.max(0, Math.round((originalDriverEarning - alreadyReversedDriver) * 100) / 100);
+          platformReversal = Math.max(0, Math.round((originalCommission - alreadyReversedComm) * 100) / 100);
+        } else {
+          const driverRatio = totalAmount > 0 ? (originalDriverEarning / totalAmount) : 0.8;
+          const proposedDriver = Math.round(delta * driverRatio * 100) / 100;
+          const remainingDriver = Math.max(0, Math.round((originalDriverEarning - alreadyReversedDriver) * 100) / 100);
+          driverReversal = Math.min(proposedDriver, remainingDriver);
+          platformReversal = Math.round((delta - driverReversal) * 100) / 100;
+        }
 
         // Decrement driver earningsTotal
         const newEarningsTotal = Math.max(0, (driver.earningsTotal || 0) - driverReversal);
@@ -843,7 +904,7 @@ export class TestDatabaseStore implements IDatabaseStore {
             driverReversal,
             `Earnings reversal on refund for ride #${payment.rideId.slice(0, 8)}`,
             payment.rideId,
-            `webhook_${params.eventId}_driver_wal_${keySuffix}`
+            `refund_${payId}_${keySuffix}_driver_wal`
           );
         } else {
           if (availableBalance > 0) {
@@ -852,7 +913,7 @@ export class TestDatabaseStore implements IDatabaseStore {
               availableBalance,
               `Partial earnings reversal on refund for ride #${payment.rideId.slice(0, 8)}`,
               payment.rideId,
-              `webhook_${params.eventId}_driver_wal_part_${keySuffix}`
+              `refund_${payId}_${keySuffix}_driver_wal_part`
             );
           }
           const debtIncurred = Math.round((driverReversal - availableBalance) * 100) / 100;
@@ -867,7 +928,7 @@ export class TestDatabaseStore implements IDatabaseStore {
             fromAccount: `driver:${driver.id}`,
             toAccount: 'platform:debt',
             status: 'OUTSTANDING',
-            idempotencyKey: `webhook_${params.eventId}_driver_debt_${keySuffix}`,
+            idempotencyKey: `refund_${payId}_${keySuffix}_driver_debt`,
           });
         }
 
@@ -880,7 +941,7 @@ export class TestDatabaseStore implements IDatabaseStore {
           fromAccount: `driver:${driver.id}`,
           toAccount: 'platform:escrow',
           status: 'SETTLED',
-          idempotencyKey: `webhook_${params.eventId}_driver_rev_${keySuffix}`,
+          idempotencyKey: `refund_${payId}_${keySuffix}_driver_rev`,
         });
 
         // Platform Commission Reversal into PlatformLedger
@@ -892,7 +953,7 @@ export class TestDatabaseStore implements IDatabaseStore {
           fromAccount: 'platform:revenue',
           toAccount: 'platform:escrow',
           status: 'SETTLED',
-          idempotencyKey: `webhook_${params.eventId}_comm_rev_${keySuffix}`,
+          idempotencyKey: `refund_${payId}_${keySuffix}_comm_rev`,
         });
       }
     }
@@ -926,7 +987,7 @@ export class TestDatabaseStore implements IDatabaseStore {
     await this.updateRide(payment.rideId, { paymentStatus: newStatus });
 
     // 3. Platform Ledger refund entry recording incremental delta
-    const idempotencyKey = `webhook_${params.eventId}_refund_${keySuffix}`;
+    const idempotencyKey = `refund_${payId}_${keySuffix}_rider`;
 
     await this.recordLedgerEntry({
       rideId: payment.rideId,

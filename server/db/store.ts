@@ -2302,6 +2302,16 @@ export class MongoDatabaseStore implements IDatabaseStore {
                 { $inc: { earningsTotal: driverEarning, totalRides: 1 } },
                 { session }
               );
+
+              // Record metadata with actual financial allocation for future reversal auditing
+              payment.metadata = {
+                ...(payment.metadata || {}),
+                driverEarning,
+                platformCommission,
+                originalTotal: payment.amount,
+                settledToDriver: true,
+              };
+              await payment.save({ session });
             }
           }
 
@@ -2333,7 +2343,18 @@ export class MongoDatabaseStore implements IDatabaseStore {
     const payment = await this.findPaymentByStripeIntent(paymentIntentId);
     if (!payment) throw new AppError('Payment not found', 404, 'PAYMENT_NOT_FOUND');
     if (payment.status === 'SUCCEEDED') return { success: true, paymentId: payment.id, alreadySettled: true };
-    await this.updatePayment(payment.id, { status: 'SUCCEEDED' });
+    const driverEarning = Math.round(payment.amount * 0.8 * 100) / 100;
+    const platformCommission = Math.round((payment.amount - driverEarning) * 100) / 100;
+    await this.updatePayment(payment.id, {
+      status: 'SUCCEEDED',
+      metadata: {
+        ...(payment.metadata || {}),
+        driverEarning,
+        platformCommission,
+        originalTotal: payment.amount,
+        settledToDriver: true,
+      },
+    });
     await this.updateRide(payment.rideId, { paymentStatus: 'SUCCEEDED', finalFare: payment.amount });
     await this.recordLedgerEntry({
       rideId: payment.rideId,
@@ -2430,12 +2451,17 @@ export class MongoDatabaseStore implements IDatabaseStore {
           let targetCumulative: number;
           let delta: number;
 
+          // Strict validation: check precision and invalid amounts BEFORE any rounding
           if (params.cumulativeAmountRefunded !== undefined && params.cumulativeAmountRefunded !== null) {
             if (typeof params.cumulativeAmountRefunded !== 'number' || isNaN(params.cumulativeAmountRefunded) || !isFinite(params.cumulativeAmountRefunded)) {
               throw new AppError('Provided refund amount must be a finite, valid number', 400, 'INVALID_REFUND_AMOUNT');
             }
             if (params.cumulativeAmountRefunded < 0) {
               throw new AppError('Refund amount cannot be negative', 400, 'INVALID_REFUND_AMOUNT');
+            }
+            const decStr = String(params.cumulativeAmountRefunded).split('.')[1];
+            if (decStr && decStr.length > 2) {
+              throw new AppError('Refund amount precision abuse: maximum 2 decimal places allowed for SAR', 400, 'INVALID_REFUND_PRECISION');
             }
             targetCumulative = Math.round(params.cumulativeAmountRefunded * 100) / 100;
             delta = Math.round((targetCumulative - existingRefunded) * 100) / 100;
@@ -2446,6 +2472,10 @@ export class MongoDatabaseStore implements IDatabaseStore {
             if (params.refundDelta <= 0) {
               throw new AppError('Refund delta must be greater than 0', 400, 'INVALID_REFUND_AMOUNT');
             }
+            const decStr = String(params.refundDelta).split('.')[1];
+            if (decStr && decStr.length > 2) {
+              throw new AppError('Refund amount precision abuse: maximum 2 decimal places allowed for SAR', 400, 'INVALID_REFUND_PRECISION');
+            }
             delta = Math.round(params.refundDelta * 100) / 100;
             targetCumulative = Math.round((existingRefunded + delta) * 100) / 100;
           } else if (params.refundAmount !== undefined && params.refundAmount !== null) {
@@ -2454,6 +2484,10 @@ export class MongoDatabaseStore implements IDatabaseStore {
             }
             if (params.refundAmount <= 0) {
               throw new AppError('Refund amount must be greater than 0', 400, 'INVALID_REFUND_AMOUNT');
+            }
+            const decStr = String(params.refundAmount).split('.')[1];
+            if (decStr && decStr.length > 2) {
+              throw new AppError('Refund amount precision abuse: maximum 2 decimal places allowed for SAR', 400, 'INVALID_REFUND_PRECISION');
             }
             targetCumulative = Math.round(params.refundAmount * 100) / 100;
             delta = Math.round((targetCumulative - existingRefunded) * 100) / 100;
@@ -2477,11 +2511,6 @@ export class MongoDatabaseStore implements IDatabaseStore {
             return;
           }
 
-          // Strict validation: Decimal precision (maximum 2 decimal places)
-          const decimalPart = String(delta).split('.')[1];
-          if (decimalPart && decimalPart.length > 2) {
-            throw new AppError('Refund amount precision abuse: maximum 2 decimal places allowed for SAR', 400, 'INVALID_REFUND_PRECISION');
-          }
           if (delta < 0.01) {
             throw new AppError('Refund amount must be at least 0.01 SAR (smallest currency unit)', 400, 'INVALID_REFUND_AMOUNT');
           }
@@ -2506,6 +2535,7 @@ export class MongoDatabaseStore implements IDatabaseStore {
           const isPartial = targetCumulative < totalAmount;
           const newStatus: PaymentStatus = isPartial ? 'PARTIALLY_REFUNDED' : 'REFUNDED';
           const keySuffix = params.refundId ? `ref_${params.refundId}` : `c_${Math.round(targetCumulative * 100)}`;
+          const payId = payment._id.toString();
 
           // Reversal of Driver Earnings and Platform Commission when fare was settled
           const ride = await RideModel.findById(payment.rideId).session(session);
@@ -2514,8 +2544,62 @@ export class MongoDatabaseStore implements IDatabaseStore {
           if (fareSettled && ride?.driverId) {
             const driver = await DriverModel.findById(ride.driverId).session(session);
             if (driver) {
-              const driverReversal = Math.round(delta * 0.8 * 100) / 100;
-              const platformReversal = Math.round((delta - driverReversal) * 100) / 100;
+              // 1. Determine ACTUAL original financial distribution recorded for this ride
+              let originalCommission: number;
+              let originalDriverEarning: number;
+
+              if (payment.metadata?.platformCommission !== undefined && payment.metadata?.driverEarning !== undefined) {
+                originalCommission = Number(payment.metadata.platformCommission);
+                originalDriverEarning = Number(payment.metadata.driverEarning);
+              } else {
+                // Look up original committed platform commission from ledger
+                const commEntry = await PlatformLedgerModel.findOne({
+                  rideId: payment.rideId,
+                  type: 'PLATFORM_COMMISSION',
+                  fromAccount: 'platform:escrow',
+                  toAccount: 'platform:revenue',
+                }).session(session).lean();
+
+                if (commEntry) {
+                  originalCommission = commEntry.amount;
+                  originalDriverEarning = Math.round((totalAmount - originalCommission) * 100) / 100;
+                } else {
+                  originalDriverEarning = Math.round(totalAmount * 0.8 * 100) / 100;
+                  originalCommission = Math.round((totalAmount - originalDriverEarning) * 100) / 100;
+                }
+              }
+
+              // 2. Query cumulative already-reversed amounts from ledger
+              const reversedDriverEntries = await PlatformLedgerModel.find({
+                rideId: payment.rideId,
+                type: 'DRIVER_EARNING',
+                toAccount: 'platform:escrow',
+              }).session(session).lean();
+              const alreadyReversedDriver = reversedDriverEntries.reduce((sum, e) => sum + (e.amount || 0), 0);
+
+              const reversedCommEntries = await PlatformLedgerModel.find({
+                rideId: payment.rideId,
+                type: 'PLATFORM_COMMISSION',
+                fromAccount: 'platform:revenue',
+                toAccount: 'platform:escrow',
+              }).session(session).lean();
+              const alreadyReversedComm = reversedCommEntries.reduce((sum, e) => sum + (e.amount || 0), 0);
+
+              // 3. Compute exact reversal delta for THIS refund (zero penny drift)
+              const isFinal = targetCumulative >= totalAmount || delta >= remainingBalance;
+              let driverReversal: number;
+              let platformReversal: number;
+
+              if (isFinal) {
+                driverReversal = Math.max(0, Math.round((originalDriverEarning - alreadyReversedDriver) * 100) / 100);
+                platformReversal = Math.max(0, Math.round((originalCommission - alreadyReversedComm) * 100) / 100);
+              } else {
+                const driverRatio = totalAmount > 0 ? (originalDriverEarning / totalAmount) : 0.8;
+                const proposedDriver = Math.round(delta * driverRatio * 100) / 100;
+                const remainingDriver = Math.max(0, Math.round((originalDriverEarning - alreadyReversedDriver) * 100) / 100);
+                driverReversal = Math.min(proposedDriver, remainingDriver);
+                platformReversal = Math.round((delta - driverReversal) * 100) / 100;
+              }
 
               // 1. Decrement driver earningsTotal
               const newEarningsTotal = Math.max(0, (driver.earningsTotal || 0) - driverReversal);
@@ -2554,7 +2638,7 @@ export class MongoDatabaseStore implements IDatabaseStore {
                       balanceAfter: updatedWallet!.balance,
                       reason: `Earnings reversal on refund for ride #${payment.rideId.slice(0, 8)}`,
                       referenceId: payment.rideId,
-                      idempotencyKey: `webhook_${eventId}_driver_wal_${keySuffix}`,
+                      idempotencyKey: `refund_${payId}_${keySuffix}_driver_wal`,
                     },
                   ],
                   { session }
@@ -2578,7 +2662,7 @@ export class MongoDatabaseStore implements IDatabaseStore {
                         balanceAfter: 0,
                         reason: `Partial earnings reversal on refund for ride #${payment.rideId.slice(0, 8)}`,
                         referenceId: payment.rideId,
-                        idempotencyKey: `webhook_${eventId}_driver_wal_part_${keySuffix}`,
+                        idempotencyKey: `refund_${payId}_${keySuffix}_driver_wal_part`,
                       },
                     ],
                     { session }
@@ -2603,7 +2687,7 @@ export class MongoDatabaseStore implements IDatabaseStore {
                       fromAccount: `driver:${driver._id.toString()}`,
                       toAccount: 'platform:debt',
                       status: 'OUTSTANDING',
-                      idempotencyKey: `webhook_${eventId}_driver_debt_${keySuffix}`,
+                      idempotencyKey: `refund_${payId}_${keySuffix}_driver_debt`,
                     },
                   ],
                   { session }
@@ -2622,7 +2706,7 @@ export class MongoDatabaseStore implements IDatabaseStore {
                     fromAccount: `driver:${driver._id.toString()}`,
                     toAccount: 'platform:escrow',
                     status: 'SETTLED',
-                    idempotencyKey: `webhook_${eventId}_driver_rev_${keySuffix}`,
+                    idempotencyKey: `refund_${payId}_${keySuffix}_driver_rev`,
                   },
                 ],
                 { session }
@@ -2640,7 +2724,7 @@ export class MongoDatabaseStore implements IDatabaseStore {
                     fromAccount: 'platform:revenue',
                     toAccount: 'platform:escrow',
                     status: 'SETTLED',
-                    idempotencyKey: `webhook_${eventId}_comm_rev_${keySuffix}`,
+                    idempotencyKey: `refund_${payId}_${keySuffix}_comm_rev`,
                   },
                 ],
                 { session }
@@ -2649,7 +2733,7 @@ export class MongoDatabaseStore implements IDatabaseStore {
           }
 
           // 5. Rider Refund entry from escrow
-          const idempotencyKey = `webhook_${eventId}_refund_${keySuffix}`;
+          const idempotencyKey = `refund_${payId}_${keySuffix}_rider`;
           await PlatformLedgerModel.create(
             [
               {
@@ -2782,6 +2866,10 @@ export class MongoDatabaseStore implements IDatabaseStore {
       if (params.cumulativeAmountRefunded < 0) {
         throw new AppError('Refund amount cannot be negative', 400, 'INVALID_REFUND_AMOUNT');
       }
+      const decStr = String(params.cumulativeAmountRefunded).split('.')[1];
+      if (decStr && decStr.length > 2) {
+        throw new AppError('Refund amount precision abuse: maximum 2 decimal places allowed for SAR', 400, 'INVALID_REFUND_PRECISION');
+      }
       targetCumulative = Math.round(params.cumulativeAmountRefunded * 100) / 100;
       delta = Math.round((targetCumulative - existingRefunded) * 100) / 100;
     } else if (params.refundDelta !== undefined && params.refundDelta !== null) {
@@ -2791,6 +2879,10 @@ export class MongoDatabaseStore implements IDatabaseStore {
       if (params.refundDelta <= 0) {
         throw new AppError('Refund delta must be greater than 0', 400, 'INVALID_REFUND_AMOUNT');
       }
+      const decStr = String(params.refundDelta).split('.')[1];
+      if (decStr && decStr.length > 2) {
+        throw new AppError('Refund amount precision abuse: maximum 2 decimal places allowed for SAR', 400, 'INVALID_REFUND_PRECISION');
+      }
       delta = Math.round(params.refundDelta * 100) / 100;
       targetCumulative = Math.round((existingRefunded + delta) * 100) / 100;
     } else if (params.refundAmount !== undefined && params.refundAmount !== null) {
@@ -2799,6 +2891,10 @@ export class MongoDatabaseStore implements IDatabaseStore {
       }
       if (params.refundAmount <= 0) {
         throw new AppError('Refund amount must be greater than 0', 400, 'INVALID_REFUND_AMOUNT');
+      }
+      const decStr = String(params.refundAmount).split('.')[1];
+      if (decStr && decStr.length > 2) {
+        throw new AppError('Refund amount precision abuse: maximum 2 decimal places allowed for SAR', 400, 'INVALID_REFUND_PRECISION');
       }
       targetCumulative = Math.round(params.refundAmount * 100) / 100;
       delta = Math.round((targetCumulative - existingRefunded) * 100) / 100;
@@ -2820,10 +2916,6 @@ export class MongoDatabaseStore implements IDatabaseStore {
       };
     }
 
-    const decimalPart = String(delta).split('.')[1];
-    if (decimalPart && decimalPart.length > 2) {
-      throw new AppError('Refund amount precision abuse: maximum 2 decimal places allowed for SAR', 400, 'INVALID_REFUND_PRECISION');
-    }
     if (delta < 0.01) {
       throw new AppError('Refund amount must be at least 0.01 SAR (smallest currency unit)', 400, 'INVALID_REFUND_AMOUNT');
     }
@@ -2848,6 +2940,7 @@ export class MongoDatabaseStore implements IDatabaseStore {
     const isPartial = targetCumulative < totalAmount;
     const newStatus: PaymentStatus = isPartial ? 'PARTIALLY_REFUNDED' : 'REFUNDED';
     const keySuffix = params.refundId ? `ref_${params.refundId}` : `c_${Math.round(targetCumulative * 100)}`;
+    const payId = payment.id;
 
     const ride = await this.findRideById(payment.rideId);
     const fareSettled = payment.status === 'SUCCEEDED' || payment.status === 'PARTIALLY_REFUNDED' || (payment.metadata as any)?.settledToDriver;
@@ -2855,30 +2948,68 @@ export class MongoDatabaseStore implements IDatabaseStore {
     if (fareSettled && ride?.driverId) {
       const driver = await this.findDriverById(ride.driverId);
       if (driver) {
-        const driverReversal = Math.round(delta * 0.8 * 100) / 100;
-        const platformReversal = Math.round((delta - driverReversal) * 100) / 100;
+        let originalCommission: number;
+        let originalDriverEarning: number;
+
+        if (payment.metadata?.platformCommission !== undefined && payment.metadata?.driverEarning !== undefined) {
+          originalCommission = Number(payment.metadata.platformCommission);
+          originalDriverEarning = Number(payment.metadata.driverEarning);
+        } else {
+          const commEntries = await this.getPlatformLedger(50, { rideId: payment.rideId });
+          const commEntry = commEntries.find((e) => e.type === 'PLATFORM_COMMISSION' && e.fromAccount === 'platform:escrow' && e.toAccount === 'platform:revenue');
+          if (commEntry) {
+            originalCommission = commEntry.amount;
+            originalDriverEarning = Math.round((totalAmount - originalCommission) * 100) / 100;
+          } else {
+            originalDriverEarning = Math.round(totalAmount * 0.8 * 100) / 100;
+            originalCommission = Math.round((totalAmount - originalDriverEarning) * 100) / 100;
+          }
+        }
+
+        const allLedgers = await this.getPlatformLedger(100, { rideId: payment.rideId });
+        const alreadyReversedDriver = allLedgers
+          .filter((e) => e.type === 'DRIVER_EARNING' && e.toAccount === 'platform:escrow')
+          .reduce((sum, e) => sum + (e.amount || 0), 0);
+        const alreadyReversedComm = allLedgers
+          .filter((e) => e.type === 'PLATFORM_COMMISSION' && e.fromAccount === 'platform:revenue' && e.toAccount === 'platform:escrow')
+          .reduce((sum, e) => sum + (e.amount || 0), 0);
+
+        const isFinal = targetCumulative >= totalAmount || delta >= remainingBalance;
+        let driverReversal: number;
+        let platformReversal: number;
+
+        if (isFinal) {
+          driverReversal = Math.max(0, Math.round((originalDriverEarning - alreadyReversedDriver) * 100) / 100);
+          platformReversal = Math.max(0, Math.round((originalCommission - alreadyReversedComm) * 100) / 100);
+        } else {
+          const driverRatio = totalAmount > 0 ? (originalDriverEarning / totalAmount) : 0.8;
+          const proposedDriver = Math.round(delta * driverRatio * 100) / 100;
+          const remainingDriver = Math.max(0, Math.round((originalDriverEarning - alreadyReversedDriver) * 100) / 100);
+          driverReversal = Math.min(proposedDriver, remainingDriver);
+          platformReversal = Math.round((delta - driverReversal) * 100) / 100;
+        }
 
         const newEarningsTotal = Math.max(0, (driver.earningsTotal || 0) - driverReversal);
         await this.updateDriver(driver.id, { earningsTotal: newEarningsTotal });
 
         const driverWallet = await this.getOrCreateWallet(driver.userId);
-        if (driverWallet.balance >= driverReversal) {
+        const available = Math.max(0, driverWallet.balance);
+        if (available >= driverReversal) {
           await this.debitWallet(
             driver.userId,
             driverReversal,
             `Earnings reversal on refund for ride #${payment.rideId.slice(0, 8)}`,
             payment.rideId,
-            `webhook_${eventId}_driver_wal_${keySuffix}`
+            `refund_${payId}_${keySuffix}_driver_wal`
           );
         } else {
-          const available = Math.max(0, driverWallet.balance);
           if (available > 0) {
             await this.debitWallet(
               driver.userId,
               available,
               `Partial earnings reversal on refund for ride #${payment.rideId.slice(0, 8)}`,
               payment.rideId,
-              `webhook_${eventId}_driver_wal_part_${keySuffix}`
+              `refund_${payId}_${keySuffix}_driver_wal_part`
             );
           }
           const debtIncurred = Math.round((driverReversal - available) * 100) / 100;
@@ -2894,7 +3025,7 @@ export class MongoDatabaseStore implements IDatabaseStore {
             fromAccount: `driver:${driver.id}`,
             toAccount: 'platform:debt',
             status: 'OUTSTANDING',
-            idempotencyKey: `webhook_${eventId}_driver_debt_${keySuffix}`,
+            idempotencyKey: `refund_${payId}_${keySuffix}_driver_debt`,
           });
         }
 
@@ -2906,7 +3037,7 @@ export class MongoDatabaseStore implements IDatabaseStore {
           fromAccount: `driver:${driver.id}`,
           toAccount: 'platform:escrow',
           status: 'SETTLED',
-          idempotencyKey: `webhook_${eventId}_driver_rev_${keySuffix}`,
+          idempotencyKey: `refund_${payId}_${keySuffix}_driver_rev`,
         });
 
         await this.recordLedgerEntry({
@@ -2917,12 +3048,12 @@ export class MongoDatabaseStore implements IDatabaseStore {
           fromAccount: 'platform:revenue',
           toAccount: 'platform:escrow',
           status: 'SETTLED',
-          idempotencyKey: `webhook_${eventId}_comm_rev_${keySuffix}`,
+          idempotencyKey: `refund_${payId}_${keySuffix}_comm_rev`,
         });
       }
     }
 
-    const idempotencyKey = `webhook_${eventId}_refund_${keySuffix}`;
+    const idempotencyKey = `refund_${payId}_${keySuffix}_rider`;
     await this.recordLedgerEntry({
       rideId: payment.rideId,
       type: 'REFUND',

@@ -260,6 +260,35 @@ export class PaymentService {
             });
           }
         }
+      } else if (event.type === 'refund.failed') {
+        const obj = event.data.object as any;
+        logger.warn(`Stripe refund ${obj.id} failed: ${obj.failure_reason || obj.reason}`);
+        let paymentIntentId = typeof obj.payment_intent === 'string' && obj.payment_intent.startsWith('pi_') ? obj.payment_intent : undefined;
+        if (!paymentIntentId && obj.charge) {
+          const localPayment = await db.findPaymentByStripeCharge(obj.charge);
+          paymentIntentId = localPayment?.stripePaymentIntentId;
+        }
+        if (paymentIntentId) {
+          await db.trackRefundState({
+            paymentIntentId,
+            refundId: obj.id,
+            amount: obj.amount ? Math.round(Number(obj.amount)) / 100 : 0,
+            status: 'failed',
+            eventId: effectiveEventId,
+            reason: obj.failure_reason || obj.reason,
+          });
+        }
+        if (effectiveEventId) {
+          await db.recordProcessedWebhook(
+            effectiveEventId,
+            'stripe',
+            event.type,
+            { id: event.id, type: event.type, refundId: obj.id, status: 'failed' },
+            'FAILED',
+            obj.failure_reason || 'Refund failed in Stripe'
+          );
+        }
+        return true;
       } else if (
         event.type === 'charge.refunded' ||
         event.type === 'refund.created' ||
@@ -275,6 +304,21 @@ export class PaymentService {
               refundId: obj.id,
               status: obj.status,
             });
+            let piId = typeof obj.payment_intent === 'string' && obj.payment_intent.startsWith('pi_') ? obj.payment_intent : undefined;
+            if (!piId && obj.charge) {
+              const localPay = await db.findPaymentByStripeCharge(obj.charge);
+              piId = localPay?.stripePaymentIntentId;
+            }
+            if (piId) {
+              await db.trackRefundState({
+                paymentIntentId: piId,
+                refundId: obj.id,
+                amount: obj.amount ? Math.round(Number(obj.amount)) / 100 : 0,
+                status: obj.status,
+                eventId: effectiveEventId,
+                reason: obj.cancellation_reason || obj.reason || obj.failure_reason,
+              });
+            }
             if (effectiveEventId) {
               await db.recordProcessedWebhook(
                 effectiveEventId,
@@ -295,16 +339,21 @@ export class PaymentService {
         } else if (obj.object === 'payment_intent' && typeof obj.id === 'string' && obj.id.startsWith('pi_')) {
           paymentIntentId = obj.id;
         } else if (obj.charge && typeof obj.charge === 'string') {
-          // Resolve PaymentIntent via charge retrieval from Stripe or DB
-          try {
-            const charge = await StripeService.retrieveCharge(obj.charge);
-            if (typeof charge?.payment_intent === 'string') {
-              paymentIntentId = charge.payment_intent;
-            } else if (charge?.payment_intent?.id) {
-              paymentIntentId = charge.payment_intent.id;
+          // Resolve PaymentIntent via local DB first, then Stripe API
+          const localPayment = await db.findPaymentByStripeCharge(obj.charge);
+          if (localPayment?.stripePaymentIntentId) {
+            paymentIntentId = localPayment.stripePaymentIntentId;
+          } else {
+            try {
+              const charge = await StripeService.retrieveCharge(obj.charge);
+              if (typeof charge?.payment_intent === 'string') {
+                paymentIntentId = charge.payment_intent;
+              } else if (charge?.payment_intent?.id) {
+                paymentIntentId = charge.payment_intent.id;
+              }
+            } catch (e: any) {
+              logger.warn(`Could not retrieve charge ${obj.charge} to resolve payment_intent: ${e.message}`);
             }
-          } catch (e: any) {
-            logger.warn(`Could not retrieve charge ${obj.charge} to resolve payment_intent: ${e.message}`);
           }
         }
 
@@ -316,6 +365,11 @@ export class PaymentService {
             eventType: event.type,
             refundId: obj.id,
             chargeId: obj.charge,
+          });
+          await db.recordReconciliationDiscrepancy({
+            type: 'UNRESOLVABLE_REFUND_PAYMENT_INTENT',
+            id: obj.id || 'unknown_refund',
+            details: `Refund webhook received without valid payment_intent. eventId=${effectiveEventId}, chargeId=${obj.charge}`,
           });
           if (effectiveEventId) {
             await db.recordProcessedWebhook(
@@ -347,29 +401,37 @@ export class PaymentService {
         const refundId = obj.refunds?.data?.[0]?.id || (obj.object === 'refund' ? obj.id : undefined);
         const currency = obj.currency ? String(obj.currency).toUpperCase() : undefined;
 
-        const settleResult = await db.settleStripeRefund({
-          paymentIntentId,
-          eventId: effectiveEventId,
-          cumulativeAmountRefunded,
-          refundDelta,
-          refundAmount: cumulativeAmountRefunded,
-          currency,
-          refundId,
-          reason: obj.cancellation_reason || obj.reason || obj.failure_reason,
-        });
+        // Acquire lock for this payment's refund to prevent race conditions during settlement
+        const refundLockKey = `payment:refund:${paymentIntentId}`;
+        const refundLock = await acquireLock(refundLockKey, 15000);
 
-        // Only emit socket side-effect once per real financial mutation (strictly idempotent)
-        if (io && settleResult.success && !settleResult.alreadyRefunded && (settleResult.refundDelta ?? 1) > 0) {
-          const payment = await db.findPaymentByStripeIntent(paymentIntentId);
-          if (payment) {
-            io.to(`ride:${payment.rideId}`).emit('ride:payment_refunded', {
-              rideId: payment.rideId,
-              status: settleResult.status || payment.status,
-              amount: settleResult.refundAmount,
-              refundDelta: settleResult.refundDelta,
-              isPartial: settleResult.isPartial,
-            });
+        try {
+          const settleResult = await db.settleStripeRefund({
+            paymentIntentId,
+            eventId: effectiveEventId,
+            cumulativeAmountRefunded,
+            refundDelta,
+            refundAmount: cumulativeAmountRefunded,
+            currency,
+            refundId,
+            reason: obj.cancellation_reason || obj.reason || obj.failure_reason,
+          });
+
+          // Only emit socket side-effect once per real financial mutation (strictly idempotent)
+          if (io && settleResult.success && !settleResult.alreadyRefunded && (settleResult.refundDelta ?? 1) > 0) {
+            const payment = await db.findPaymentByStripeIntent(paymentIntentId);
+            if (payment) {
+              io.to(`ride:${payment.rideId}`).emit('ride:payment_refunded', {
+                rideId: payment.rideId,
+                status: settleResult.status || payment.status,
+                amount: settleResult.refundAmount,
+                refundDelta: settleResult.refundDelta,
+                isPartial: settleResult.isPartial,
+              });
+            }
           }
+        } finally {
+          await releaseLock(refundLockKey, refundLock.token);
         }
       }
 
@@ -428,68 +490,96 @@ export class PaymentService {
       throw new AppError('Payment not found for refund request', 404, 'PAYMENT_NOT_FOUND');
     }
 
-    if (payment.status !== 'SUCCEEDED' && payment.status !== 'PARTIALLY_REFUNDED') {
-      throw new AppError(
-        `Cannot refund payment in '${payment.status}' status. Only SUCCEEDED or PARTIALLY_REFUNDED payments can be refunded.`,
-        400,
-        'INVALID_PAYMENT_STATUS_FOR_REFUND'
-      );
+    // IDOR protection: only the rider or an admin can initiate a refund
+    if (params.requestedByUserId) {
+      if (payment.userId !== params.requestedByUserId) {
+        const requestingUser = await db.findUserById(params.requestedByUserId);
+        if (requestingUser?.role !== 'ADMIN') {
+          throw new AppError('Unauthorized to request refund for this payment', 403, 'FORBIDDEN');
+        }
+      }
     }
 
-    const totalAmount = Math.round(payment.amount * 100) / 100;
-    const existingRefunded = Math.round((payment.refundAmount || 0) * 100) / 100;
-    const remainingBalance = Math.round((totalAmount - existingRefunded) * 100) / 100;
-
-    if (remainingBalance <= 0) {
-      throw new AppError('Payment is already fully refunded', 400, 'PAYMENT_ALREADY_REFUNDED');
+    // Distributed lock to serialize concurrent refund requests for the same payment
+    const lockKey = `payment:refund:${payment.id}`;
+    const lock = await acquireLock(lockKey, 10000);
+    if (!lock.acquired) {
+      throw new AppError('A refund is currently being processed for this payment.', 409, 'CONCURRENT_REFUND_CONFLICT');
     }
 
-    let parsedAmount: number | undefined = undefined;
-    if (amount !== undefined && amount !== null) {
-      if (typeof amount !== 'number' || isNaN(amount) || !isFinite(amount)) {
-        throw new AppError('Refund amount must be a finite, valid number', 400, 'INVALID_REFUND_AMOUNT');
+    try {
+      // Re-fetch payment inside lock to get latest status and refund amount
+      const freshPayment = await db.findPaymentById(payment.id);
+      if (!freshPayment) {
+        throw new AppError('Payment not found', 404, 'PAYMENT_NOT_FOUND');
       }
-      if (amount <= 0) {
-        throw new AppError('Refund amount must be greater than 0', 400, 'INVALID_REFUND_AMOUNT');
-      }
-      // Decimal precision validation
-      const decimalStr = String(amount).split('.')[1];
-      if (decimalStr && decimalStr.length > 2) {
-        throw new AppError('Refund amount cannot have more than 2 decimal places', 400, 'INVALID_REFUND_PRECISION');
-      }
-      parsedAmount = Math.round(amount * 100) / 100;
 
-      if (parsedAmount > totalAmount) {
+      if (freshPayment.status !== 'SUCCEEDED' && freshPayment.status !== 'PARTIALLY_REFUNDED') {
         throw new AppError(
-          `Refund amount (${parsedAmount} ${payment.currency}) exceeds original payment amount (${totalAmount} ${payment.currency})`,
+          `Cannot refund payment in '${freshPayment.status}' status. Only SUCCEEDED or PARTIALLY_REFUNDED payments can be refunded.`,
           400,
-          'REFUND_AMOUNT_EXCEEDS_BALANCE'
+          'INVALID_PAYMENT_STATUS_FOR_REFUND'
         );
       }
-      if (parsedAmount > remainingBalance) {
-        throw new AppError(
-          `Refund amount (${parsedAmount} ${payment.currency}) exceeds remaining refundable balance (${remainingBalance} ${payment.currency})`,
-          400,
-          'REFUND_AMOUNT_EXCEEDS_BALANCE'
-        );
+
+      const totalAmount = Math.round(freshPayment.amount * 100) / 100;
+      const existingRefunded = Math.round((freshPayment.refundAmount || 0) * 100) / 100;
+      const remainingBalance = Math.round((totalAmount - existingRefunded) * 100) / 100;
+
+      if (remainingBalance <= 0) {
+        throw new AppError('Payment is already fully refunded', 400, 'PAYMENT_ALREADY_REFUNDED');
       }
+
+      let parsedAmount: number | undefined = undefined;
+      if (amount !== undefined && amount !== null) {
+        if (typeof amount !== 'number' || isNaN(amount) || !isFinite(amount)) {
+          throw new AppError('Refund amount must be a finite, valid number', 400, 'INVALID_REFUND_AMOUNT');
+        }
+        if (amount <= 0) {
+          throw new AppError('Refund amount must be greater than 0', 400, 'INVALID_REFUND_AMOUNT');
+        }
+        // Strict decimal precision validation BEFORE any calculation
+        const decimalStr = String(amount).split('.')[1];
+        if (decimalStr && decimalStr.length > 2) {
+          throw new AppError('Refund amount cannot have more than 2 decimal places', 400, 'INVALID_REFUND_PRECISION');
+        }
+        parsedAmount = Math.round(amount * 100) / 100;
+
+        if (parsedAmount > totalAmount) {
+          throw new AppError(
+            `Refund amount (${parsedAmount} ${freshPayment.currency}) exceeds original payment amount (${totalAmount} ${freshPayment.currency})`,
+            400,
+            'REFUND_AMOUNT_EXCEEDS_BALANCE'
+          );
+        }
+        if (parsedAmount > remainingBalance) {
+          throw new AppError(
+            `Refund amount (${parsedAmount} ${freshPayment.currency}) exceeds remaining refundable balance (${remainingBalance} ${freshPayment.currency})`,
+            400,
+            'REFUND_AMOUNT_EXCEEDS_BALANCE'
+          );
+        }
+      }
+
+      const intentToRefund = freshPayment.stripePaymentIntentId;
+      if (!intentToRefund) {
+        throw new AppError('Payment does not have an associated Stripe payment intent', 400, 'STRIPE_INTENT_MISSING');
+      }
+
+      // Process refund through Stripe (source of truth)
+      const stripeResult = await StripeService.refundPayment(intentToRefund, parsedAmount, reason);
+
+      return {
+        success: true,
+        refundId: stripeResult.refundId,
+        status: stripeResult.status,
+        amountRefunded: stripeResult.amountRefunded || parsedAmount || remainingBalance,
+        paymentStatus: freshPayment.status,
+      };
+    } finally {
+      await releaseLock(lockKey, lock.token);
     }
-
-    const intentToRefund = payment.stripePaymentIntentId;
-    if (!intentToRefund) {
-      throw new AppError('Payment does not have an associated Stripe payment intent', 400, 'STRIPE_INTENT_MISSING');
-    }
-
-    // Process refund through Stripe (source of truth)
-    const stripeResult = await StripeService.refundPayment(intentToRefund, parsedAmount, reason);
-
-    return {
-      success: true,
-      refundId: stripeResult.refundId,
-      status: stripeResult.status,
-      amountRefunded: stripeResult.amountRefunded || parsedAmount || remainingBalance,
-      paymentStatus: payment.status,
-    };
   }
 }
+
 
