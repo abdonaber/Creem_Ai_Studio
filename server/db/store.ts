@@ -48,6 +48,8 @@ export interface IRefreshSession {
   revoked: boolean;
   revokedReason?: string;
   expiresAt: string;
+  rotatedAt?: string;
+  replacedByJti?: string;
   ip?: string;
   userAgent?: string;
   createdAt: string;
@@ -281,6 +283,10 @@ export interface IDatabaseStore {
     userAgent?: string;
   }): Promise<IRefreshSession>;
   findRefreshSessionByJti(jti: string): Promise<IRefreshSession | null>;
+  consumeRefreshSession(
+    jti: string,
+    replacedByJti?: string
+  ): Promise<{ consumed: boolean; session: IRefreshSession | null }>;
   revokeRefreshSession(jti: string, reason?: string): Promise<void>;
   revokeAllSessionsForUser(userId: string, reason?: string): Promise<void>;
 }
@@ -338,6 +344,10 @@ export class MongoDatabaseStore implements IDatabaseStore {
       licenseNumber: doc.licenseNumber,
       documents: doc.documents,
       earningsTotal: doc.earningsTotal ?? 0,
+      outstandingDebt: doc.outstandingDebt ?? 0,
+      lastSeenAt: doc.lastSeenAt
+        ? (doc.lastSeenAt instanceof Date ? doc.lastSeenAt.toISOString() : String(doc.lastSeenAt))
+        : undefined,
     };
   }
 
@@ -608,11 +618,20 @@ export class MongoDatabaseStore implements IDatabaseStore {
   public async updateRide(id: string, updates: Partial<IRide>): Promise<IRide | null> {
     this.ensureConnection();
     const query = mongoose.Types.ObjectId.isValid(id) ? { _id: id } : { id };
-    const doc = await RideModel.findOneAndUpdate(
-      query,
-      { $set: { ...updates, updatedAt: new Date() } },
-      { new: true }
-    ).lean();
+    const setOps: Record<string, any> = { updatedAt: new Date() };
+    const unsetOps: Record<string, any> = {};
+    for (const [k, v] of Object.entries(updates)) {
+      if (v === undefined) {
+        unsetOps[k] = '';
+      } else {
+        setOps[k] = v;
+      }
+    }
+    const updateQuery: Record<string, any> = { $set: setOps };
+    if (Object.keys(unsetOps).length > 0) {
+      updateQuery.$unset = unsetOps;
+    }
+    const doc = await RideModel.findOneAndUpdate(query, updateQuery, { new: true }).lean();
     return doc ? this.docToRide(doc) : null;
   }
 
@@ -804,14 +823,16 @@ export class MongoDatabaseStore implements IDatabaseStore {
         {
           ...rideQuery,
           status: { $in: ['REQUESTED', 'SEARCHING_DRIVER'] },
-          driverId: { $exists: false },
+          $or: [{ driverId: { $exists: false } }, { driverId: null }],
         },
         {
           $set: {
             status: 'DRIVER_ASSIGNED',
             driverId,
             updatedAt: new Date(),
-            'currentOffer.status': 'ACCEPTED',
+          },
+          $unset: {
+            currentOffer: '',
           },
           $push: {
             stateHistory: {
@@ -1318,11 +1339,15 @@ export class MongoDatabaseStore implements IDatabaseStore {
           );
 
           // 2. Driver earning & platform commission
+          const walletCommissionRate = config.commissionRate;
+          const walletDriverShareRate = 1 - walletCommissionRate;
+          let settledDriverEarning = Math.round(amount * walletDriverShareRate * 100) / 100;
+          let settledPlatformCommission = Math.round((amount - settledDriverEarning) * 100) / 100;
           if (driverId) {
             const driver = await DriverModel.findById(driverId).session(session).lean();
             if (driver) {
-              const driverEarning = Math.round(amount * 0.8 * 100) / 100;
-              const platformCommission = Math.round((amount - driverEarning) * 100) / 100;
+              const driverEarning = settledDriverEarning;
+              const platformCommission = settledPlatformCommission;
 
               let debtRecovery = 0;
               if (driver.outstandingDebt && driver.outstandingDebt > 0) {
@@ -1439,6 +1464,12 @@ export class MongoDatabaseStore implements IDatabaseStore {
                 status: 'SUCCEEDED',
                 paymentMethod: 'WALLET',
                 idempotencyKey,
+                metadata: {
+                  driverEarning: settledDriverEarning,
+                  platformCommission: settledPlatformCommission,
+                  originalTotal: amount,
+                  settledToDriver: Boolean(driverId),
+                },
               },
             ],
             { session }
@@ -1494,11 +1525,14 @@ export class MongoDatabaseStore implements IDatabaseStore {
       idempotencyKey: idempotencyKey ? `${idempotencyKey}_ledger_fare` : undefined,
     });
 
+    const fbDriverEarning = Math.round(amount * (1 - config.commissionRate) * 100) / 100;
+    const fbPlatformCommission = Math.round((amount - fbDriverEarning) * 100) / 100;
+
     if (driverId) {
       const driver = await this.findDriverById(driverId);
       if (driver) {
-        const driverEarning = Math.round(amount * 0.8 * 100) / 100;
-        const platformCommission = Math.round((amount - driverEarning) * 100) / 100;
+        const driverEarning = fbDriverEarning;
+        const platformCommission = fbPlatformCommission;
 
         let debtRecovery = 0;
         if (driver.outstandingDebt && driver.outstandingDebt > 0) {
@@ -1563,6 +1597,12 @@ export class MongoDatabaseStore implements IDatabaseStore {
       status: 'SUCCEEDED',
       paymentMethod: 'WALLET',
       idempotencyKey,
+      metadata: {
+        driverEarning: fbDriverEarning,
+        platformCommission: fbPlatformCommission,
+        originalTotal: amount,
+        settledToDriver: Boolean(driverId),
+      },
     });
 
     return { success: true, transactionId: payment.id };
@@ -1591,13 +1631,13 @@ export class MongoDatabaseStore implements IDatabaseStore {
             result = {
               success: true,
               transactionId: existingPayment._id.toString(),
-              platformFee: Math.round(amount * 0.2 * 100) / 100,
+              platformFee: Math.round(amount * config.commissionRate * 100) / 100,
               commissionDebt: 0,
             };
             return;
           }
 
-          const platformFee = Math.round(amount * 0.2 * 100) / 100;
+          const platformFee = Math.round(amount * config.commissionRate * 100) / 100;
           const driverEarning = Math.round((amount - platformFee) * 100) / 100;
           const driver = await DriverModel.findById(driverId).session(session).lean();
           let debtIncurred = 0;
@@ -1752,6 +1792,12 @@ export class MongoDatabaseStore implements IDatabaseStore {
                 status: 'SUCCEEDED',
                 paymentMethod: 'CASH',
                 idempotencyKey,
+                metadata: {
+                  driverEarning,
+                  platformCommission: platformFee,
+                  originalTotal: amount,
+                  settledToDriver: true,
+                },
               },
             ],
             { session }
@@ -1793,12 +1839,12 @@ export class MongoDatabaseStore implements IDatabaseStore {
       return {
         success: true,
         transactionId: existingPayment._id.toString(),
-        platformFee: Math.round(amount * 0.2 * 100) / 100,
+        platformFee: Math.round(amount * config.commissionRate * 100) / 100,
         commissionDebt: 0,
       };
     }
 
-    const platformFee = Math.round(amount * 0.2 * 100) / 100;
+    const platformFee = Math.round(amount * config.commissionRate * 100) / 100;
     const driverEarning = Math.round((amount - platformFee) * 100) / 100;
     const driver = await this.findDriverById(driverId);
     let debtIncurred = 0;
@@ -1870,6 +1916,12 @@ export class MongoDatabaseStore implements IDatabaseStore {
       status: 'SUCCEEDED',
       paymentMethod: 'CASH',
       idempotencyKey,
+      metadata: {
+        driverEarning,
+        platformCommission: platformFee,
+        originalTotal: amount,
+        settledToDriver: true,
+      },
     });
 
     return {
@@ -1914,20 +1966,10 @@ export class MongoDatabaseStore implements IDatabaseStore {
       stripePaymentIntentId: payment.stripePaymentIntentId,
       stripeClientSecret: payment.stripeClientSecret,
       idempotencyKey: payment.idempotencyKey,
+      refundRequests: payment.refundRequests || [],
+      metadata: payment.metadata,
     });
-    return {
-      id: doc._id.toString(),
-      rideId: doc.rideId,
-      userId: doc.userId,
-      amount: doc.amount,
-      currency: doc.currency,
-      status: doc.status,
-      paymentMethod: doc.paymentMethod,
-      stripePaymentIntentId: doc.stripePaymentIntentId,
-      stripeClientSecret: doc.stripeClientSecret,
-      idempotencyKey: doc.idempotencyKey,
-      createdAt: doc.createdAt.toISOString(),
-    };
+    return this.docToPayment(doc);
   }
 
   private docToPayment(doc: any): IPayment {
@@ -1944,6 +1986,16 @@ export class MongoDatabaseStore implements IDatabaseStore {
       stripeClientSecret: doc.stripeClientSecret,
       idempotencyKey: doc.idempotencyKey,
       refundAmount: doc.refundAmount,
+      refundRequests: doc.refundRequests?.map((r: any) => ({
+        requestId: r.requestId,
+        idempotencyKey: r.idempotencyKey,
+        requestedAmount: r.requestedAmount,
+        reason: r.reason,
+        stripeRefundId: r.stripeRefundId,
+        status: r.status,
+        createdAt: r.createdAt instanceof Date ? r.createdAt.toISOString() : String(r.createdAt),
+        updatedAt: r.updatedAt instanceof Date ? r.updatedAt.toISOString() : undefined,
+      })),
       refunds: doc.refunds?.map((r: any) => ({
         stripeRefundId: r.stripeRefundId,
         amount: r.amount,
@@ -2213,7 +2265,7 @@ export class MongoDatabaseStore implements IDatabaseStore {
           if (ride?.driverId) {
             const driver = await DriverModel.findById(ride.driverId).session(session).lean();
             if (driver) {
-              const driverEarning = Math.round(payment.amount * 0.8 * 100) / 100;
+              const driverEarning = Math.round(payment.amount * (1 - config.commissionRate) * 100) / 100;
               const platformCommission = Math.round((payment.amount - driverEarning) * 100) / 100;
 
               let debtRecovery = 0;
@@ -2343,19 +2395,14 @@ export class MongoDatabaseStore implements IDatabaseStore {
     const payment = await this.findPaymentByStripeIntent(paymentIntentId);
     if (!payment) throw new AppError('Payment not found', 404, 'PAYMENT_NOT_FOUND');
     if (payment.status === 'SUCCEEDED') return { success: true, paymentId: payment.id, alreadySettled: true };
-    const driverEarning = Math.round(payment.amount * 0.8 * 100) / 100;
+    const driverEarning = Math.round(payment.amount * (1 - config.commissionRate) * 100) / 100;
     const platformCommission = Math.round((payment.amount - driverEarning) * 100) / 100;
-    await this.updatePayment(payment.id, {
-      status: 'SUCCEEDED',
-      metadata: {
-        ...(payment.metadata || {}),
-        driverEarning,
-        platformCommission,
-        originalTotal: payment.amount,
-        settledToDriver: true,
-      },
+
+    await this.updateRide(payment.rideId, {
+      paymentStatus: 'SUCCEEDED',
+      paymentMethod: 'CREDIT_CARD',
+      finalFare: payment.amount,
     });
-    await this.updateRide(payment.rideId, { paymentStatus: 'SUCCEEDED', finalFare: payment.amount });
     await this.recordLedgerEntry({
       rideId: payment.rideId,
       type: 'RIDER_FARE',
@@ -2365,6 +2412,68 @@ export class MongoDatabaseStore implements IDatabaseStore {
       toAccount: 'platform:escrow',
       status: 'SETTLED',
       idempotencyKey: `webhook_${eventId}_fare`,
+    });
+
+    let settledToDriver = false;
+    const ride = await this.findRideById(payment.rideId);
+    if (ride?.driverId) {
+      const driver = await this.findDriverById(ride.driverId);
+      if (driver) {
+        settledToDriver = true;
+        let debtRecovery = 0;
+        if (driver.outstandingDebt && driver.outstandingDebt > 0) {
+          debtRecovery = Math.min(driverEarning, driver.outstandingDebt);
+        }
+        const netPayout = driverEarning - debtRecovery;
+        if (netPayout > 0) {
+          await this.creditWallet(
+            driver.userId,
+            netPayout,
+            `Net earnings for card ride #${payment.rideId.slice(0, 8)} (minus debt recovery)`,
+            payment.rideId,
+            `webhook_${eventId}_driver_credit`
+          );
+        }
+        if (debtRecovery > 0) {
+          await DriverModel.findByIdAndUpdate(driver.id, {
+            $inc: { outstandingDebt: -debtRecovery },
+          });
+          await this.recordLedgerEntry({
+            rideId: payment.rideId,
+            type: 'DEBT_RECOVERY',
+            amount: debtRecovery,
+            currency: 'SAR',
+            fromAccount: `driver:${driver.id}`,
+            toAccount: 'platform:commission',
+            status: 'SETTLED',
+            idempotencyKey: `webhook_${eventId}_debt_rec`,
+          });
+        }
+        await this.recordLedgerEntry({
+          rideId: payment.rideId,
+          type: 'PLATFORM_COMMISSION',
+          amount: platformCommission,
+          currency: 'SAR',
+          fromAccount: 'platform:escrow',
+          toAccount: 'platform:revenue',
+          status: 'COMMITTED',
+          idempotencyKey: `webhook_${eventId}_ledger_comm`,
+        });
+        await DriverModel.findByIdAndUpdate(driver.id, {
+          $inc: { earningsTotal: driverEarning, totalRides: 1 },
+        });
+      }
+    }
+
+    await this.updatePayment(payment.id, {
+      status: 'SUCCEEDED',
+      metadata: {
+        ...(payment.metadata || {}),
+        driverEarning,
+        platformCommission,
+        originalTotal: payment.amount,
+        settledToDriver,
+      },
     });
     return { success: true, paymentId: payment.id };
   }
@@ -2564,8 +2673,13 @@ export class MongoDatabaseStore implements IDatabaseStore {
                   originalCommission = commEntry.amount;
                   originalDriverEarning = Math.round((totalAmount - originalCommission) * 100) / 100;
                 } else {
-                  originalDriverEarning = Math.round(totalAmount * 0.8 * 100) / 100;
+                  originalDriverEarning = Math.round(totalAmount * (1 - config.commissionRate) * 100) / 100;
                   originalCommission = Math.round((totalAmount - originalDriverEarning) * 100) / 100;
+                  await this.recordReconciliationDiscrepancy({
+                    type: 'MISSING_ORIGINAL_SPLIT',
+                    id: payId,
+                    details: `Original commission/earnings metadata missing on payment ${payId}; defaulted reversal split to config rate (${config.commissionRate}).`,
+                  });
                 }
               }
 
@@ -2594,7 +2708,7 @@ export class MongoDatabaseStore implements IDatabaseStore {
                 driverReversal = Math.max(0, Math.round((originalDriverEarning - alreadyReversedDriver) * 100) / 100);
                 platformReversal = Math.max(0, Math.round((originalCommission - alreadyReversedComm) * 100) / 100);
               } else {
-                const driverRatio = totalAmount > 0 ? (originalDriverEarning / totalAmount) : 0.8;
+                const driverRatio = totalAmount > 0 ? (originalDriverEarning / totalAmount) : (1 - config.commissionRate);
                 const proposedDriver = Math.round(delta * driverRatio * 100) / 100;
                 const remainingDriver = Math.max(0, Math.round((originalDriverEarning - alreadyReversedDriver) * 100) / 100);
                 driverReversal = Math.min(proposedDriver, remainingDriver);
@@ -2961,8 +3075,13 @@ export class MongoDatabaseStore implements IDatabaseStore {
             originalCommission = commEntry.amount;
             originalDriverEarning = Math.round((totalAmount - originalCommission) * 100) / 100;
           } else {
-            originalDriverEarning = Math.round(totalAmount * 0.8 * 100) / 100;
+            originalDriverEarning = Math.round(totalAmount * (1 - config.commissionRate) * 100) / 100;
             originalCommission = Math.round((totalAmount - originalDriverEarning) * 100) / 100;
+            await this.recordReconciliationDiscrepancy({
+              type: 'MISSING_ORIGINAL_SPLIT',
+              id: payId,
+              details: `Original commission/earnings metadata missing on payment ${payId}; defaulted reversal split to config rate (${config.commissionRate}).`,
+            });
           }
         }
 
@@ -2982,7 +3101,7 @@ export class MongoDatabaseStore implements IDatabaseStore {
           driverReversal = Math.max(0, Math.round((originalDriverEarning - alreadyReversedDriver) * 100) / 100);
           platformReversal = Math.max(0, Math.round((originalCommission - alreadyReversedComm) * 100) / 100);
         } else {
-          const driverRatio = totalAmount > 0 ? (originalDriverEarning / totalAmount) : 0.8;
+          const driverRatio = totalAmount > 0 ? (originalDriverEarning / totalAmount) : (1 - config.commissionRate);
           const proposedDriver = Math.round(delta * driverRatio * 100) / 100;
           const remainingDriver = Math.max(0, Math.round((originalDriverEarning - alreadyReversedDriver) * 100) / 100);
           driverReversal = Math.min(proposedDriver, remainingDriver);
@@ -3416,11 +3535,14 @@ export class MongoDatabaseStore implements IDatabaseStore {
       RideModel.countDocuments({
         status: { $in: ['SEARCHING_DRIVER', 'DRIVER_ASSIGNED', 'DRIVER_ARRIVING', 'DRIVER_ARRIVED', 'RIDE_STARTED'] },
       }),
-      PaymentModel.find({ status: 'SUCCEEDED' }).lean(),
+      PaymentModel.find({ status: { $in: ['SUCCEEDED', 'PARTIALLY_REFUNDED'] } }).lean(),
     ]);
 
-    const totalGMV = payments.reduce((acc, p) => acc + (p.amount || 0), 0);
-    const platformNetRevenue = Math.round(totalGMV * 0.2 * 100) / 100;
+    const totalGMV = payments.reduce(
+      (acc, p) => acc + Math.max(0, (p.amount || 0) - ((p as any).refundAmount || 0)),
+      0
+    );
+    const platformNetRevenue = Math.round(totalGMV * config.commissionRate * 100) / 100;
 
     return {
       totalUsers,
@@ -3558,12 +3680,27 @@ export class MongoDatabaseStore implements IDatabaseStore {
   }> {
     this.ensureConnection();
     const [payments, drivers] = await Promise.all([
-      PaymentModel.find({ status: 'SUCCEEDED' }).lean(),
+      PaymentModel.find({ status: { $in: ['SUCCEEDED', 'PARTIALLY_REFUNDED'] } }).lean(),
       DriverModel.find({ outstandingDebt: { $gt: 0 } }).lean(),
     ]);
 
-    const totalGrossVolume = Math.round(payments.reduce((acc, p) => acc + (p.amount || 0), 0) * 100) / 100;
-    const totalPlatformRevenue = Math.round(totalGrossVolume * 0.2 * 100) / 100;
+    let totalGrossVolume = 0;
+    let totalPlatformRevenue = 0;
+    for (const p of payments) {
+      const amount = p.amount || 0;
+      const refunded = (p as any).refundAmount || 0;
+      const net = Math.max(0, Math.round((amount - refunded) * 100) / 100);
+      totalGrossVolume += net;
+      const ratio = amount > 0 ? net / amount : 0;
+      if ((p as any).metadata?.platformCommission !== undefined) {
+        totalPlatformRevenue += Number((p as any).metadata.platformCommission) * ratio;
+      } else {
+        totalPlatformRevenue += net * config.commissionRate;
+      }
+    }
+
+    totalGrossVolume = Math.round(totalGrossVolume * 100) / 100;
+    totalPlatformRevenue = Math.round(totalPlatformRevenue * 100) / 100;
     const totalDriverPayouts = Math.round((totalGrossVolume - totalPlatformRevenue) * 100) / 100;
     const totalOutstandingDebt = Math.round(drivers.reduce((acc, d) => acc + ((d as any).outstandingDebt || 0), 0) * 100) / 100;
 
@@ -3669,7 +3806,7 @@ export class MongoDatabaseStore implements IDatabaseStore {
         const fare = r.finalFare ?? r.estimatedFare ?? 0;
         const refunded = payment?.refundAmount || 0;
         const netFare = Math.max(0, fare - refunded);
-        expectedEarnings += Math.round(netFare * 0.8 * 100) / 100;
+        expectedEarnings += Math.round(netFare * (1 - config.commissionRate) * 100) / 100;
       }
 
       const diff = Math.abs((driver.earningsTotal || 0) - expectedEarnings);
@@ -3694,7 +3831,7 @@ export class MongoDatabaseStore implements IDatabaseStore {
       const fare = r.finalFare ?? r.estimatedFare ?? 0;
       const refunded = payment?.refundAmount || 0;
       const netFare = Math.max(0, fare - refunded);
-      expectedTotalCommission += Math.round(netFare * 0.2 * 100) / 100;
+      expectedTotalCommission += Math.round(netFare * config.commissionRate * 100) / 100;
     }
 
     const commissionLedgers = await PlatformLedgerModel.find({
@@ -3770,10 +3907,55 @@ export class MongoDatabaseStore implements IDatabaseStore {
       revoked: doc.revoked,
       revokedReason: doc.revokedReason,
       expiresAt: doc.expiresAt.toISOString(),
+      rotatedAt: (doc as any).rotatedAt ? new Date((doc as any).rotatedAt).toISOString() : undefined,
+      replacedByJti: (doc as any).replacedByJti,
       ip: doc.ip,
       userAgent: doc.userAgent,
       createdAt: doc.createdAt.toISOString(),
     };
+  }
+
+  public async consumeRefreshSession(
+    jti: string,
+    replacedByJti?: string
+  ): Promise<{ consumed: boolean; session: IRefreshSession | null }> {
+    this.ensureConnection();
+    const now = new Date();
+    const update: Record<string, any> = {
+      revoked: true,
+      revokedReason: 'ROTATED',
+      rotatedAt: now,
+    };
+    if (replacedByJti) update.replacedByJti = replacedByJti;
+
+    const priorDoc = await RefreshSessionModel.findOneAndUpdate(
+      { jti, revoked: false, expiresAt: { $gt: now } },
+      { $set: update },
+      { new: false }
+    ).lean();
+
+    if (priorDoc) {
+      return {
+        consumed: true,
+        session: {
+          id: priorDoc._id.toString(),
+          userId: priorDoc.userId,
+          jti: priorDoc.jti,
+          tokenHash: priorDoc.tokenHash,
+          revoked: false,
+          revokedReason: priorDoc.revokedReason,
+          expiresAt: priorDoc.expiresAt.toISOString(),
+          rotatedAt: (priorDoc as any).rotatedAt ? new Date((priorDoc as any).rotatedAt).toISOString() : undefined,
+          replacedByJti: (priorDoc as any).replacedByJti,
+          ip: priorDoc.ip,
+          userAgent: priorDoc.userAgent,
+          createdAt: priorDoc.createdAt.toISOString(),
+        },
+      };
+    }
+
+    const existing = await this.findRefreshSessionByJti(jti);
+    return { consumed: false, session: existing };
   }
 
   public async revokeRefreshSession(jti: string, reason: string = 'LOGOUT'): Promise<void> {

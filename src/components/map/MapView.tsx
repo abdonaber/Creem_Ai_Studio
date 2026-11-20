@@ -7,10 +7,44 @@ interface MapViewProps {
   destination?: LocationCoordinate | null;
   driverLocation?: { lat: number; lng: number; heading?: number } | null;
   fleetDrivers?: IDriver[];
-  onSelectLocation?: (coord: { lat: number; lng: number; address: string }, type: 'pickup' | 'destination') => void;
+  routePolyline?: Array<[number, number]>;
+  onSelectLocation?: (
+    coord: { lat: number; lng: number; address: string },
+    type: 'pickup' | 'destination'
+  ) => void;
   selectionMode?: 'pickup' | 'destination' | null;
   className?: string;
   zoom?: number;
+}
+
+function createPopupContent(title: string, lines: Array<{ text: string; className?: string }>): HTMLElement {
+  const container = document.createElement('div');
+  container.className = 'p-1 text-right';
+
+  const titleEl = document.createElement('div');
+  titleEl.className = 'font-bold text-slate-800 text-sm';
+  titleEl.textContent = title;
+  container.appendChild(titleEl);
+
+  for (const line of lines) {
+    if (!line.text) continue;
+    const lineEl = document.createElement('div');
+    lineEl.className = line.className || 'text-xs text-slate-600 mt-0.5';
+    lineEl.textContent = line.text;
+    container.appendChild(lineEl);
+  }
+
+  return container;
+}
+
+function hasValidCoords(loc?: { lat?: number | null; lng?: number | null } | null): loc is { lat: number; lng: number } {
+  return Boolean(
+    loc &&
+      typeof loc.lat === 'number' &&
+      typeof loc.lng === 'number' &&
+      Number.isFinite(loc.lat) &&
+      Number.isFinite(loc.lng)
+  );
 }
 
 export const MapView: React.FC<MapViewProps> = ({
@@ -18,6 +52,7 @@ export const MapView: React.FC<MapViewProps> = ({
   destination,
   driverLocation,
   fleetDrivers = [],
+  routePolyline,
   onSelectLocation,
   selectionMode,
   className = 'h-full w-full',
@@ -31,12 +66,23 @@ export const MapView: React.FC<MapViewProps> = ({
   const fleetMarkersRef = useRef<L.Marker[]>([]);
   const polylineRef = useRef<L.Polyline | null>(null);
 
+  const onSelectLocationRef = useRef(onSelectLocation);
+  const selectionModeRef = useRef(selectionMode);
+
+  useEffect(() => {
+    onSelectLocationRef.current = onSelectLocation;
+  }, [onSelectLocation]);
+
+  useEffect(() => {
+    selectionModeRef.current = selectionMode;
+  }, [selectionMode]);
+
   // Initialize Map
   useEffect(() => {
     if (!mapContainerRef.current || mapInstanceRef.current) return;
 
-    const initialLat = pickup?.lat || 24.7136;
-    const initialLng = pickup?.lng || 46.6753;
+    const initialLat = pickup?.lat ?? 24.7136;
+    const initialLng = pickup?.lng ?? 46.6753;
 
     const map = L.map(mapContainerRef.current, {
       center: [initialLat, initialLng],
@@ -44,7 +90,6 @@ export const MapView: React.FC<MapViewProps> = ({
       zoomControl: false,
     });
 
-    // Dark/Clean CartoDB Positron / Voyager style map tiles
     L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
       attribution: '&copy; OpenStreetMap &copy; CARTO',
       subdomains: 'abcd',
@@ -53,15 +98,17 @@ export const MapView: React.FC<MapViewProps> = ({
 
     L.control.zoom({ position: 'bottomright' }).addTo(map);
 
-    map.on('click', (e) => {
-      if (onSelectLocation && selectionMode) {
-        onSelectLocation(
+    map.on('click', (e: L.LeafletMouseEvent) => {
+      const handler = onSelectLocationRef.current;
+      const mode = selectionModeRef.current;
+      if (handler && mode) {
+        handler(
           {
             lat: e.latlng.lat,
             lng: e.latlng.lng,
-            address: `إحداثيات (${e.latlng.lat.toFixed(4)}, ${e.latlng.lng.toFixed(4)})`,
+            address: `موقع محدد (${e.latlng.lat.toFixed(4)}, ${e.latlng.lng.toFixed(4)})`,
           },
-          selectionMode
+          mode
         );
       }
     });
@@ -72,7 +119,7 @@ export const MapView: React.FC<MapViewProps> = ({
       map.remove();
       mapInstanceRef.current = null;
     };
-  }, []);
+  }, [zoom]);
 
   // Update Pickup Marker
   useEffect(() => {
@@ -84,7 +131,7 @@ export const MapView: React.FC<MapViewProps> = ({
       pickupMarkerRef.current = null;
     }
 
-    if (pickup) {
+    if (hasValidCoords(pickup)) {
       const pickupIcon = L.divIcon({
         className: 'custom-pickup-marker',
         html: `
@@ -101,9 +148,13 @@ export const MapView: React.FC<MapViewProps> = ({
         iconAnchor: [16, 16],
       });
 
+      const popupEl = createPopupContent('نقطة الركوب', [
+        { text: pickup.address || '' },
+      ]);
+
       pickupMarkerRef.current = L.marker([pickup.lat, pickup.lng], { icon: pickupIcon })
         .addTo(map)
-        .bindPopup(`<div class="font-bold text-slate-800 text-sm">نقطة الركوب</div><div class="text-xs text-slate-600">${pickup.address}</div>`);
+        .bindPopup(popupEl);
     }
   }, [pickup]);
 
@@ -117,7 +168,7 @@ export const MapView: React.FC<MapViewProps> = ({
       destinationMarkerRef.current = null;
     }
 
-    if (destination) {
+    if (hasValidCoords(destination)) {
       const destIcon = L.divIcon({
         className: 'custom-dest-marker',
         html: `
@@ -134,9 +185,13 @@ export const MapView: React.FC<MapViewProps> = ({
         iconAnchor: [18, 36],
       });
 
+      const popupEl = createPopupContent('الوجهة', [
+        { text: destination.address || '' },
+      ]);
+
       destinationMarkerRef.current = L.marker([destination.lat, destination.lng], { icon: destIcon })
         .addTo(map)
-        .bindPopup(`<div class="font-bold text-slate-800 text-sm">الوجهة</div><div class="text-xs text-slate-600">${destination.address}</div>`);
+        .bindPopup(popupEl);
     }
   }, [destination]);
 
@@ -150,37 +205,34 @@ export const MapView: React.FC<MapViewProps> = ({
       polylineRef.current = null;
     }
 
-    if (pickup && destination) {
-      const latlngs: [number, number][] = [
-        [pickup.lat, pickup.lng],
-        // Add a slight realistic curve midpoint for natural road visualization
-        [(pickup.lat + destination.lat) / 2 + 0.002, (pickup.lng + destination.lng) / 2 + 0.003],
-        [destination.lat, destination.lng],
-      ];
+    if (hasValidCoords(pickup) && hasValidCoords(destination)) {
+      const latlngs: [number, number][] =
+        routePolyline && routePolyline.length >= 2
+          ? routePolyline
+          : [
+              [pickup.lat, pickup.lng],
+              [destination.lat, destination.lng],
+            ];
 
       const polyline = L.polyline(latlngs, {
-        color: '#059669', // Emerald 600
+        color: '#059669',
         weight: 5,
         opacity: 0.85,
-        dashArray: '8, 8',
+        dashArray: routePolyline && routePolyline.length > 2 ? undefined : '8, 8',
         lineCap: 'round',
         lineJoin: 'round',
       }).addTo(map);
 
       polylineRef.current = polyline;
 
-      const bounds = L.latLngBounds([
-        [pickup.lat, pickup.lng],
-        [destination.lat, destination.lng],
-      ]);
-
-      if (driverLocation) {
+      const bounds = L.latLngBounds(latlngs);
+      if (hasValidCoords(driverLocation)) {
         bounds.extend([driverLocation.lat, driverLocation.lng]);
       }
 
       map.fitBounds(bounds, { padding: [60, 60], maxZoom: 15 });
     }
-  }, [pickup, destination]);
+  }, [pickup, destination, routePolyline, driverLocation]);
 
   // Update Driver Marker
   useEffect(() => {
@@ -192,8 +244,8 @@ export const MapView: React.FC<MapViewProps> = ({
       driverMarkerRef.current = null;
     }
 
-    if (driverLocation) {
-      const heading = driverLocation.heading || 0;
+    if (hasValidCoords(driverLocation)) {
+      const heading = Number.isFinite(driverLocation.heading) ? Number(driverLocation.heading) : 0;
       const driverCarIcon = L.divIcon({
         className: 'custom-driver-car-marker',
         html: `
@@ -211,9 +263,10 @@ export const MapView: React.FC<MapViewProps> = ({
         iconAnchor: [20, 20],
       });
 
+      const popupEl = createPopupContent('موقع الكابتن المباشر', []);
       driverMarkerRef.current = L.marker([driverLocation.lat, driverLocation.lng], { icon: driverCarIcon })
         .addTo(map)
-        .bindPopup('<div class="font-bold text-slate-900 text-sm">موقع الكابتن المباشر</div>');
+        .bindPopup(popupEl);
     }
   }, [driverLocation]);
 
@@ -227,7 +280,7 @@ export const MapView: React.FC<MapViewProps> = ({
 
     if (fleetDrivers && fleetDrivers.length > 0) {
       fleetDrivers.forEach((driver) => {
-        if (!driver.currentLocation) return;
+        if (!hasValidCoords(driver.currentLocation)) return;
 
         const fleetIcon = L.divIcon({
           className: 'custom-fleet-marker',
@@ -246,15 +299,29 @@ export const MapView: React.FC<MapViewProps> = ({
           iconAnchor: [16, 16],
         });
 
-        const m = L.marker([driver.currentLocation.lat, driver.currentLocation.lng], { icon: fleetIcon })
+        const vehicleInfo = [driver.vehicle?.make, driver.vehicle?.model]
+          .filter(Boolean)
+          .join(' ');
+        const categorySuffix = driver.vehicle?.category ? ` - ${driver.vehicle.category}` : '';
+
+        const popupEl = createPopupContent(driver.userName || 'كابتن', [
+          {
+            text: `${vehicleInfo}${categorySuffix}`.trim(),
+            className: 'text-xs text-slate-500',
+          },
+          {
+            text: driver.isOnline ? 'متاح الآن' : 'غير متصل',
+            className: `text-xs font-semibold mt-1 ${
+              driver.isOnline ? 'text-emerald-600' : 'text-slate-500'
+            }`,
+          },
+        ]);
+
+        const m = L.marker([driver.currentLocation.lat, driver.currentLocation.lng], {
+          icon: fleetIcon,
+        })
           .addTo(map)
-          .bindPopup(`
-            <div class="p-1">
-              <div class="font-bold text-slate-800">${driver.userName || 'كابتن'}</div>
-              <div class="text-xs text-slate-500">${driver.vehicle?.make || ''} ${driver.vehicle?.model || ''} - ${driver.vehicle?.category || ''}</div>
-              <div class="text-xs text-emerald-600 font-semibold mt-1">${driver.isOnline ? '🟢 متاح الآن' : '⚪ غير متصل'}</div>
-            </div>
-          `);
+          .bindPopup(popupEl);
 
         fleetMarkersRef.current.push(m);
       });
@@ -263,10 +330,10 @@ export const MapView: React.FC<MapViewProps> = ({
 
   return (
     <div className={`relative ${className} overflow-hidden rounded-2xl border border-slate-200 shadow-inner`}>
-      <div ref={mapContainerRef} className="h-full w-full" />
+      <div ref={mapContainerRef} className={`h-full w-full ${selectionMode ? 'cursor-crosshair' : ''}`} />
       {selectionMode && (
-        <div className="absolute top-4 left-1/2 -translate-x-1/2 z-[1000] bg-slate-900/90 text-white px-4 py-2 rounded-full text-xs font-medium shadow-lg backdrop-blur-md flex items-center gap-2 border border-slate-700">
-          <span className="h-2 w-2 rounded-full bg-emerald-400 animate-ping"></span>
+        <div className="absolute top-4 left-1/2 -translate-x-1/2 z-[1000] bg-slate-900/90 text-white px-4 py-2 rounded-full text-xs font-medium shadow-lg backdrop-blur-md flex items-center gap-2 border border-slate-700 pointer-events-none">
+          <span className="h-2 w-2 rounded-full bg-emerald-400 animate-ping" />
           انقر على الخريطة لتحديد {selectionMode === 'pickup' ? 'نقطة الانطلاق' : 'الوجهة المطلوبة'}
         </div>
       )}

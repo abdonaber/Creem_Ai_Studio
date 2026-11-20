@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { INotification } from '../../types';
 import { api } from '../../lib/api';
-import { Bell, Check, X } from 'lucide-react';
+import { Bell, Check, CheckCheck, X } from 'lucide-react';
 
 interface NotificationDrawerProps {
   isOpen: boolean;
@@ -15,13 +15,19 @@ export const NotificationDrawer: React.FC<NotificationDrawerProps> = ({
   onRefreshCount,
 }) => {
   const [notifications, setNotifications] = useState<INotification[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   const fetchNotifications = async () => {
+    setLoading(true);
+    setErrorMsg(null);
     try {
       const res = await api.get<INotification[]>('/users/notifications');
       setNotifications(res || []);
-    } catch (err) {
-      console.error('Fetch notifications error:', err);
+    } catch (err: any) {
+      setErrorMsg(err.message || 'تعذر تحميل الإشعارات');
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -38,12 +44,24 @@ export const NotificationDrawer: React.FC<NotificationDrawerProps> = ({
         prev.map((n) => (n.id === id ? { ...n, read: true } : n))
       );
       onRefreshCount();
-    } catch (err) {
-      console.error('Mark read error:', err);
+    } catch (err: any) {
+      setErrorMsg(err.message || 'تعذر تحديث حالة الإشعار');
+    }
+  };
+
+  const handleMarkAllRead = async () => {
+    try {
+      await api.put('/users/notifications/read-all');
+      setNotifications((prev) => prev.map((n) => ({ ...n, read: true })));
+      onRefreshCount();
+    } catch (err: any) {
+      setErrorMsg(err.message || 'تعذر تحديث الإشعارات');
     }
   };
 
   if (!isOpen) return null;
+
+  const hasUnread = notifications.some((n) => !n.read);
 
   return (
     <div className="fixed inset-0 z-50 bg-slate-950/70 backdrop-blur-xs flex items-center justify-center p-4">
@@ -54,17 +72,36 @@ export const NotificationDrawer: React.FC<NotificationDrawerProps> = ({
             <Bell className="h-5 w-5 text-emerald-600" />
             <h3 className="font-bold text-slate-900 text-base">مركز الإشعارات</h3>
           </div>
-          <button
-            onClick={onClose}
-            className="p-1.5 text-slate-400 hover:text-slate-600 rounded-xl hover:bg-slate-100 transition-colors"
-          >
-            <X className="h-5 w-5" />
-          </button>
+          <div className="flex items-center gap-2">
+            {hasUnread && (
+              <button
+                onClick={handleMarkAllRead}
+                className="text-xs font-bold text-emerald-700 hover:bg-emerald-50 px-2.5 py-1.5 rounded-xl flex items-center gap-1 transition-colors"
+              >
+                <CheckCheck className="h-4 w-4" />
+                قراءة الكل
+              </button>
+            )}
+            <button
+              onClick={onClose}
+              className="p-1.5 text-slate-400 hover:text-slate-600 rounded-xl hover:bg-slate-100 transition-colors"
+            >
+              <X className="h-5 w-5" />
+            </button>
+          </div>
         </div>
+
+        {errorMsg && (
+          <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-rose-700 text-xs font-medium">
+            {errorMsg}
+          </div>
+        )}
 
         {/* List */}
         <div className="flex-1 overflow-y-auto space-y-2 pr-1">
-          {notifications.length === 0 ? (
+          {loading ? (
+            <div className="text-center text-xs text-slate-400 py-10">جاري تحميل الإشعارات...</div>
+          ) : notifications.length === 0 ? (
             <div className="text-center text-xs text-slate-400 py-10">لا توجد إشعارات جديدة</div>
           ) : (
             notifications.map((n) => (

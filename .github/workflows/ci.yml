@@ -6,28 +6,75 @@ on:
     branches: [main, master]
 
 jobs:
-  audit-and-test:
-    name: Lint, Test & Build
+  audit-test-and-build:
+    name: Audit, Typecheck, Test & Build (Bun)
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Setup Node.js 22
-        uses: actions/setup-node@v4
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
         with:
-          node-version: 22
-          cache: 'npm'
+          bun-version: latest
 
-      - name: Install Dependencies
-        run: npm ci
+      - name: Install Dependencies (Strict Lockfile)
+        run: bun install --frozen-lockfile
+
+      - name: Security Vulnerability Audit
+        run: bun audit
 
       - name: TypeScript Type Checking
-        run: npm run lint
+        run: bun run lint
 
-      - name: Run Test Suite
-        run: npm test
+      - name: Run Unit & API Test Suite
+        run: bun run test
 
       - name: Build Application
-        run: npm run build
+        run: bun run build
+
+  real-infra-integration:
+    name: Real MongoDB Replica Set & Redis Integration
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install Dependencies (Strict Lockfile)
+        run: bun install --frozen-lockfile
+
+      - name: Start MongoDB 7 Single-Node Replica Set
+        run: |
+          docker run -d --name mongo-rs -p 27017:27017 mongo:7 --replSet rs0 --bind_ip_all
+          for i in $(seq 1 30); do
+            if docker exec mongo-rs mongosh --quiet --eval "db.runCommand({ ping: 1 }).ok" | grep -q 1; then
+              break
+            fi
+            sleep 1
+          done
+          docker exec mongo-rs mongosh --quiet --eval 'rs.initiate({_id:"rs0",members:[{_id:0,host:"localhost:27017"}]})'
+          sleep 3
+
+      - name: Run Real Infrastructure Integration Tests
+        env:
+          RUN_REAL_INFRA_TESTS: 'true'
+          MONGODB_URI: mongodb://localhost:27017/creem_ci?replicaSet=rs0
+          REDIS_URL: redis://localhost:6379
+        run: bun run test -- tests/realInfra.test.ts

@@ -1,8 +1,8 @@
 import React, { useState } from 'react';
-import { api } from '../../lib/api';
+import { api, setAccessToken } from '../../lib/api';
 import { IUser, UserRole } from '../../types';
 import { reconnectSocketWithToken } from '../../lib/socket';
-import { User, Lock, Mail, Phone, Car, Sparkles, X } from 'lucide-react';
+import { User, Lock, Mail, Phone, Car, X } from 'lucide-react';
 
 interface AuthModalProps {
   isOpen: boolean;
@@ -40,7 +40,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
           password,
           role,
         });
-        localStorage.setItem('creemy_token', res.accessToken);
+        setAccessToken(res.accessToken);
         reconnectSocketWithToken(res.accessToken);
         onAuthSuccess(res.user, res.accessToken);
         onClose();
@@ -49,7 +49,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
           email,
           password,
         });
-        localStorage.setItem('creemy_token', res.accessToken);
+        setAccessToken(res.accessToken);
         reconnectSocketWithToken(res.accessToken);
         onAuthSuccess(res.user, res.accessToken);
         onClose();
@@ -72,7 +72,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
             </div>
             <div>
               <h3 className="font-bold text-slate-900 text-base">
-                {mode === 'login' ? 'تسجيل الدخول إلى CreemY' : 'إنشاء حساب جديد في CreemY'}
+                {mode === 'login' ? 'تسجيل الدخول إلى Creem' : 'إنشاء حساب جديد في Creem'}
               </h3>
               <p className="text-xs text-slate-400">منصة النقل الذكية المعتمدة</p>
             </div>
@@ -179,6 +179,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
               <input
                 type="password"
                 required
+                minLength={mode === 'register' ? 8 : undefined}
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 placeholder="••••••••"
@@ -190,7 +191,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
           <button
             type="submit"
             disabled={loading}
-            className="w-full py-3 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl font-bold text-xs shadow-md shadow-emerald-600/30 transition-colors mt-2"
+            className="w-full py-3 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 text-white rounded-xl font-bold text-xs shadow-md shadow-emerald-600/30 transition-colors mt-2"
           >
             {loading
               ? 'جاري التحقق...'
@@ -207,7 +208,10 @@ export const AuthModal: React.FC<AuthModalProps> = ({
               ليس لديك حساب بعد؟{' '}
               <button
                 type="button"
-                onClick={() => setMode('register')}
+                onClick={() => {
+                  setMode('register');
+                  setErrorMsg(null);
+                }}
                 className="font-bold text-emerald-700 hover:underline"
               >
                 إنشاء حساب جديد
@@ -218,7 +222,10 @@ export const AuthModal: React.FC<AuthModalProps> = ({
               لديك حساب بالفعل؟{' '}
               <button
                 type="button"
-                onClick={() => setMode('login')}
+                onClick={() => {
+                  setMode('login');
+                  setErrorMsg(null);
+                }}
                 className="font-bold text-emerald-700 hover:underline"
               >
                 تسجيل الدخول

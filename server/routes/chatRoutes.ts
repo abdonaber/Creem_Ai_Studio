@@ -18,7 +18,7 @@ chatRouter.get('/:rideId', async (req: Request, res: Response, next: NextFunctio
 
     const driver = await db.findDriverByUserId(req.user!.userId);
     const isRider = ride.riderId === req.user!.userId;
-    const isDriver = driver && ride.driverId === driver.id;
+    const isDriver = Boolean(driver && ride.driverId === driver.id);
     const isAdmin = req.user!.role === 'ADMIN';
 
     if (!isRider && !isDriver && !isAdmin) {
@@ -36,22 +36,27 @@ chatRouter.get('/:rideId', async (req: Request, res: Response, next: NextFunctio
 chatRouter.post('/:rideId', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { rideId } = req.params;
-    const { text } = req.body;
+    const { text, content } = req.body;
+    const rawText = typeof text === 'string' ? text : content;
 
-    if (!text || typeof text !== 'string' || text.trim().length === 0) {
+    if (!rawText || typeof rawText !== 'string' || rawText.trim().length === 0) {
       throw new AppError('Message text is required', 400, 'INVALID_INPUT');
     }
 
-    if (text.length > 1000) {
+    if (rawText.trim().length > 1000) {
       throw new AppError('Message is too long (maximum 1000 characters)', 400, 'TEXT_TOO_LONG');
     }
 
     const ride = await db.findRideById(rideId);
     if (!ride) throw new AppError('Ride not found', 404, 'NOT_FOUND');
 
+    if (ride.status === 'CANCELLED' || ride.status === 'NO_DRIVER_FOUND') {
+      throw new AppError('Chat is closed for cancelled or unmatched rides.', 400, 'CHAT_CLOSED');
+    }
+
     const driver = await db.findDriverByUserId(req.user!.userId);
     const isRider = ride.riderId === req.user!.userId;
-    const isDriver = driver && ride.driverId === driver.id;
+    const isDriver = Boolean(driver && ride.driverId === driver.id);
     const isAdmin = req.user!.role === 'ADMIN';
 
     if (!isRider && !isDriver && !isAdmin) {
@@ -74,13 +79,13 @@ chatRouter.post('/:rideId', async (req: Request, res: Response, next: NextFuncti
       senderId: req.user!.userId,
       senderName: user?.name || 'مستخدم',
       recipientId,
-      content: text.trim(),
+      content: rawText.trim(),
       createdAt: new Date().toISOString(),
       read: false,
     });
 
     if (io) {
-      io.to(`ride:${rideId}`).emit('chat:incoming', message);
+      io.to(`ride:${rideId}`).emit('chat:message_received', message);
     }
 
     res.status(201).json({ success: true, data: message });

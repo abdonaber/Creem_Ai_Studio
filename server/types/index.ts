@@ -219,6 +219,15 @@ export interface IPayment {
   idempotencyKey?: string;
   refundAmount?: number;
   refunds?: IPaymentRefund[];
+  refundRequests?: Array<{
+    requestKey: string;
+    idempotencyKey: string;
+    amount: number;
+    status: string;
+    stripeRefundId?: string;
+    createdAt: string;
+    updatedAt?: string;
+  }>;
   metadata?: Record<string, any>;
   createdAt: string;
 }

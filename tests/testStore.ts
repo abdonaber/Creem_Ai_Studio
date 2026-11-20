@@ -44,9 +44,11 @@ export class TestDatabaseStore implements IDatabaseStore {
     this.drivers.clear();
     this.vehicles.clear();
     this.rides.clear();
+    this.offers.clear();
     this.wallets.clear();
     this.transactions.clear();
     this.payments.clear();
+    this.ledger = [];
     this.ratings = [];
     this.messages = [];
     this.notifications = [];
@@ -192,6 +194,12 @@ export class TestDatabaseStore implements IDatabaseStore {
       durationMinutes: ride.durationMinutes || 10,
       paymentMethod: ride.paymentMethod || 'WALLET',
       paymentStatus: ride.paymentStatus || 'PENDING',
+      offeredDriverIds: ride.offeredDriverIds || [],
+      currentOffer: ride.currentOffer,
+      searchRadiusKm: ride.searchRadiusKm,
+      retryCount: ride.retryCount,
+      startedAt: ride.startedAt,
+      completedAt: ride.completedAt,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
@@ -237,12 +245,14 @@ export class TestDatabaseStore implements IDatabaseStore {
     if (!allowedCurrentStatuses.includes(ride.status)) {
       return { success: false, message: `Invalid transition from ${ride.status}` };
     }
-    ride.status = nextStatus;
-    if (additionalUpdates) {
-      Object.assign(ride, additionalUpdates);
-    }
-    ride.updatedAt = new Date().toISOString();
-    return { success: true, ride };
+    const updated: IRide = {
+      ...ride,
+      ...(additionalUpdates || {}),
+      status: nextStatus,
+      updatedAt: new Date().toISOString(),
+    };
+    this.rides.set(rideId, updated);
+    return { success: true, ride: updated };
   }
   async atomicAcceptRide(
     rideId: string,
@@ -254,13 +264,21 @@ export class TestDatabaseStore implements IDatabaseStore {
     }
     const driver = this.drivers.get(driverId);
     if (driver) {
-      driver.isBusy = true;
-      driver.activeRideId = rideId;
+      this.drivers.set(driverId, {
+        ...driver,
+        isBusy: true,
+        activeRideId: rideId,
+      });
     }
-    ride.driverId = driverId;
-    ride.status = 'DRIVER_ASSIGNED';
-    ride.updatedAt = new Date().toISOString();
-    return { success: true, ride };
+    const updated: IRide = {
+      ...ride,
+      driverId,
+      status: 'DRIVER_ASSIGNED',
+      currentOffer: undefined,
+      updatedAt: new Date().toISOString(),
+    };
+    this.rides.set(rideId, updated);
+    return { success: true, ride: updated };
   }
 
   async freeDriver(driverId: string, rideId?: string): Promise<boolean> {
@@ -448,7 +466,7 @@ export class TestDatabaseStore implements IDatabaseStore {
     if (params.driverId) {
       const d = await this.findDriverById(params.driverId);
       if (d) {
-        const net = Math.round(params.amount * 0.8 * 100) / 100;
+        const net = Math.round(params.amount * (1 - config.commissionRate) * 100) / 100;
         await this.creditWallet(d.userId, net, `Ride earnings ${params.rideId}`);
       }
     }
@@ -474,6 +492,7 @@ export class TestDatabaseStore implements IDatabaseStore {
       stripeClientSecret: payment.stripeClientSecret,
       idempotencyKey: payment.idempotencyKey,
       refundAmount: payment.refundAmount,
+      refundRequests: payment.refundRequests || [],
       metadata: payment.metadata,
       createdAt: new Date().toISOString(),
     };
@@ -634,7 +653,7 @@ export class TestDatabaseStore implements IDatabaseStore {
     if (ride?.driverId) {
       const driver = await this.findDriverById(ride.driverId);
       if (driver) {
-        const driverEarning = Math.round(payment.amount * 0.8 * 100) / 100;
+        const driverEarning = Math.round(payment.amount * (1 - config.commissionRate) * 100) / 100;
         const platformCommission = Math.round((payment.amount - driverEarning) * 100) / 100;
 
         let debtRecovery = 0;
@@ -861,8 +880,13 @@ export class TestDatabaseStore implements IDatabaseStore {
             originalCommission = commEntry.amount;
             originalDriverEarning = Math.round((totalAmount - originalCommission) * 100) / 100;
           } else {
-            originalDriverEarning = Math.round(totalAmount * 0.8 * 100) / 100;
+            originalDriverEarning = Math.round(totalAmount * (1 - config.commissionRate) * 100) / 100;
             originalCommission = Math.round((totalAmount - originalDriverEarning) * 100) / 100;
+            await this.recordReconciliationDiscrepancy({
+              type: 'MISSING_ORIGINAL_SPLIT',
+              id: payId,
+              details: `Original commission/earnings metadata missing on payment ${payId}; defaulted reversal split to config rate (${config.commissionRate}).`,
+            });
           }
         }
 
@@ -883,7 +907,7 @@ export class TestDatabaseStore implements IDatabaseStore {
           driverReversal = Math.max(0, Math.round((originalDriverEarning - alreadyReversedDriver) * 100) / 100);
           platformReversal = Math.max(0, Math.round((originalCommission - alreadyReversedComm) * 100) / 100);
         } else {
-          const driverRatio = totalAmount > 0 ? (originalDriverEarning / totalAmount) : 0.8;
+          const driverRatio = totalAmount > 0 ? (originalDriverEarning / totalAmount) : (1 - config.commissionRate);
           const proposedDriver = Math.round(delta * driverRatio * 100) / 100;
           const remainingDriver = Math.max(0, Math.round((originalDriverEarning - alreadyReversedDriver) * 100) / 100);
           driverReversal = Math.min(proposedDriver, remainingDriver);
@@ -1050,7 +1074,8 @@ export class TestDatabaseStore implements IDatabaseStore {
     amount: number;
     idempotencyKey?: string;
   }): Promise<{ success: boolean; transactionId: string; platformFee: number; commissionDebt: number }> {
-    const platformFee = Math.round(params.amount * 0.2 * 100) / 100;
+    const platformFee = Math.round(params.amount * config.commissionRate * 100) / 100;
+    const driverEarning = Math.round((params.amount - platformFee) * 100) / 100;
     let debtIncurred = 0;
 
     const payment = await this.createPayment({
@@ -1061,6 +1086,12 @@ export class TestDatabaseStore implements IDatabaseStore {
       status: 'SUCCEEDED',
       paymentMethod: 'CASH',
       idempotencyKey: params.idempotencyKey,
+      metadata: {
+        driverEarning,
+        platformCommission: platformFee,
+        originalTotal: params.amount,
+        settledToDriver: true,
+      },
     });
 
     // Record Rider cash payment ledger entry
@@ -1331,21 +1362,36 @@ export class TestDatabaseStore implements IDatabaseStore {
     totalOutstandingDebt: number;
     transactionCount: number;
   }> {
-    const succeeded = Array.from(this.payments.values()).filter((p) => p.status === 'SUCCEEDED');
-    const totalGrossVolume = succeeded.reduce((sum, p) => sum + (p.amount || 0), 0);
-    const totalPlatformRevenue = Math.round(totalGrossVolume * 0.2 * 100) / 100;
-    const totalDriverPayouts = Math.round((totalGrossVolume - totalPlatformRevenue) * 100) / 100;
-    const totalOutstandingDebt = Array.from(this.drivers.values()).reduce(
-      (sum, d) => sum + ((d as any).outstandingDebt || 0),
-      0
+    const activePayments = Array.from(this.payments.values()).filter(
+      (p) => p.status === 'SUCCEEDED' || p.status === 'PARTIALLY_REFUNDED'
     );
+    let totalGrossVolume = 0;
+    let totalPlatformRevenue = 0;
+    for (const p of activePayments) {
+      const amount = p.amount || 0;
+      const refunded = p.refundAmount || 0;
+      const net = Math.max(0, Math.round((amount - refunded) * 100) / 100);
+      totalGrossVolume += net;
+      const ratio = amount > 0 ? net / amount : 0;
+      if (p.metadata?.platformCommission !== undefined) {
+        totalPlatformRevenue += Number(p.metadata.platformCommission) * ratio;
+      } else {
+        totalPlatformRevenue += net * config.commissionRate;
+      }
+    }
+    totalGrossVolume = Math.round(totalGrossVolume * 100) / 100;
+    totalPlatformRevenue = Math.round(totalPlatformRevenue * 100) / 100;
+    const totalDriverPayouts = Math.round((totalGrossVolume - totalPlatformRevenue) * 100) / 100;
+    const totalOutstandingDebt = Math.round(
+      Array.from(this.drivers.values()).reduce((sum, d) => sum + ((d as any).outstandingDebt || 0), 0) * 100
+    ) / 100;
 
     return {
       totalGrossVolume,
       totalPlatformRevenue,
       totalDriverPayouts,
       totalOutstandingDebt,
-      transactionCount: succeeded.length,
+      transactionCount: activePayments.length,
     };
   }
 
@@ -1429,12 +1475,18 @@ export class TestDatabaseStore implements IDatabaseStore {
     for (const [driverId, driver] of this.drivers.entries()) {
       if ((driver.earningsTotal || 0) > 0) {
         const settledDriverRides = Array.from(this.rides.values()).filter(
-          (r) => r.driverId === driverId && r.status === 'RIDE_COMPLETED' && r.paymentStatus === 'SUCCEEDED'
+          (r) =>
+            r.driverId === driverId &&
+            r.status === 'RIDE_COMPLETED' &&
+            (r.paymentStatus === 'SUCCEEDED' || r.paymentStatus === 'PARTIALLY_REFUNDED')
         );
 
         const expectedEarnings = settledDriverRides.reduce((acc, r) => {
+          const payment = Array.from(this.payments.values()).find((p) => p.rideId === r.id);
           const fare = r.finalFare ?? r.estimatedFare ?? 0;
-          return acc + Math.round(fare * 0.8 * 100) / 100;
+          const refunded = payment?.refundAmount || 0;
+          const netFare = Math.max(0, fare - refunded);
+          return acc + Math.round(netFare * (1 - config.commissionRate) * 100) / 100;
         }, 0);
 
         const diff = Math.abs((driver.earningsTotal || 0) - expectedEarnings);
@@ -1450,16 +1502,26 @@ export class TestDatabaseStore implements IDatabaseStore {
 
     // 5. Audit Platform Commission in Ledger vs Settled Rides
     const settledRides = Array.from(this.rides.values()).filter(
-      (r) => r.status === 'RIDE_COMPLETED' && r.paymentStatus === 'SUCCEEDED'
+      (r) =>
+        r.status === 'RIDE_COMPLETED' &&
+        (r.paymentStatus === 'SUCCEEDED' || r.paymentStatus === 'PARTIALLY_REFUNDED')
     );
 
     const expectedTotalCommission = settledRides.reduce((acc, r) => {
+      const payment = Array.from(this.payments.values()).find((p) => p.rideId === r.id);
       const fare = r.finalFare ?? r.estimatedFare ?? 0;
-      return acc + Math.round(fare * 0.2 * 100) / 100;
+      const refunded = payment?.refundAmount || 0;
+      const netFare = Math.max(0, fare - refunded);
+      return acc + Math.round(netFare * config.commissionRate * 100) / 100;
     }, 0);
 
     const commissionLedgers = this.ledger.filter((l) => l.type === 'PLATFORM_COMMISSION');
-    const recordedCommission = commissionLedgers.reduce((acc, l) => acc + (l.amount || 0), 0);
+    const recordedCommission = commissionLedgers.reduce((acc, l) => {
+      if (l.fromAccount === 'platform:revenue' && l.toAccount === 'platform:escrow') {
+        return acc - (l.amount || 0);
+      }
+      return acc + (l.amount || 0);
+    }, 0);
 
     if (Math.abs(expectedTotalCommission - recordedCommission) > 0.1) {
       discrepancies.push({
@@ -1495,6 +1557,22 @@ export class TestDatabaseStore implements IDatabaseStore {
   }
   async findRefreshSessionByJti(jti: string): Promise<IRefreshSession | null> {
     return this.sessions.get(jti) || null;
+  }
+  async consumeRefreshSession(
+    jti: string,
+    replacedByJti?: string
+  ): Promise<{ consumed: boolean; session: IRefreshSession | null }> {
+    const existing = this.sessions.get(jti);
+    if (!existing) return { consumed: false, session: null };
+    if (existing.revoked || new Date(existing.expiresAt).getTime() <= Date.now()) {
+      return { consumed: false, session: { ...existing } };
+    }
+    const priorCopy = { ...existing };
+    existing.revoked = true;
+    existing.revokedReason = 'ROTATED';
+    existing.rotatedAt = new Date().toISOString();
+    if (replacedByJti) existing.replacedByJti = replacedByJti;
+    return { consumed: true, session: priorCopy };
   }
   async revokeRefreshSession(jti: string, reason?: string): Promise<void> {
     const s = this.sessions.get(jti);

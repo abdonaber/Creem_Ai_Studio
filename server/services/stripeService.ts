@@ -38,7 +38,6 @@ export class StripeService {
     status: string;
   }> {
     const stripe = getStripe();
-    // Stripe amounts are in smallest currency unit (e.g. Halalas for SAR, Cents for USD)
     const amountInSmallestUnit = Math.round(params.amount * 100);
 
     const intent = await stripe.paymentIntents.create(
@@ -83,12 +82,13 @@ export class StripeService {
   }
 
   /**
-   * Refunds a payment intent with robust validation
+   * Refunds a payment intent with strict 2-decimal precision validation and Stripe idempotencyKey
    */
   public static async refundPayment(
     paymentIntentId: string,
     amount?: number,
-    reason?: 'duplicate' | 'fraudulent' | 'requested_by_customer'
+    reason?: 'duplicate' | 'fraudulent' | 'requested_by_customer',
+    idempotencyKey?: string
   ): Promise<{ refundId: string; status: string; amountRefunded?: number }> {
     if (!paymentIntentId || typeof paymentIntentId !== 'string' || paymentIntentId.trim().length === 0) {
       throw new AppError('paymentIntentId is required for refund', 400, 'INVALID_PAYMENT_INTENT');
@@ -102,28 +102,33 @@ export class StripeService {
       if (amount <= 0) {
         throw new AppError('Refund amount must be greater than 0', 400, 'INVALID_REFUND_AMOUNT');
       }
-      // Enforce 2 decimal places precision
-      const roundedAmount = Math.round(amount * 100) / 100;
-      parsedAmountCents = Math.round(roundedAmount * 100);
+      const decStr = String(amount).split('.')[1];
+      if (decStr && decStr.length > 2) {
+        throw new AppError('Refund amount precision abuse: maximum 2 decimal places allowed', 400, 'INVALID_REFUND_PRECISION');
+      }
+      parsedAmountCents = Math.round(amount * 100);
+      if (parsedAmountCents < 1) {
+        throw new AppError('Refund amount must be at least 0.01', 400, 'INVALID_REFUND_AMOUNT');
+      }
     }
 
     const stripe = getStripe();
-    const refund = await stripe.refunds.create({
-      payment_intent: paymentIntentId.trim(),
-      amount: parsedAmountCents,
-      reason,
-    });
+    const refund = await stripe.refunds.create(
+      {
+        payment_intent: paymentIntentId.trim(),
+        amount: parsedAmountCents,
+        reason,
+      },
+      idempotencyKey ? { idempotencyKey } : undefined
+    );
 
     return {
       refundId: refund.id,
       status: refund.status || 'succeeded',
-      amountRefunded: refund.amount ? refund.amount / 100 : undefined,
+      amountRefunded: refund.amount !== undefined ? Math.round(Number(refund.amount)) / 100 : undefined,
     };
   }
 
-  /**
-   * Retrieves a charge by ID from Stripe
-   */
   public static async retrieveCharge(chargeId: string): Promise<any> {
     if (!chargeId || typeof chargeId !== 'string') {
       throw new AppError('chargeId is required', 400, 'INVALID_CHARGE_ID');
@@ -132,9 +137,6 @@ export class StripeService {
     return await stripe.charges.retrieve(chargeId.trim());
   }
 
-  /**
-   * Retrieves a payment intent by ID from Stripe
-   */
   public static async retrievePaymentIntent(paymentIntentId: string): Promise<any> {
     if (!paymentIntentId || typeof paymentIntentId !== 'string') {
       throw new AppError('paymentIntentId is required', 400, 'INVALID_PAYMENT_INTENT');

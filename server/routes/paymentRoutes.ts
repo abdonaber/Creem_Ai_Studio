@@ -30,7 +30,6 @@ paymentRouter.post('/process', authenticate, async (req: Request, res: Response,
       idempotencyKey
     );
 
-
     res.json({ success: true, data: result });
   } catch (err) {
     next(err);
@@ -41,6 +40,9 @@ paymentRouter.post('/process', authenticate, async (req: Request, res: Response,
 paymentRouter.post('/refund', authenticate, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { rideId, paymentIntentId, amount, reason } = req.body;
+    const idempotencyKey =
+      (req.headers['idempotency-key'] as string) || req.body.idempotencyKey;
+
     if (!rideId && !paymentIntentId) {
       throw new AppError('rideId or paymentIntentId is required', 400, 'INVALID_INPUT');
     }
@@ -51,6 +53,7 @@ paymentRouter.post('/refund', authenticate, async (req: Request, res: Response, 
       amount,
       reason,
       requestedByUserId: req.user!.userId,
+      idempotencyKey,
     });
 
     res.json({ success: true, data: result });

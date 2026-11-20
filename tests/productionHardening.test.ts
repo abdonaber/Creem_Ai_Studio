@@ -64,7 +64,7 @@ describe('Production Hardening & Integrity Suite', () => {
       const res = await request(app).get('/health');
       expect(res.status).toBe(200);
       expect(res.body.status).toBe('healthy');
-      expect(res.body.platform).toBe('CreemY');
+      expect(res.body.platform).toBe('Creem');
       expect(res.body.uptimeSeconds).toBeGreaterThanOrEqual(0);
       expect(res.body.memoryUsage).toBeDefined();
     });

@@ -39,12 +39,10 @@ export class AuthService {
       throw new AppError('Phone number already registered.', 409, 'PHONE_EXISTS');
     }
 
-    // Strong password policy
     if (!data.password || data.password.length < 8) {
       throw new AppError('Password must be at least 8 characters long.', 400, 'WEAK_PASSWORD');
     }
 
-    // Phase 12 Security Hardening: Prevent public admin registration
     if (data.role === 'ADMIN') {
       throw new AppError('Public registration for the administrator role is strictly forbidden.', 403, 'FORBIDDEN_ROLE');
     }
@@ -61,20 +59,17 @@ export class AuthService {
       passwordHash,
       role,
       status: 'ACTIVE',
-      avatarUrl: `https://api.dicebear.com/7.x/bottts/svg?seed=${userId}`,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
 
-    await db.createUser(user);
-    await db.getOrCreateWallet(userId); // Init wallet
+    const createdUser = await db.createUser(user);
+    await db.getOrCreateWallet(createdUser.id);
 
-    // If driver, initialize real driver profile
     if (role === 'DRIVER') {
       const driverId = generateId('drv');
       let vehicle: IVehicle | undefined = undefined;
 
-      // If vehicle details are supplied during registration, persist them directly
       if (
         data.vehicleDetails?.make &&
         data.vehicleDetails?.model &&
@@ -93,39 +88,41 @@ export class AuthService {
           plateNumber: data.vehicleDetails.plateNumber.trim(),
           category: data.vehicleDetails.category || 'STANDARD',
         };
-        await db.createVehicle(vehicle);
       }
 
-      // In production and real operation, newly registered drivers require admin verification
       const approvalStatus: DriverApprovalStatus = 'PENDING';
-
-      const driver: IDriver = {
+      const createdDriver = await db.createDriver({
         id: driverId,
-        userId,
+        userId: createdUser.id,
         approvalStatus,
-        isOnline: false, // Never online until admin approval and driver toggle
-        vehicle,
+        isOnline: false,
         rating: 5.0,
         totalRides: 0,
         licenseNumber: data.licenseNumber?.trim() || '',
         documents: {},
         earningsTotal: 0,
         outstandingDebt: 0,
-      };
-      await db.createDriver(driver);
+      });
+
+      if (vehicle) {
+        await db.createVehicle({
+          ...vehicle,
+          driverId: createdDriver.id,
+        });
+      }
     }
 
     await db.createAuditLog({
       id: generateId('aud'),
-      userId,
+      userId: createdUser.id,
       action: 'USER_REGISTERED',
-      details: { email: user.email, role },
+      details: { email: createdUser.email, role },
       ip: clientInfo?.ip,
       timestamp: new Date().toISOString(),
     });
 
-    const tokens = await this.generateTokens(user, clientInfo);
-    const { passwordHash: _, ...safeUser } = user;
+    const tokens = await this.generateTokens(createdUser, clientInfo);
+    const { passwordHash: _, ...safeUser } = createdUser;
     return { user: safeUser, ...tokens };
   }
 
@@ -179,17 +176,76 @@ export class AuthService {
         throw new AppError('Malformed refresh token.', 401, 'INVALID_REFRESH_TOKEN');
       }
 
+      const incomingHash = crypto.createHash('sha256').update(oldRefreshToken).digest('hex');
       const session = await db.findRefreshSessionByJti(decoded.jti);
 
-      if (!session || session.revoked) {
-        // TOKEN REUSE ATTACK DETECTED!
-        // Immediately revoke all sessions for this user across all devices
+      if (!session) {
         await db.revokeAllSessionsForUser(decoded.userId, 'REPLAY_ATTACK_DETECTED');
         await db.createAuditLog({
           id: generateId('aud'),
           userId: decoded.userId,
           action: 'SECURITY_ALERT_TOKEN_REPLAY',
-          details: { jti: decoded.jti, reason: 'Attempted reuse of rotated/revoked token' },
+          details: { jti: decoded.jti, reason: 'Refresh session not found' },
+          ip: clientInfo?.ip,
+          timestamp: new Date().toISOString(),
+        });
+        throw new AppError('Session not found or expired. Please sign in again.', 401, 'TOKEN_REUSED');
+      }
+
+      // Timing-safe hash comparison
+      const storedBuf = Buffer.from(session.tokenHash || '', 'hex');
+      const incomingBuf = Buffer.from(incomingHash, 'hex');
+      if (
+        storedBuf.length === 0 ||
+        storedBuf.length !== incomingBuf.length ||
+        !crypto.timingSafeEqual(storedBuf, incomingBuf)
+      ) {
+        await db.revokeAllSessionsForUser(decoded.userId, 'TOKEN_HASH_MISMATCH');
+        await db.createAuditLog({
+          id: generateId('aud'),
+          userId: decoded.userId,
+          action: 'SECURITY_ALERT_TOKEN_HASH_MISMATCH',
+          details: { jti: decoded.jti },
+          ip: clientInfo?.ip,
+          timestamp: new Date().toISOString(),
+        });
+        throw new AppError('Invalid refresh token signature.', 401, 'INVALID_REFRESH_TOKEN');
+      }
+
+      const newJti = crypto.randomBytes(16).toString('hex');
+      const consumeRes = await db.consumeRefreshSession(decoded.jti, newJti);
+
+      if (!consumeRes.consumed) {
+        const currentSession = consumeRes.session || session;
+        const rotatedAtMs = currentSession.rotatedAt ? new Date(currentSession.rotatedAt).getTime() : 0;
+        const replacementSession = currentSession.replacedByJti
+          ? await db.findRefreshSessionByJti(currentSession.replacedByJti)
+          : null;
+        const withinGraceWindow =
+          currentSession.revokedReason === 'ROTATED' &&
+          rotatedAtMs > 0 &&
+          Date.now() - rotatedAtMs < config.refreshGraceWindowMs &&
+          !replacementSession?.revoked &&
+          (!currentSession.ip || !clientInfo?.ip || currentSession.ip === clientInfo.ip);
+
+        if (withinGraceWindow) {
+          throw new AppError(
+            'Session refresh already completed concurrently. Please retry with latest token.',
+            401,
+            'CONCURRENT_REFRESH_REJECTED'
+          );
+        }
+
+        // True replay attack or reuse of logged-out token -> revoke ALL user sessions
+        await db.revokeAllSessionsForUser(decoded.userId, 'REPLAY_ATTACK_DETECTED');
+        await db.createAuditLog({
+          id: generateId('aud'),
+          userId: decoded.userId,
+          action: 'SECURITY_ALERT_TOKEN_REPLAY',
+          details: {
+            jti: decoded.jti,
+            reason: `Attempted reuse of ${currentSession.revokedReason || 'revoked'} token`,
+          },
           ip: clientInfo?.ip,
           timestamp: new Date().toISOString(),
         });
@@ -201,9 +257,6 @@ export class AuthService {
         );
       }
 
-      // Invalidate the consumed refresh token session
-      await db.revokeRefreshSession(decoded.jti, 'ROTATED');
-
       const user = await db.findUserById(decoded.userId);
       if (!user) {
         throw new AppError('User not found.', 401, 'USER_NOT_FOUND');
@@ -213,11 +266,49 @@ export class AuthService {
         throw new AppError('Account is suspended.', 403, 'ACCOUNT_SUSPENDED');
       }
 
-      return await this.generateTokens(user, clientInfo);
+      return await this.generateTokens(user, clientInfo, newJti);
     } catch (error) {
       if (error instanceof AppError) throw error;
       throw new AppError('Invalid or expired refresh token.', 401, 'INVALID_REFRESH_TOKEN');
     }
+  }
+
+  public static async changePassword(
+    userId: string,
+    currentPassword: string,
+    newPassword: string,
+    clientInfo?: { ip?: string; userAgent?: string }
+  ): Promise<void> {
+    const user = await db.findUserById(userId);
+    if (!user) {
+      throw new AppError('User not found.', 404, 'USER_NOT_FOUND');
+    }
+
+    const isValid = await bcrypt.compare(currentPassword, user.passwordHash);
+    if (!isValid) {
+      throw new AppError('Current password is incorrect.', 400, 'INVALID_CURRENT_PASSWORD');
+    }
+
+    if (!newPassword || newPassword.length < 8) {
+      throw new AppError('New password must be at least 8 characters long.', 400, 'WEAK_PASSWORD');
+    }
+
+    if (newPassword === currentPassword) {
+      throw new AppError('New password must be different from current password.', 400, 'SAME_PASSWORD');
+    }
+
+    const passwordHash = await bcrypt.hash(newPassword, this.SALT_ROUNDS);
+    await db.updateUser(userId, { passwordHash });
+    await db.revokeAllSessionsForUser(userId, 'PASSWORD_CHANGED');
+
+    await db.createAuditLog({
+      id: generateId('aud'),
+      userId,
+      action: 'USER_PASSWORD_CHANGED',
+      details: {},
+      ip: clientInfo?.ip,
+      timestamp: new Date().toISOString(),
+    });
   }
 
   public static async logout(refreshToken?: string, userId?: string): Promise<void> {
@@ -255,7 +346,8 @@ export class AuthService {
 
   private static async generateTokens(
     user: IUser,
-    clientInfo?: { ip?: string; userAgent?: string }
+    clientInfo?: { ip?: string; userAgent?: string },
+    presetJti?: string
   ): Promise<{ accessToken: string; refreshToken: string }> {
     const accessToken = jwt.sign(
       { userId: user.id, email: user.email, role: user.role },
@@ -263,7 +355,7 @@ export class AuthService {
       { expiresIn: '15m' }
     );
 
-    const jti = crypto.randomBytes(16).toString('hex');
+    const jti = presetJti || crypto.randomBytes(16).toString('hex');
     const refreshToken = jwt.sign(
       { userId: user.id, jti },
       config.jwtRefreshSecret,

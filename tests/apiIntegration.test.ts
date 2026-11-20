@@ -65,7 +65,7 @@ describe('End-to-End API Integration & RBAC Tests', () => {
     const res = await request(app).get('/health');
     expect(res.status).toBe(200);
     expect(res.body.status).toBe('healthy');
-    expect(res.body.platform).toBe('CreemY');
+    expect(res.body.platform).toBe('Creem');
   });
 
   it('POST /api/v1/rides/estimate returns fares across categories for Riyadh coordinates', async () => {

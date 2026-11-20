@@ -17,6 +17,16 @@ notificationRouter.get('/', async (req: Request, res: Response, next: NextFuncti
   }
 });
 
+// Mark all as read (must be declared before /:id/read)
+notificationRouter.put('/read-all', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const count = await db.markAllNotificationsRead(req.user!.userId);
+    res.json({ success: true, data: { updatedCount: count }, message: 'All notifications marked as read' });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // Mark single notification as read
 notificationRouter.put('/:id/read', async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -29,16 +39,6 @@ notificationRouter.put('/:id/read', async (req: Request, res: Response, next: Ne
 
     const updated = await db.updateNotification(req.params.id, { read: true });
     res.json({ success: true, data: updated });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// Mark all as read
-notificationRouter.put('/read-all', async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    await db.markAllNotificationsRead(req.user!.userId);
-    res.json({ success: true, message: 'All notifications marked as read' });
   } catch (err) {
     next(err);
   }

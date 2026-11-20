@@ -1,7 +1,7 @@
-import React, { useState, useEffect } from 'react';
-import { IUser, UserRole } from './types';
-import { api } from './lib/api';
-import { getSocket, reconnectSocketWithToken } from './lib/socket';
+import React, { useState, useEffect, useCallback } from 'react';
+import { IUser } from './types';
+import { api, clearAccessToken, refreshAccessToken } from './lib/api';
+import { disconnectSocket, getSocket, reconnectSocketWithToken } from './lib/socket';
 import { Header } from './components/common/Header';
 import { RiderApp } from './components/rider/RiderApp';
 import { DriverApp } from './components/driver/DriverApp';
@@ -10,6 +10,7 @@ import { WalletModal } from './components/wallet/WalletModal';
 import { ChatModal } from './components/chat/ChatModal';
 import { NotificationDrawer } from './components/common/NotificationDrawer';
 import { AuthModal } from './components/auth/AuthModal';
+import { ChangePasswordModal } from './components/auth/ChangePasswordModal';
 
 export const App: React.FC = () => {
   const [currentUser, setCurrentUser] = useState<IUser | null>(null);
@@ -17,17 +18,30 @@ export const App: React.FC = () => {
   const [unreadNotifications, setUnreadNotifications] = useState<number>(0);
   const [socketConnected, setSocketConnected] = useState<boolean>(false);
   const [activeView, setActiveView] = useState<'rider' | 'driver' | 'admin'>('rider');
+  const [booting, setBooting] = useState<boolean>(true);
 
   // Modal States
   const [walletModalOpen, setWalletModalOpen] = useState<boolean>(false);
   const [chatModalRideId, setChatModalRideId] = useState<string | null>(null);
   const [notificationsOpen, setNotificationsOpen] = useState<boolean>(false);
   const [authModalOpen, setAuthModalOpen] = useState<boolean>(false);
+  const [changePasswordOpen, setChangePasswordOpen] = useState<boolean>(false);
 
-  // Authenticate / Bootstrap Session
-  const initUserSession = async () => {
+  const fetchNotificationCount = useCallback(async () => {
     try {
-      const token = localStorage.getItem('creemy_token');
+      const notifs = await api.get<any[]>('/users/notifications');
+      const unread = (notifs || []).filter((n) => !n.read).length;
+      setUnreadNotifications(unread);
+    } catch {
+      // Unauthenticated or transient error
+    }
+  }, []);
+
+  // Authenticate / Bootstrap Session using HttpOnly refresh cookie (no localStorage tokens)
+  const initUserSession = useCallback(async () => {
+    setBooting(true);
+    try {
+      const token = await refreshAccessToken();
       if (token) {
         const res = await api.get<{
           user: IUser;
@@ -35,38 +49,35 @@ export const App: React.FC = () => {
         }>('/auth/me');
 
         setCurrentUser(res.user);
-        setWalletBalance(res.walletBalance);
+        setWalletBalance(res.walletBalance || 0);
         reconnectSocketWithToken(token);
         if (res.user.role === 'DRIVER') setActiveView('driver');
         else if (res.user.role === 'ADMIN') setActiveView('admin');
         else setActiveView('rider');
+        await fetchNotificationCount();
+        setAuthModalOpen(false);
         return;
       }
     } catch {
-      localStorage.removeItem('creemy_token');
+      clearAccessToken();
+    } finally {
+      setBooting(false);
     }
 
-    // If unauthenticated, show Auth modal for real registration / login
     setAuthModalOpen(true);
-  };
-
-  const fetchNotificationCount = async () => {
-    try {
-      const notifs = await api.get<any[]>('/users/notifications');
-      const unread = (notifs || []).filter((n) => !n.read).length;
-      setUnreadNotifications(unread);
-    } catch {
-      // ignore
-    }
-  };
+  }, [fetchNotificationCount]);
 
   useEffect(() => {
     initUserSession();
-    fetchNotificationCount();
-  }, []);
+  }, [initUserSession]);
 
   // Socket Connection Monitoring & Live Notifications
   useEffect(() => {
+    if (!currentUser) {
+      setSocketConnected(false);
+      return;
+    }
+
     const socket = getSocket();
 
     const handleConnect = () => setSocketConnected(true);
@@ -87,14 +98,14 @@ export const App: React.FC = () => {
       socket.off('disconnect', handleDisconnect);
       socket.off('notification:new', handleNewNotification);
     };
-  }, []);
+  }, [currentUser]);
 
   const handleAuthSuccess = async (user: IUser, token: string) => {
     setCurrentUser(user);
     reconnectSocketWithToken(token);
     try {
       const me = await api.get<{ walletBalance: number }>('/auth/me');
-      setWalletBalance(me.walletBalance);
+      setWalletBalance(me.walletBalance || 0);
     } catch {
       setWalletBalance(0);
     }
@@ -106,22 +117,23 @@ export const App: React.FC = () => {
     fetchNotificationCount();
   };
 
-  // Logout Handler
   const handleLogout = async () => {
     try {
       await api.post('/auth/logout');
     } catch {
       // ignore
     }
-    localStorage.removeItem('creemy_token');
+    clearAccessToken();
+    disconnectSocket();
     setCurrentUser(null);
     setWalletBalance(0);
+    setUnreadNotifications(0);
     setActiveView('rider');
     setAuthModalOpen(true);
   };
 
   return (
-    <div dir="rtl" className="min-h-screen bg-slate-50 text-slate-900 font-sans antialiased select-none">
+    <div dir="rtl" className="min-h-screen bg-slate-50 text-slate-900 font-sans antialiased">
       {/* Universal Navigation Header */}
       <Header
         currentUser={currentUser}
@@ -131,6 +143,7 @@ export const App: React.FC = () => {
         onOpenWallet={() => setWalletModalOpen(true)}
         onOpenNotifications={() => setNotificationsOpen(true)}
         onOpenAuth={() => setAuthModalOpen(true)}
+        onOpenChangePassword={() => setChangePasswordOpen(true)}
         onLogout={handleLogout}
         activeView={activeView}
         setActiveView={setActiveView}
@@ -138,19 +151,33 @@ export const App: React.FC = () => {
 
       {/* Main View Area */}
       <main className="w-full">
-        {activeView === 'rider' && (
-          <RiderApp
-            onOpenWallet={() => setWalletModalOpen(true)}
-            onOpenChat={(rideId) => setChatModalRideId(rideId)}
-            walletBalance={walletBalance}
-          />
-        )}
+        {booting ? (
+          <div className="h-[calc(100vh-4rem)] flex items-center justify-center text-sm text-slate-500">
+            جاري تهيئة جلسة Creem الآمنة...
+          </div>
+        ) : (
+          <>
+            {activeView === 'rider' && (
+              <RiderApp
+                currentUser={currentUser}
+                onOpenAuth={() => setAuthModalOpen(true)}
+                onOpenWallet={() => setWalletModalOpen(true)}
+                onOpenChat={(rideId) => setChatModalRideId(rideId)}
+                walletBalance={walletBalance}
+              />
+            )}
 
-        {activeView === 'driver' && (
-          <DriverApp onOpenChat={(rideId) => setChatModalRideId(rideId)} />
-        )}
+            {activeView === 'driver' && (
+              <DriverApp
+                currentUser={currentUser}
+                onOpenAuth={() => setAuthModalOpen(true)}
+                onOpenChat={(rideId) => setChatModalRideId(rideId)}
+              />
+            )}
 
-        {activeView === 'admin' && <AdminDashboard />}
+            {activeView === 'admin' && <AdminDashboard />}
+          </>
+        )}
       </main>
 
       {/* Global Modals */}
@@ -177,6 +204,11 @@ export const App: React.FC = () => {
         isOpen={authModalOpen}
         onClose={() => setAuthModalOpen(false)}
         onAuthSuccess={handleAuthSuccess}
+      />
+
+      <ChangePasswordModal
+        isOpen={changePasswordOpen}
+        onClose={() => setChangePasswordOpen(false)}
       />
     </div>
   );

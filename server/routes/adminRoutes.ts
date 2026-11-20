@@ -272,6 +272,17 @@ adminRouter.put(
       const updated = await db.updateUser(req.params.id, { status });
       if (!updated) throw new AppError('User not found', 404, 'NOT_FOUND');
 
+      if (status === 'SUSPENDED') {
+        await db.revokeAllSessionsForUser(req.params.id, 'ACCOUNT_SUSPENDED');
+        const driver = await db.findDriverByUserId(req.params.id);
+        if (driver && driver.isOnline) {
+          await db.updateDriver(driver.id, { isOnline: false });
+        }
+        if (io) {
+          io.in(`user:${req.params.id}`).disconnectSockets(true);
+        }
+      }
+
       await db.logAudit(req.user!.userId, 'USER_STATUS_UPDATED', {
         targetUserId: req.params.id,
         status,
@@ -299,12 +310,14 @@ adminRouter.get('/audit-logs', async (req: Request, res: Response, next: NextFun
 // Admin Refund Route for Ride
 adminRouter.post('/rides/:id/refund', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { amount, reason } = req.body;
+    const { amount, reason, idempotencyKey } = req.body;
+    const headerKey = req.headers['idempotency-key'] as string | undefined;
     const result = await PaymentService.refundRidePayment({
       rideId: req.params.id,
       amount,
       reason,
       requestedByUserId: req.user!.userId,
+      idempotencyKey: headerKey || idempotencyKey,
     });
 
     await db.logAudit(req.user!.userId, 'ADMIN_RIDE_REFUND_ISSUED', {

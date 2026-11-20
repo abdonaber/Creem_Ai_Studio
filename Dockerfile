@@ -1,45 +1,46 @@
-# Multi-stage production build for Creem Platform
-FROM node:22-alpine AS builder
+# Multi-stage production build for Creem Platform (Bun)
+FROM oven/bun:1-alpine AS builder
 
 WORKDIR /app
 
-# Install build dependencies
-COPY package*.json ./
-RUN npm ci
+# Copy package manifest and strict Bun lockfile
+COPY package.json bun.lock ./
+RUN bun install --frozen-lockfile
 
-# Copy source code
+# Copy application source
 COPY . .
 
-# Build Vite frontend and bundled Node/Express server
-RUN npm run build
+# Build Vite client and server bundle
+RUN bun run build
 
 # Production runner stage
-FROM node:22-alpine AS runner
+FROM oven/bun:1-alpine AS runner
 
 WORKDIR /app
 
+ENV APP_ENV=production
 ENV NODE_ENV=production
+ENV APP_MODE=production
 ENV PORT=3000
 
-# Install curl for healthcheck
+# Install curl for container healthcheck
 RUN apk add --no-cache curl
 
-# Only install production dependencies
-COPY package*.json ./
-RUN npm ci --omit=dev && npm cache clean --force
+# Install production dependencies using strict lockfile
+COPY package.json bun.lock ./
+RUN bun install --frozen-lockfile --production
 
-# Copy built artifacts from builder stage
+# Copy compiled build artifacts
 COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/metadata.json ./metadata.json
 
-# Security: Run as non-root user
-USER node
+# Security: switch to non-root user
+RUN chown -R bun:bun /app
+USER bun
 
-# Expose production port
 EXPOSE 3000
 
-# Health check probe
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD curl -f http://localhost:3000/health || exit 1
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD sh -c 'curl -f http://localhost:${PORT:-3000}/health || exit 1'
 
-# Start production server
-CMD ["node", "dist/server.cjs"]
+CMD ["bun", "run", "dist/server.cjs"]

@@ -1,4 +1,5 @@
 import { Router, Request, Response, NextFunction } from 'express';
+import { z } from 'zod';
 import { authenticate } from '../middleware/auth';
 import { db } from '../db/store';
 import { AppError } from '../middleware/errorHandler';
@@ -14,14 +15,47 @@ export const rideRouter = Router();
 
 rideRouter.use(authenticate);
 
+const coordSchema = z.object({
+  lat: z.number().finite().min(-90).max(90),
+  lng: z.number().finite().min(-180).max(180),
+  address: z.string().trim().max(300).optional(),
+});
+
+const estimateSchema = z.object({
+  pickup: coordSchema,
+  destination: coordSchema,
+});
+
+const requestRideSchema = z.object({
+  pickup: coordSchema,
+  destination: coordSchema,
+  vehicleCategory: z.enum(['ECO', 'STANDARD', 'COMFORT', 'VIP']).default('STANDARD'),
+  paymentMethod: z.enum(['WALLET', 'CASH', 'CREDIT_CARD']).default('WALLET'),
+});
+
+const transitionSchema = z.object({
+  status: z.enum([
+    'REQUESTED',
+    'SEARCHING_DRIVER',
+    'DRIVER_ASSIGNED',
+    'DRIVER_ARRIVING',
+    'DRIVER_ARRIVED',
+    'RIDE_STARTED',
+    'RIDE_COMPLETED',
+    'CANCELLED',
+    'NO_DRIVER_FOUND',
+  ]),
+});
+
 // Estimate Fare
 rideRouter.post('/estimate', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { pickup, destination } = req.body;
-    if (!pickup?.lat || !pickup?.lng || !destination?.lat || !destination?.lng) {
+    const parsed = estimateSchema.safeParse(req.body);
+    if (!parsed.success) {
       throw new AppError('Valid pickup and destination coordinates are required', 400, 'INVALID_COORDINATES');
     }
 
+    const { pickup, destination } = parsed.data;
     const route = await RoutingService.calculateRoute(
       { lat: pickup.lat, lng: pickup.lng },
       { lat: destination.lat, lng: destination.lng }
@@ -61,13 +95,13 @@ rideRouter.post('/estimate', async (req: Request, res: Response, next: NextFunct
 // Request Ride
 rideRouter.post('/request', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { pickup, destination, vehicleCategory = 'STANDARD', paymentMethod = 'WALLET' } = req.body;
-
-    if (!pickup?.lat || !pickup?.lng || !destination?.lat || !destination?.lng) {
-      throw new AppError('Pickup and destination locations are required', 400, 'INVALID_INPUT');
+    const parsed = requestRideSchema.safeParse(req.body);
+    if (!parsed.success) {
+      throw new AppError('Pickup and destination coordinates are required', 400, 'INVALID_INPUT');
     }
 
-    // Check if user already has an ongoing active ride
+    const { pickup, destination, vehicleCategory, paymentMethod } = parsed.data;
+
     const existingActive = await db.findActiveRideForUser(req.user!.userId);
     if (existingActive) {
       throw new AppError('You already have an active ride in progress', 400, 'ACTIVE_RIDE_EXISTS');
@@ -105,13 +139,12 @@ rideRouter.post('/request', async (req: Request, res: Response, next: NextFuncti
       updatedAt: new Date().toISOString(),
     };
 
-    await db.createRide(ride);
-    await db.logAudit(req.user!.userId, 'RIDE_REQUESTED', { rideId: ride.id, fare: fare.total });
+    const createdRide = await db.createRide(ride);
+    await db.logAudit(req.user!.userId, 'RIDE_REQUESTED', { rideId: createdRide.id, fare: fare.total });
 
-    // Initiate dispatch
-    await DispatchService.dispatchRide(ride);
+    await DispatchService.dispatchRide(createdRide);
 
-    res.status(201).json({ success: true, data: ride });
+    res.status(201).json({ success: true, data: createdRide });
   } catch (err) {
     next(err);
   }
@@ -143,7 +176,6 @@ rideRouter.get('/active', async (req: Request, res: Response, next: NextFunction
       return;
     }
 
-    // Enrich with driver details if assigned
     let driverDetails = null;
     if (activeRide.driverId) {
       const driver = await db.findDriverById(activeRide.driverId);
@@ -162,7 +194,6 @@ rideRouter.get('/active', async (req: Request, res: Response, next: NextFunction
       }
     }
 
-    // Enrich with rider details if driver
     let riderDetails = null;
     const rider = await db.findUserById(activeRide.riderId);
     if (rider) {
@@ -195,10 +226,9 @@ rideRouter.get('/:id', async (req: Request, res: Response, next: NextFunction) =
 
     const driver = await db.findDriverByUserId(req.user!.userId);
     const isRider = ride.riderId === req.user!.userId;
-    const isDriver = driver && ride.driverId === driver.id;
+    const isDriver = Boolean(driver && ride.driverId === driver.id);
     const isAdmin = req.user!.role === 'ADMIN';
 
-    // IDOR verification
     if (!isRider && !isDriver && !isAdmin) {
       throw new AppError('Access denied. You do not own this ride.', 403, 'FORBIDDEN_IDOR');
     }
@@ -216,6 +246,9 @@ rideRouter.post('/:id/accept', async (req: Request, res: Response, next: NextFun
     if (!driver || driver.approvalStatus !== 'APPROVED') {
       throw new AppError('Only approved drivers can accept rides', 403, 'FORBIDDEN');
     }
+    if (!driver.isOnline) {
+      throw new AppError('Driver must be online to accept rides', 400, 'DRIVER_OFFLINE');
+    }
 
     const result = await db.atomicAcceptRide(req.params.id, driver.id);
     if (!result.success || !result.ride) {
@@ -230,7 +263,7 @@ rideRouter.post('/:id/accept', async (req: Request, res: Response, next: NextFun
   }
 });
 
-// Decline Ride Offer (Driver declines targeted offer)
+// Decline Ride Offer
 rideRouter.post('/:id/decline', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const driver = await db.findDriverByUserId(req.user!.userId);
@@ -250,19 +283,23 @@ rideRouter.post('/:id/decline', async (req: Request, res: Response, next: NextFu
 // Transition Ride Status (State Machine Enforcement)
 rideRouter.post('/:id/transition', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { status } = req.body as { status: RideStatus };
+    const parsed = transitionSchema.safeParse(req.body);
+    if (!parsed.success) {
+      throw new AppError('Invalid target ride status', 400, 'INVALID_STATUS');
+    }
+
+    const { status } = parsed.data as { status: RideStatus };
     const ride = await db.findRideById(req.params.id);
     if (!ride) throw new AppError('Ride not found', 404, 'NOT_FOUND');
 
     const driver = await db.findDriverByUserId(req.user!.userId);
-    const isDriver = driver && ride.driverId === driver.id;
+    const isDriver = Boolean(driver && ride.driverId === driver.id);
     const isAdmin = req.user!.role === 'ADMIN';
 
     if (!isDriver && !isAdmin) {
       throw new AppError('Only the assigned driver or admin can update ride status', 403, 'FORBIDDEN');
     }
 
-    // State machine legal transition map
     const transitions: Record<RideStatus, RideStatus[]> = {
       REQUESTED: [],
       SEARCHING_DRIVER: ['DRIVER_ASSIGNED', 'NO_DRIVER_FOUND', 'CANCELLED'],
@@ -284,7 +321,7 @@ rideRouter.post('/:id/transition', async (req: Request, res: Response, next: Nex
       additionalUpdates.startedAt = new Date().toISOString();
     } else if (status === 'RIDE_COMPLETED') {
       additionalUpdates.completedAt = new Date().toISOString();
-      additionalUpdates.finalFare = ride.estimatedFare;
+      additionalUpdates.finalFare = FareService.calculateFinalFare(ride);
     }
 
     const transitionResult = await db.atomicTransitionRide(
@@ -302,13 +339,12 @@ rideRouter.post('/:id/transition', async (req: Request, res: Response, next: Nex
       );
     }
 
-    // If ride is completed, automatically process payment
     if (status === 'RIDE_COMPLETED') {
       try {
         await PaymentService.processRidePayment(
           ride.id,
           ride.riderId,
-          ride.finalFare || ride.estimatedFare,
+          transitionResult.ride.finalFare || ride.estimatedFare,
           ride.paymentMethod
         );
       } catch (payErr: any) {
@@ -316,7 +352,6 @@ rideRouter.post('/:id/transition', async (req: Request, res: Response, next: Nex
       }
     }
 
-    // Broadcast update via Socket.IO
     if (io) {
       io.to(`ride:${ride.id}`).emit('ride:status_changed', {
         rideId: ride.id,
@@ -340,25 +375,25 @@ rideRouter.post('/:id/cancel', async (req: Request, res: Response, next: NextFun
 
     const driver = await db.findDriverByUserId(req.user!.userId);
     const isRider = ride.riderId === req.user!.userId;
-    const isDriver = driver && ride.driverId === driver.id;
+    const isDriver = Boolean(driver && ride.driverId === driver.id);
     const isAdmin = req.user!.role === 'ADMIN';
 
     if (!isRider && !isDriver && !isAdmin) {
       throw new AppError('Unauthorized to cancel this ride', 403, 'FORBIDDEN');
     }
 
-    if (['RIDE_COMPLETED', 'CANCELLED'].includes(ride.status)) {
+    if (['RIDE_COMPLETED', 'CANCELLED', 'NO_DRIVER_FOUND'].includes(ride.status)) {
       throw new AppError(`Cannot cancel a ride that is already ${ride.status}`, 400, 'CANNOT_CANCEL');
     }
 
-    const cancelledBy = isRider ? 'RIDER' : isDriver ? 'DRIVER' : 'SYSTEM';
+    const cancelledBy = isRider ? 'RIDER' : isDriver ? 'DRIVER' : isAdmin ? 'ADMIN' : 'SYSTEM';
 
     const result = await db.atomicTransitionRide(
       ride.id,
       'CANCELLED',
       ['REQUESTED', 'SEARCHING_DRIVER', 'DRIVER_ASSIGNED', 'DRIVER_ARRIVING', 'DRIVER_ARRIVED'],
       {
-        cancellationReason: reason || 'Cancelled by user',
+        cancellationReason: reason ? String(reason).slice(0, 300) : 'Cancelled by user',
         cancelledBy,
         byUserId: req.user!.userId,
       } as any
@@ -388,7 +423,8 @@ rideRouter.post('/:id/cancel', async (req: Request, res: Response, next: NextFun
 rideRouter.post('/:id/rate', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { stars, comment } = req.body;
-    if (!stars || stars < 1 || stars > 5) {
+    const numericStars = Number(stars);
+    if (!Number.isFinite(numericStars) || numericStars < 1 || numericStars > 5) {
       throw new AppError('Rating must be between 1 and 5 stars', 400, 'INVALID_RATING');
     }
 
@@ -416,19 +452,19 @@ rideRouter.post('/:id/rate', async (req: Request, res: Response, next: NextFunct
       rideId: ride.id,
       fromUserId: req.user!.userId,
       toUserId,
-      stars: Number(stars),
-      comment: comment ? String(comment).trim() : undefined,
+      stars: numericStars,
+      comment: comment ? String(comment).trim().slice(0, 500) : undefined,
       createdAt: new Date().toISOString(),
     });
 
-    // Recalculate driver rating average
     if (driver) {
       const allRatings = await db.getRatingsForUser(driver.userId);
-      const avg = allRatings.reduce((acc, curr) => acc + curr.stars, 0) / allRatings.length;
-      await db.updateDriver(driver.id, {
-        rating: Math.round(avg * 10) / 10,
-        totalRides: (driver.totalRides || 0) + 1,
-      });
+      if (allRatings.length > 0) {
+        const avg = allRatings.reduce((acc, curr) => acc + curr.stars, 0) / allRatings.length;
+        await db.updateDriver(driver.id, {
+          rating: Math.round(avg * 10) / 10,
+        });
+      }
     }
 
     res.json({ success: true, data: rating });

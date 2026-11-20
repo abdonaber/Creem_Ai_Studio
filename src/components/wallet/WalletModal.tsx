@@ -4,12 +4,12 @@ import { IWallet, IWalletTransaction } from '../../types';
 import {
   Wallet,
   X,
-  PlusCircle,
   Sparkles,
   CreditCard,
   ArrowUpRight,
   ArrowDownLeft,
-  CheckCircle2
+  CheckCircle2,
+  AlertCircle,
 } from 'lucide-react';
 
 interface WalletModalProps {
@@ -26,24 +26,27 @@ export const WalletModal: React.FC<WalletModalProps> = ({
   const [wallet, setWallet] = useState<IWallet | null>(null);
   const [transactions, setTransactions] = useState<IWalletTransaction[]>([]);
   const [amount, setAmount] = useState<number>(100);
-  const [promoCode, setPromoCode] = useState<string>('CREEMY2026');
+  const [promoCode, setPromoCode] = useState<string>('');
   const [loading, setLoading] = useState<boolean>(false);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   const fetchWalletData = async () => {
     try {
       const res = await api.get<{ wallet: IWallet; transactions: IWalletTransaction[] }>('/wallet');
       if (res) {
         setWallet(res.wallet);
-        setTransactions(res.transactions);
+        setTransactions(res.transactions || []);
       }
-    } catch (err) {
-      console.error('Wallet error:', err);
+    } catch (err: any) {
+      setErrorMessage(err.message || 'تعذر تحميل بيانات المحفظة');
     }
   };
 
   useEffect(() => {
     if (isOpen) {
+      setErrorMessage(null);
+      setSuccessMessage(null);
       fetchWalletData();
     }
   }, [isOpen]);
@@ -51,21 +54,26 @@ export const WalletModal: React.FC<WalletModalProps> = ({
   const handleTopup = async () => {
     setLoading(true);
     setSuccessMessage(null);
+    setErrorMessage(null);
     try {
-      const res = await api.post<{ transaction: IWalletTransaction; newBalance: number }>('/wallet/topup', {
+      const res = await api.post<{
+        transaction: IWalletTransaction;
+        promoApplied?: boolean;
+        newBalance: number;
+      }>('/wallet/topup', {
         amount,
         promoCode: promoCode.trim() || undefined,
       });
 
       setSuccessMessage(
-        promoCode === 'CREEMY2026'
+        res.promoApplied
           ? `تم شحن ${amount} SAR بنجاح وإضافة مكافأة الكود الترويجي (+25 SAR)!`
           : `تم شحن ${amount} SAR بنجاح!`
       );
       onBalanceUpdated(res.newBalance);
       fetchWalletData();
     } catch (err: any) {
-      alert(err.message || 'فشل في شحن الرصيد');
+      setErrorMessage(err.message || 'فشل في شحن الرصيد');
     } finally {
       setLoading(false);
     }
@@ -83,7 +91,7 @@ export const WalletModal: React.FC<WalletModalProps> = ({
               <Wallet className="h-6 w-6" />
             </div>
             <div>
-              <h3 className="font-bold text-slate-900 text-lg">محفظة CreemY الرقمية</h3>
+              <h3 className="font-bold text-slate-900 text-lg">محفظة Creem الرقمية</h3>
               <p className="text-xs text-slate-400">إدارة الرصيد والمدفوعات الفورية</p>
             </div>
           </div>
@@ -104,7 +112,7 @@ export const WalletModal: React.FC<WalletModalProps> = ({
           </div>
           <div className="text-[11px] text-slate-300 flex items-center gap-1.5 pt-1">
             <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" />
-            جاهز للاستخدام في جميع رحلات وفئات CreemY
+            جاهز للاستخدام في جميع رحلات وفئات Creem
           </div>
         </div>
 
@@ -117,6 +125,7 @@ export const WalletModal: React.FC<WalletModalProps> = ({
             {[50, 100, 200, 500].map((val) => (
               <button
                 key={val}
+                type="button"
                 onClick={() => setAmount(val)}
                 className={`py-2.5 rounded-xl text-xs font-bold border transition-all ${
                   amount === val
@@ -133,21 +142,28 @@ export const WalletModal: React.FC<WalletModalProps> = ({
           <div className="space-y-1.5">
             <label className="text-xs font-semibold text-slate-600 flex items-center gap-1">
               <Sparkles className="h-3.5 w-3.5 text-amber-500" />
-              كود الخصم والمكافأة الترويجية
+              كود الخصم والمكافأة الترويجية (اختياري)
             </label>
             <div className="flex gap-2">
               <input
                 type="text"
                 value={promoCode}
                 onChange={(e) => setPromoCode(e.target.value.toUpperCase())}
-                placeholder="CREEMY2026"
+                placeholder="CREEM2026"
                 className="flex-1 text-xs p-3 font-mono font-bold bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-emerald-500 focus:outline-hidden"
               />
               <span className="px-3 py-2 bg-amber-50 border border-amber-200 text-amber-800 rounded-xl text-xs font-bold flex items-center">
-                +25 SAR بونص
+                CREEM2026
               </span>
             </div>
           </div>
+
+          {errorMessage && (
+            <div className="p-3 rounded-xl bg-rose-50 text-rose-800 text-xs font-medium border border-rose-200 flex items-center gap-2">
+              <AlertCircle className="h-4 w-4 text-rose-600 shrink-0" />
+              {errorMessage}
+            </div>
+          )}
 
           {successMessage && (
             <div className="p-3 rounded-xl bg-emerald-50 text-emerald-800 text-xs font-medium border border-emerald-200 flex items-center gap-2">
@@ -157,9 +173,10 @@ export const WalletModal: React.FC<WalletModalProps> = ({
           )}
 
           <button
+            type="button"
             disabled={loading}
             onClick={handleTopup}
-            className="w-full py-3.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-2xl font-bold text-xs shadow-lg shadow-emerald-600/30 flex items-center justify-center gap-2 transition-all active:scale-98"
+            className="w-full py-3.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 text-white rounded-2xl font-bold text-xs shadow-lg shadow-emerald-600/30 flex items-center justify-center gap-2 transition-all active:scale-98"
           >
             <CreditCard className="h-4 w-4" />
             {loading ? 'جاري معالجة الشحن الآمن...' : `تأكيد شحن ${amount} SAR الآن`}

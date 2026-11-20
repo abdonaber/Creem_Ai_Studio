@@ -58,7 +58,7 @@ export interface IDriver {
   userId: string;
   approvalStatus: DriverApprovalStatus;
   isOnline: boolean;
-  currentLocation: {
+  currentLocation?: {
     lat: number;
     lng: number;
     heading?: number;
@@ -69,9 +69,11 @@ export interface IDriver {
   totalRides: number;
   licenseNumber: string;
   earningsTotal: number;
+  outstandingDebt?: number;
   userName?: string;
   userEmail?: string;
   userPhone?: string;
+  userAvatar?: string;
 }
 
 export interface IRide {
@@ -82,7 +84,7 @@ export interface IRide {
   vehicleCategory: VehicleCategory;
   pickup: LocationCoordinate;
   destination: LocationCoordinate;
-  currentDriverLocation?: { lat: number; lng: number };
+  currentDriverLocation?: { lat: number; lng: number; heading?: number };
   estimatedFare: number;
   finalFare?: number;
   tip?: number;
@@ -160,4 +162,34 @@ export interface IAuditLog {
   details: Record<string, unknown>;
   ip?: string;
   timestamp: string;
+}
+
+export interface IPaginationMeta {
+  total: number;
+  page: number;
+  totalPages: number;
+  limit: number;
+}
+
+export interface IReconciliationReport {
+  healthy: boolean;
+  discrepanciesCount: number;
+  discrepancies: Array<{
+    type: string;
+    id: string;
+    details: string;
+  }>;
+}
+
+export interface IPlatformLedgerEntry {
+  id: string;
+  rideId: string;
+  type: string;
+  amount: number;
+  currency: string;
+  fromAccount: string;
+  toAccount: string;
+  status: string;
+  idempotencyKey?: string;
+  createdAt: string;
 }

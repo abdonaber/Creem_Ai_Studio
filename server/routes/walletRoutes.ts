@@ -33,8 +33,13 @@ walletRouter.post('/topup', async (req: Request, res: Response, next: NextFuncti
       (req.headers['idempotency-key'] as string) || req.body.idempotencyKey;
     const numAmount = Number(amount);
 
-    if (isNaN(numAmount) || numAmount <= 0) {
-      throw new AppError('Top-up amount must be greater than zero', 400, 'INVALID_AMOUNT');
+    if (!Number.isFinite(numAmount) || numAmount <= 0) {
+      throw new AppError('Top-up amount must be a finite number greater than zero', 400, 'INVALID_AMOUNT');
+    }
+
+    const decPart = String(numAmount).split('.')[1];
+    if (decPart && decPart.length > 2) {
+      throw new AppError('Maximum 2 decimal places allowed for SAR amounts', 400, 'INVALID_AMOUNT');
     }
 
     if (numAmount > 5000) {
@@ -42,11 +47,12 @@ walletRouter.post('/topup', async (req: Request, res: Response, next: NextFuncti
     }
 
     let bonus = 0;
-    if (promoCode && String(promoCode).toUpperCase() === 'CREEMY2026') {
-      bonus = 25; // 25 SAR welcome promo bonus verified server-side
+    const normalizedPromo = promoCode ? String(promoCode).trim().toUpperCase() : '';
+    if (normalizedPromo === 'CREEM2026' || normalizedPromo === 'CREEMY2026') {
+      bonus = 25;
     }
 
-    const totalCredit = numAmount + bonus;
+    const totalCredit = Math.round((numAmount + bonus) * 100) / 100;
     const reason = bonus > 0 ? `Recharge (+${bonus} SAR Promo Bonus)` : 'Wallet Card Recharge';
 
     const result = await db.creditWallet(

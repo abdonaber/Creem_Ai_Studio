@@ -1,20 +1,16 @@
 import { io, Socket } from 'socket.io-client';
+import { getAccessToken } from './api';
 
 let socket: Socket | null = null;
 
 export function getSocket(): Socket {
   if (!socket) {
-    const token = localStorage.getItem('creemy_token');
     socket = io(window.location.origin, {
-      auth: { token },
-      autoConnect: true,
+      auth: (cb) => cb({ token: getAccessToken() }),
+      autoConnect: Boolean(getAccessToken()),
       reconnection: true,
       reconnectionAttempts: 10,
       reconnectionDelay: 1000,
-    });
-
-    socket.on('connect', () => {
-      console.log('[Socket.IO] Connected with ID:', socket?.id);
     });
 
     socket.on('connect_error', (err) => {
@@ -30,8 +26,11 @@ export function reconnectSocketWithToken(token: string): Socket {
     socket.disconnect().connect();
   } else {
     socket = io(window.location.origin, {
-      auth: { token },
+      auth: (cb) => cb({ token: getAccessToken() || token }),
       autoConnect: true,
+      reconnection: true,
+      reconnectionAttempts: 10,
+      reconnectionDelay: 1000,
     });
   }
   return socket;

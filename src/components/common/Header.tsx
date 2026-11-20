@@ -9,6 +9,7 @@ import {
   LogOut,
   ChevronDown,
   LogIn,
+  KeyRound,
 } from 'lucide-react';
 
 interface HeaderProps {
@@ -19,6 +20,7 @@ interface HeaderProps {
   onOpenWallet: () => void;
   onOpenNotifications: () => void;
   onOpenAuth: () => void;
+  onOpenChangePassword: () => void;
   onLogout: () => void;
   activeView: 'rider' | 'driver' | 'admin';
   setActiveView: (view: 'rider' | 'driver' | 'admin') => void;
@@ -32,6 +34,7 @@ export const Header: React.FC<HeaderProps> = ({
   onOpenWallet,
   onOpenNotifications,
   onOpenAuth,
+  onOpenChangePassword,
   onLogout,
   activeView,
   setActiveView,
@@ -45,16 +48,24 @@ export const Header: React.FC<HeaderProps> = ({
         <div className="flex items-center gap-3">
           <div
             className="flex items-center gap-2.5 cursor-pointer"
-            onClick={() => setActiveView(currentUser?.role === 'DRIVER' ? 'driver' : 'rider')}
+            onClick={() =>
+              setActiveView(
+                currentUser?.role === 'ADMIN'
+                  ? 'admin'
+                  : currentUser?.role === 'DRIVER'
+                  ? 'driver'
+                  : 'rider'
+              )
+            }
           >
             <div className="h-10 w-10 rounded-xl bg-gradient-to-tr from-emerald-600 to-teal-500 flex items-center justify-center text-white shadow-md shadow-emerald-500/20">
               <Car className="h-6 w-6 stroke-[2.2]" />
             </div>
             <div>
-              <span className="text-2xl font-black tracking-tight text-slate-900 flex items-center gap-1">
-                Creem<span className="text-emerald-600">Y</span>
+              <span className="text-2xl font-black tracking-tight text-slate-900 flex items-center">
+                Cre<span className="text-emerald-600">em</span>
               </span>
-              <span className="hidden sm:inline-block text-[10px] text-slate-400 font-medium -mt-1 block">
+              <span className="hidden sm:block text-[10px] text-slate-400 font-medium -mt-1">
                 منصة النقل الذكية
               </span>
             </div>
@@ -75,12 +86,12 @@ export const Header: React.FC<HeaderProps> = ({
               }`}
             />
             <span className="text-[11px] font-sans">
-              {socketConnected ? 'Live Socket' : 'Connecting'}
+              {socketConnected ? 'متصل' : 'قيد الاتصال'}
             </span>
           </div>
         </div>
 
-        {/* Center: Authorized View Switcher */}
+        {/* Center: Authorized View Switcher (Desktop) */}
         {currentUser && (
           <div className="hidden sm:flex items-center bg-slate-100/80 p-1 rounded-xl border border-slate-200 text-sm font-medium">
             {(currentUser.role === 'RIDER' || currentUser.role === 'ADMIN') && (
@@ -93,7 +104,7 @@ export const Header: React.FC<HeaderProps> = ({
                 }`}
               >
                 <User className="h-4 w-4" />
-                الراكب (Rider)
+                الراكب
               </button>
             )}
 
@@ -107,7 +118,7 @@ export const Header: React.FC<HeaderProps> = ({
                 }`}
               >
                 <Car className="h-4 w-4" />
-                الكابتن (Driver)
+                الكابتن
               </button>
             )}
 
@@ -121,7 +132,7 @@ export const Header: React.FC<HeaderProps> = ({
                 }`}
               >
                 <ShieldCheck className="h-4 w-4" />
-                لوحة الإدارة (Admin)
+                لوحة الإدارة
               </button>
             )}
           </div>
@@ -205,6 +216,13 @@ export const Header: React.FC<HeaderProps> = ({
                         المحفظة والرصيد
                       </button>
                       <button
+                        onClick={onOpenChangePassword}
+                        className="w-full flex items-center gap-2 px-3 py-2 rounded-xl text-xs text-slate-700 hover:bg-slate-50 transition-colors text-right"
+                      >
+                        <KeyRound className="h-4 w-4 text-slate-400" />
+                        تغيير كلمة المرور
+                      </button>
+                      <button
                         onClick={onLogout}
                         className="w-full flex items-center gap-2 px-3 py-2 rounded-xl text-xs text-rose-600 hover:bg-rose-50 transition-colors text-right"
                       >
@@ -227,6 +245,39 @@ export const Header: React.FC<HeaderProps> = ({
           )}
         </div>
       </div>
+
+      {/* Mobile Navigation Switcher */}
+      {currentUser && currentUser.role === 'ADMIN' && (
+        <div className="sm:hidden border-t border-slate-100 px-3 py-2 flex items-center justify-center gap-1.5 bg-slate-50/90 text-xs font-semibold">
+          <button
+            onClick={() => setActiveView('rider')}
+            className={`flex-1 py-1.5 rounded-lg flex items-center justify-center gap-1 ${
+              activeView === 'rider' ? 'bg-white text-emerald-700 shadow-xs' : 'text-slate-600'
+            }`}
+          >
+            <User className="h-3.5 w-3.5" />
+            الراكب
+          </button>
+          <button
+            onClick={() => setActiveView('driver')}
+            className={`flex-1 py-1.5 rounded-lg flex items-center justify-center gap-1 ${
+              activeView === 'driver' ? 'bg-white text-emerald-700 shadow-xs' : 'text-slate-600'
+            }`}
+          >
+            <Car className="h-3.5 w-3.5" />
+            الكابتن
+          </button>
+          <button
+            onClick={() => setActiveView('admin')}
+            className={`flex-1 py-1.5 rounded-lg flex items-center justify-center gap-1 ${
+              activeView === 'admin' ? 'bg-white text-emerald-700 shadow-xs' : 'text-slate-600'
+            }`}
+          >
+            <ShieldCheck className="h-3.5 w-3.5" />
+            الإدارة
+          </button>
+        </div>
+      )}
     </header>
   );
 };

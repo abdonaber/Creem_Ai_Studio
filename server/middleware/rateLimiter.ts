@@ -7,8 +7,12 @@ export function rateLimit(options: { windowMs: number; max: number; message?: st
   const windowSeconds = Math.max(1, Math.ceil(windowMs / 1000));
 
   return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
-    // In test environment or health checks, skip rate limits
-    if (process.env.NODE_ENV === 'test' || req.path === '/health' || req.path === '/ready') {
+    const isTestEnv =
+      process.env.NODE_ENV === 'test' ||
+      Boolean(process.env.VITEST) ||
+      Boolean(process.env.BUN_TEST);
+
+    if (isTestEnv || req.path === '/health' || req.path === '/ready' || req.path === '/readiness') {
       return next();
     }
 

@@ -101,6 +101,10 @@ export class QueueManager {
         logger.info('[BullMQ] Redis connection established.');
       });
 
+      this.sharedRedisConnection.on('ready', () => {
+        this.isRedisAvailable = true;
+      });
+
       this.sharedRedisConnection.on('error', (err) => {
         this.isRedisAvailable = false;
         logger.warn(`[BullMQ] Redis error: ${err.message}`);
@@ -110,10 +114,6 @@ export class QueueManager {
         this.isRedisAvailable = false;
       });
 
-      this.sharedRedisConnection.connect().catch((err) => {
-        logger.warn(`[BullMQ] Initial Redis connection failed: ${err.message}`);
-      });
-
       return this.sharedRedisConnection;
     } catch (err: any) {
       logger.warn(`[BullMQ] Failed to configure Redis: ${err.message}`);
@@ -121,15 +121,48 @@ export class QueueManager {
     }
   }
 
+  public static isReady(): boolean {
+    if (this.isShuttingDown || !this.isInitialized) {
+      return false;
+    }
+    if (config.isProduction) {
+      return this.isRedisAvailable;
+    }
+    if (config.redisUrl) {
+      return this.isRedisAvailable;
+    }
+    return true;
+  }
+
   /**
    * Initialize Queues and Workers
    */
   public static async init(): Promise<void> {
+    this.isShuttingDown = false;
     if (this.isInitialized) return;
 
     const redis = this.getRedisConnection();
     if (!redis) {
+      if (config.isProduction) {
+        throw new Error('FATAL: Redis connection is required for QueueManager in production.');
+      }
       logger.info('[BullMQ] Redis not configured. Queue system operating in direct/fallback execution mode.');
+      this.isInitialized = true;
+      return;
+    }
+
+    try {
+      if (redis.status === 'wait' || redis.status === 'end') {
+        await redis.connect();
+      }
+      await redis.ping();
+      this.isRedisAvailable = true;
+    } catch (err: any) {
+      this.isRedisAvailable = false;
+      if (config.isProduction) {
+        throw new Error(`FATAL: BullMQ failed to connect/ping Redis in production: ${err.message}`);
+      }
+      logger.warn(`[BullMQ] Redis unreachable during init; falling back to local execution: ${err.message}`);
       this.isInitialized = true;
       return;
     }

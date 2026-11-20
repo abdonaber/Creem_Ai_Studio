@@ -20,19 +20,16 @@ declare global {
   }
 }
 
-export async function authenticate(req: Request, res: Response, next: NextFunction): Promise<void> {
+export async function authenticate(req: Request, _res: Response, next: NextFunction): Promise<void> {
   try {
     const authHeader = req.headers.authorization;
-    let token: string | undefined;
-
-    if (authHeader && authHeader.startsWith('Bearer ')) {
-      token = authHeader.split(' ')[1];
-    } else if (req.cookies && req.cookies.creemy_access_token) {
-      token = req.cookies.creemy_access_token;
-    }
+    const token =
+      authHeader && authHeader.startsWith('Bearer ')
+        ? authHeader.slice(7).trim()
+        : undefined;
 
     if (!token) {
-      throw new AppError('Authentication required. Missing token.', 401, 'UNAUTHORIZED');
+      throw new AppError('Authentication required. Missing Bearer token.', 401, 'UNAUTHORIZED');
     }
 
     const decoded = jwt.verify(token, config.jwtSecret) as AuthPayload;
@@ -66,7 +63,7 @@ export async function authenticate(req: Request, res: Response, next: NextFuncti
 }
 
 export function requireRole(...allowedRoles: UserRole[]) {
-  return (req: Request, res: Response, next: NextFunction): void => {
+  return (req: Request, _res: Response, next: NextFunction): void => {
     if (!req.user) {
       return next(new AppError('Authentication required.', 401, 'UNAUTHORIZED'));
     }
@@ -83,6 +80,48 @@ export function requireRole(...allowedRoles: UserRole[]) {
 
     next();
   };
+}
+
+/**
+ * CSRF protection for cookie-backed auth state-changing routes (/refresh, /logout, /logout-all).
+ * Validates Origin/Referer against allowed origins and blocks cross-site form/cookie submissions.
+ */
+export function verifyCsrfOrigin(req: Request, _res: Response, next: NextFunction): void {
+  const origin = req.headers.origin;
+  const referer = req.headers.referer;
+
+  const isAllowedOrigin = (candidate: string): boolean => {
+    try {
+      const parsed = new URL(candidate);
+      const originOnly = `${parsed.protocol}//${parsed.host}`;
+      if (config.allowedOrigins.includes(originOnly)) {
+        return true;
+      }
+      if (!config.isProduction && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(originOnly)) {
+        return true;
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  };
+
+  if (origin && !isAllowedOrigin(origin)) {
+    return next(new AppError('CSRF validation failed: untrusted request origin.', 403, 'CSRF_ORIGIN_MISMATCH'));
+  }
+
+  if (!origin && referer && !isAllowedOrigin(referer)) {
+    return next(new AppError('CSRF validation failed: untrusted request referer.', 403, 'CSRF_REFERER_MISMATCH'));
+  }
+
+  // In strict production, if cookie auth is used with no Origin/Referer and no custom header, block
+  const usesCookie = Boolean(req.cookies?.creem_refresh_token || req.cookies?.creemy_refresh_token);
+  const hasCustomHeader = Boolean(req.headers['x-requested-with'] || req.headers.authorization);
+  if (config.isProduction && usesCookie && !origin && !referer && !hasCustomHeader) {
+    return next(new AppError('CSRF validation failed: missing origin or custom request header.', 403, 'CSRF_HEADER_REQUIRED'));
+  }
+
+  next();
 }
 
 export function createAuthToken(payload: AuthPayload): string {

@@ -1,4 +1,4 @@
-import { VehicleCategory } from '../types';
+import { IRide, VehicleCategory } from '../types';
 
 export class FareService {
   /**
@@ -80,5 +80,34 @@ export class FareService {
       surgeMultiplier,
       total: Math.round(calculatedTotal * 100) / 100,
     };
+  }
+
+  /**
+   * Server-authoritative final fare calculation upon trip completion.
+   * Accounts for actual elapsed duration (if longer than estimated) and rider tip.
+   */
+  public static calculateFinalFare(
+    ride: Pick<IRide, 'distanceKm' | 'durationMinutes' | 'vehicleCategory' | 'estimatedFare' | 'startedAt' | 'tip'>
+  ): number {
+    let effectiveMinutes = ride.durationMinutes || 5;
+    if (ride.startedAt) {
+      const startMs = new Date(ride.startedAt).getTime();
+      if (Number.isFinite(startMs)) {
+        const elapsedMinutes = Math.max(1, Math.ceil((Date.now() - startMs) / 60000));
+        if (elapsedMinutes > effectiveMinutes) {
+          // Cap excess waiting/traffic surcharge reasonably at 2.5x estimated duration
+          effectiveMinutes = Math.min(elapsedMinutes, Math.ceil(effectiveMinutes * 2.5));
+        }
+      }
+    }
+
+    const recalculated = this.calculateFare(
+      ride.distanceKm || 1,
+      effectiveMinutes,
+      ride.vehicleCategory || 'STANDARD'
+    );
+    const baseOrRecalc = Math.max(ride.estimatedFare || 0, recalculated.total);
+    const tip = Math.max(0, ride.tip || 0);
+    return Math.round((baseOrRecalc + tip) * 100) / 100;
   }
 }

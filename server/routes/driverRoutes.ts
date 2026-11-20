@@ -1,4 +1,5 @@
 import { Router, Request, Response, NextFunction } from 'express';
+import { z } from 'zod';
 import { authenticate, requireRole } from '../middleware/auth';
 import { db } from '../db/store';
 import { AppError } from '../middleware/errorHandler';
@@ -9,6 +10,31 @@ export const driverRouter = Router();
 
 driverRouter.use(authenticate);
 driverRouter.use(requireRole('DRIVER', 'ADMIN'));
+
+const statusSchema = z.object({
+  isOnline: z.boolean(),
+});
+
+const onboardingSchema = z.object({
+  licenseNumber: z.string().trim().min(3).max(60).optional(),
+  vehicle: z
+    .object({
+      make: z.string().trim().min(1).max(60),
+      model: z.string().trim().min(1).max(60),
+      year: z.coerce.number().int().min(1995).max(new Date().getFullYear() + 1),
+      color: z.string().trim().min(1).max(40),
+      plateNumber: z.string().trim().min(2).max(30),
+      category: z.enum(['STANDARD', 'COMFORT', 'VIP', 'ECO']).optional(),
+    })
+    .optional(),
+  documents: z
+    .object({
+      licensePhoto: z.string().max(2048).optional(),
+      vehicleRegistration: z.string().max(2048).optional(),
+      idCardPhoto: z.string().max(2048).optional(),
+    })
+    .optional(),
+});
 
 // Driver Profile & Vehicle
 driverRouter.get('/me', async (req: Request, res: Response, next: NextFunction) => {
@@ -35,6 +61,11 @@ driverRouter.get('/me', async (req: Request, res: Response, next: NextFunction) 
 // Toggle Online/Offline
 driverRouter.put('/status', async (req: Request, res: Response, next: NextFunction) => {
   try {
+    const parsed = statusSchema.safeParse(req.body);
+    if (!parsed.success) {
+      throw new AppError('isOnline boolean is required', 400, 'INVALID_INPUT');
+    }
+
     const driver = await db.findDriverByUserId(req.user!.userId);
     if (!driver) throw new AppError('Driver profile not found', 404, 'NOT_FOUND');
 
@@ -42,9 +73,8 @@ driverRouter.put('/status', async (req: Request, res: Response, next: NextFuncti
       throw new AppError('Driver account must be approved before going online', 403, 'NOT_APPROVED');
     }
 
-    const { isOnline } = req.body;
+    const { isOnline } = parsed.data;
 
-    // Check outstanding commission debt threshold
     if (isOnline && (driver.outstandingDebt || 0) > 200) {
       throw new AppError(
         `Cannot go online: Outstanding platform commission debt (${driver.outstandingDebt?.toFixed(
@@ -55,7 +85,10 @@ driverRouter.put('/status', async (req: Request, res: Response, next: NextFuncti
       );
     }
 
-    const updated = await db.updateDriver(driver.id, { isOnline: Boolean(isOnline) });
+    const updated = await db.updateDriver(driver.id, {
+      isOnline,
+      ...(isOnline ? { lastSeenAt: new Date().toISOString() } : {}),
+    });
 
     res.json({ success: true, data: updated });
   } catch (err) {
@@ -131,42 +164,33 @@ driverRouter.put('/onboarding', async (req: Request, res: Response, next: NextFu
     const driver = await db.findDriverByUserId(req.user!.userId);
     if (!driver) throw new AppError('Driver not found', 404, 'NOT_FOUND');
 
-    const { vehicle, documents, licenseNumber } = req.body;
+    const parsed = onboardingSchema.safeParse(req.body);
+    if (!parsed.success) {
+      throw new AppError(parsed.error.issues[0]?.message || 'Invalid onboarding details', 400, 'INVALID_VEHICLE_DATA');
+    }
+
+    const { vehicle, documents, licenseNumber } = parsed.data;
+    let savedVehicle = await db.findVehicleByDriverId(driver.id);
 
     if (vehicle) {
-      if (
-        !vehicle.make ||
-        !vehicle.model ||
-        !vehicle.year ||
-        !vehicle.color ||
-        !vehicle.plateNumber
-      ) {
-        throw new AppError(
-          'Complete vehicle specifications (make, model, year, color, plateNumber) are required',
-          400,
-          'INVALID_VEHICLE_DATA'
-        );
-      }
-
-      const existingVehicle = await db.findVehicleByDriverId(driver.id);
-      if (existingVehicle) {
-        await db.updateVehicle(existingVehicle.id, {
-          make: vehicle.make.trim(),
-          model: vehicle.model.trim(),
-          year: Number(vehicle.year),
-          color: vehicle.color.trim(),
-          plateNumber: vehicle.plateNumber.trim(),
+      if (savedVehicle) {
+        savedVehicle = await db.updateVehicle(driver.id, {
+          make: vehicle.make,
+          model: vehicle.model,
+          year: vehicle.year,
+          color: vehicle.color,
+          plateNumber: vehicle.plateNumber,
           category: vehicle.category || 'STANDARD',
         });
       } else {
-        await db.createVehicle({
+        savedVehicle = await db.createVehicle({
           id: generateId('veh'),
           driverId: driver.id,
-          make: vehicle.make.trim(),
-          model: vehicle.model.trim(),
-          year: Number(vehicle.year),
-          color: vehicle.color.trim(),
-          plateNumber: vehicle.plateNumber.trim(),
+          make: vehicle.make,
+          model: vehicle.model,
+          year: vehicle.year,
+          color: vehicle.color,
+          plateNumber: vehicle.plateNumber,
           category: vehicle.category || 'STANDARD',
         });
       }
@@ -174,10 +198,13 @@ driverRouter.put('/onboarding', async (req: Request, res: Response, next: NextFu
 
     const updated = await db.updateDriver(driver.id, {
       ...(documents ? { documents: { ...driver.documents, ...documents } } : {}),
-      ...(licenseNumber ? { licenseNumber: licenseNumber.trim() } : {}),
+      ...(licenseNumber ? { licenseNumber } : {}),
     });
 
-    res.json({ success: true, data: updated });
+    res.json({
+      success: true,
+      data: updated ? { ...updated, vehicle: savedVehicle } : null,
+    });
   } catch (err) {
     next(err);
   }

@@ -1,95 +1,107 @@
-# CreemY — Production-Ready Smart Ride-Hailing Platform
-منصة نقل ذكية متكاملة ومستقلة (إنتاجية بالكامل)
+# Creem — Production-Ready Smart Ride-Hailing Platform
+منصة **Creem** للنقل الذكي المتكاملة (Production-Ready Ride-Hailing Platform)
 
 ---
 
-## 🌟 نظرة عامة (Overview)
+## نظرة عامة (Overview)
 
-**CreemY** هي منصة نقل ذكية كاملة (Full-Stack Ride-Hailing Platform) مبنية لتلائم متطلبات التشغيل الفعلي والإنتاجي (Production-Ready). تشتمل على واجهات ركاب، وسائقين، ولوحة إدارة متقدمة، مع دعم الخرائط التفاعلية وتتبع الرحلات اللحظي، وإدارة المحفظة والمدفوعات الإلكترونية عبر Stripe، ومحرك التوزيع الجغرافي الذكي المعتمد على أقفال التزامن لمنع سباقات الحجز (Race Conditions).
-
----
-
-## 🏗️ البنية المعمارية (Architectural Topology)
-
-1. **Frontend**: React 18+, TypeScript, Tailwind CSS, Leaflet/OSM Maps, Socket.IO Client, Lucide Icons, RTL support.
-2. **Backend**: Node.js, Express, Socket.IO Server, TypeScript (`tsx` in dev, `esbuild` for production CJS bundle).
-3. **Database Layer**: MongoDB (Mongoose ODM) مع بنية فهارس جغرافية 2dsphere وUnique Indexes.
-4. **Caching & Concurrency Layer**: Redis (ioredis) لدعم Distributed Locks (`ride_accept:${rideId}`) وحسابات التزامن وإلغاء الازدواجية.
-5. **Payment Engine**: Stripe SDK (PaymentIntents, Webhook Signature Verification, Idempotency Keys) + محفظة رقمية بنظام قيد الحركات ومحاسبة عمولة المنصة (Platform Commission).
-6. **Security & RBAC**: JWT Access Tokens (15 min) + HttpOnly Refresh Tokens (7 days) مع Token Rotation وإبطال الجلسات عند التدوير غير المشروع، وحماية ضد IDOR/BOLA على مستوى جميع المسارات وغرف السوكت.
+**Creem** هي منصة نقل ذكية متكاملة (Full-Stack Ride-Hailing Platform) تضم تطبيقات الركاب والكباتن ولوحة الإدارة، مع خرائط تفاعلية آمنة عبر Leaflet/OSM، وتتبع لحظي عبر Socket.IO + Redis Pub/Sub Adapter، ومحرك دفع متكامل عبر Stripe والمحفظة الرقمية، ودورة تسوية محاسبية مزدوجة القيد (Double-Entry Ledger) تدعم الاسترداد الكامل والجزئي المتعدد والمطابقة المالية (Reconciliation).
 
 ---
 
-## 🔒 دورة حياة الرحلة وقواعد الحالات (State Machine)
+## البنية المعمارية (Architectural Topology)
 
-تخضع كل رحلة لـ Finite State Machine صارم ومدعوم بعمليات ذرية (Atomic Transitions):
+1. **Runtime & Package Manager**: Bun (`bun.lock` صارم عبر `bun install --frozen-lockfile`).
+2. **Frontend**: React 19, TypeScript, Tailwind CSS v4, Leaflet/OSM Maps, Socket.IO Client, Lucide Icons, دعم كامل للغة العربية RTL.
+3. **Backend**: Express, Socket.IO Server (`@socket.io/redis-adapter`), TypeScript, esbuild production bundle (`dist/server.cjs`).
+4. **Database Layer**: MongoDB Replica Set (Mongoose ODM) مع فهارس `2dsphere` و`Unique Indexes` ومعاملات مالية ذرية (Multi-Document ACID Transactions).
+5. **Caching, Locks & Queues**: Redis (`ioredis`) للأقفال الموزعة (`acquireLock` / `releaseLock`) وقوائم انتظار BullMQ (`QueueManager`).
+6. **Payment Engine**: Stripe SDK (PaymentIntents، التحقق الصارم من توقيع Webhooks، مفاتيح Idempotency) + محفظة رقمية ودفتر أستاذ عام بنظام عمولة المنصة الموحدة **20%** (`PLATFORM_COMMISSION_RATE=0.2`).
+7. **Security & RBAC**:
+   - تخزين Access Token في الذاكرة فقط (JWT قصير الأمد 15 دقيقة).
+   - تدوير Refresh Tokens عبر كوكيز `HttpOnly; SameSite=Lax` مع فحص CSRF Origin، وكشف إعادة الاستخدام غير المشروع، ونافذة سماح آمنة للطلبات المتزامنة (5 ثوانٍ).
+   - فحص حالة الحساب في قاعدة البيانات، وإبطال الجلسات عند تغيير كلمة المرور أو إيقاف الحساب من الإدارة.
+
+---
+
+## دورة حياة الرحلة (Ride State Machine)
+
+تخضع كل رحلة لتحولات ذرية محمية:
 - `REQUESTED` ➔ `SEARCHING_DRIVER` ➔ `DRIVER_ASSIGNED` ➔ `DRIVER_ARRIVING` ➔ `DRIVER_ARRIVED` ➔ `RIDE_STARTED` ➔ `RIDE_COMPLETED`
-- الإلغاء مسموح من الحالات المؤهلة (`REQUESTED`, `SEARCHING_DRIVER`, `DRIVER_ASSIGNED`, `DRIVER_ARRIVING`) مع تسجيل سبب الإلغاء والطرف الملغي.
-- لا يمكن قبول الرحلة إلا لسائق واحد فقط بواسطة قفل موزع (`atomicAcceptRide` + Redis Lock).
+- الإلغاء مسموح قبل بدء الرحلة مع توثيق الطرف الملغي (`RIDER`, `DRIVER`, `ADMIN`, `SYSTEM`)، ورفض العروض عبر `POST /api/v1/rides/:id/decline`.
 
 ---
 
-## 💳 النظام المالي والمحفظة (Wallet & Payments)
+## النظام المالي والمحفظة والاستردادات (Payments, Ledger & Refunds)
 
-- **الدفع بالمحفظة (Wallet)**: خصم ذري مع التحقق الصارم من الرصيد الكافي، وإضافة الأرباح للسائق بعد اقتطاع نسبة عمولة المنصة (15%).
-- **الدفع بالبطاقة عبر Stripe**: إنشاء `PaymentIntent` مع دعم تأكيد الدفع ومعالجة الـ Webhooks مع التحقق من التوقيع الرقمي (`stripe-signature`).
-- **الدفع النقدي (Cash)**: توثيق عمولة المنصة في ذمة السائق وموازنة الحسابات بعد اكتمال الرحلة.
-- **مقاومة التكرار (Idempotency)**: منع عمليات الخصم أو الشحن المكررة باستخدام `idempotencyKey` ومؤشرات الفهرسة الفريدة.
+- **المحفظة (Wallet)**: خصم ذري من الراكب وإضافة صافي **80%** للسائق مع قيد عمولة المنصة **20%** في دفتر الأستاذ.
+- **البطاقات عبر Stripe**: معالجة `payment_intent.succeeded`، `payment_intent.payment_failed`، `payment_intent.canceled`، و`charge.refunded` / `refund.updated` / `refund.failed`.
+- **ضوابط الاسترداد (Refund Safety)**:
+  - عدم تسوية أي استرداد مالياً قبل تأكيد Stripe لحالة `succeeded`.
+  - التحقق الصارم من الدقة العشرية (خانتان عشريتان كحد أقصى) ومنع الخلط بين `re_*` و`pi_*`.
+  - دعم الاستردادات الجزئية المتعددة (Multi-item `refunds.data`)، وعكس الأرباح والعمولات وفق القيم الفعلية للمعاملة الأصلية.
+  - مطابقة مالية شاملة عبر `/api/v1/admin/reconciliation`.
 
 ---
 
-## ⚙️ متغيرات البيئة (Environment Variables)
+## متغيرات البيئة (Environment Variables)
 
-راجع ملف `.env.example` لضبط المتغيرات المطلوبة:
+راجع `.env.example`:
 
 ```env
-# بيئة التشغيل
 APP_ENV=production
 APP_MODE=production
 NODE_ENV=production
 
-# خادم المنصة
 PORT=3000
-APP_URL=http://localhost:3000
+APP_URL=https://creem.app
 
-# قواعد البيانات والتخزين المؤقت
-MONGODB_URI=mongodb+srv://<user>:<password>@cluster0.mongodb.net/creemy?retryWrites=true&w=majority
+MONGODB_URI=mongodb+srv://<user>:<password>@cluster0.mongodb.net/creem?retryWrites=true&w=majority
 REDIS_URL=redis://localhost:6379
 
-# مفاتيح التشفير والأمان (32 خانة على الأقل في الإنتاج)
+PLATFORM_COMMISSION_RATE=0.2
+
 JWT_SECRET=your-32-character-ultra-secure-jwt-secret-key
 JWT_REFRESH_SECRET=your-32-character-ultra-secure-refresh-key
 COOKIE_SECRET=your-32-character-cookie-secret-key
 
-# بوابات الدفع (Stripe)
-STRIPE_SECRET_KEY=sk_test_...
-STRIPE_PUBLISHABLE_KEY=pk_test_...
+STRIPE_SECRET_KEY=sk_live_...
+STRIPE_PUBLISHABLE_KEY=pk_live_...
 STRIPE_WEBHOOK_SECRET=whsec_...
 
-# الأصول المسموحة في CORS
-CORS_ALLOWED_ORIGINS=https://creemy.app,https://admin.creemy.app
+CORS_ALLOWED_ORIGINS=https://creem.app,https://admin.creem.app
 ```
 
 ---
 
-## 🧪 تشغيل الاختبارات والتحقق (Tests & Quality Checks)
+## التثبيت والاختبارات والبناء (Bun Workflow)
 
 ```bash
-# تشغيل فحص الأنماط والأنواع (Linting & Type Safety)
-npm run lint
+# تثبيت الاعتماديات بشكل صارم وفق bun.lock
+bun install --frozen-lockfile
 
-# تشغيل حزمة الاختبارات الشاملة (Vitest)
-npx vitest run
+# فحص الثغرات الأمنية
+bun audit
 
-# بناء المشروع الإنتاجي (Production Build)
-npm run build
+# فحص TypeScript
+bun run lint
+
+# تشغيل جميع الاختبارات (Vitest)
+bun run test
+
+# تشغيل الاختبارات على مشغل Bun
+bun test
+
+# بناء نسخة الإنتاج وتشغيلها
+bun run build
+bun run start
 ```
 
 ---
 
-## 🚀 تسجيل الحسابات والتشغيل الإنتاجي (Production Account Provisioning)
+## التشغيل عبر Docker
 
-في بيئة الإنتاج الصارمة (Production-Only):
-- يتم إنشاء حسابات الركاب والكباتن عبر واجهة التسجيل المباشرة (`POST /api/v1/auth/register`) أو نافذة إنشاء الحساب في التطبيق.
-- يتم اعتماد الكباتن وفحص وثائقهم بواسطة المشرفين المعتمدين.
-- لا توجد حسابات تجريبية أو بيانات أولية افتراضية في قاعدة البيانات؛ كل حساب يتم إنشاؤه مشفر بـ Argon2/Bcrypt مع إنشاء محفظة رقمية مستقلة فورية.
+```bash
+docker build -t creem-platform .
+docker run -p 3000:3000 --env-file .env creem-platform
+```

@@ -367,13 +367,22 @@ export interface IPaymentDocument extends Document {
   stripeChargeId?: string;
   stripeClientSecret?: string;
   idempotencyKey?: string;
-  refundAmount?: number;
+    refundAmount?: number;
   refunds?: Array<{
     stripeRefundId: string;
     amount: number;
     status: string;
     eventId?: string;
     reason?: string;
+    createdAt: Date;
+    updatedAt?: Date;
+  }>;
+  refundRequests?: Array<{
+    requestKey: string;
+    idempotencyKey: string;
+    amount: number;
+    status: string;
+    stripeRefundId?: string;
     createdAt: Date;
     updatedAt?: Date;
   }>;
@@ -412,13 +421,24 @@ export const PaymentSchema = new Schema<IPaymentDocument>(
     stripeClientSecret: String,
     idempotencyKey: { type: String, sparse: true, unique: true },
     refundAmount: { type: Number, default: 0 },
-    refunds: [
+      refunds: [
       {
         stripeRefundId: { type: String, required: true },
         amount: { type: Number, required: true },
         status: { type: String, default: 'succeeded' },
         eventId: String,
         reason: String,
+        createdAt: { type: Date, default: Date.now },
+        updatedAt: { type: Date, default: Date.now },
+      },
+    ],
+    refundRequests: [
+      {
+        requestKey: { type: String, required: true },
+        idempotencyKey: { type: String, required: true },
+        amount: { type: Number, required: true },
+        status: { type: String, default: 'requested' },
+        stripeRefundId: String,
         createdAt: { type: Date, default: Date.now },
         updatedAt: { type: Date, default: Date.now },
       },
@@ -539,6 +559,8 @@ export interface IRefreshSessionDocument extends Document {
   tokenHash: string;
   revoked: boolean;
   revokedReason?: string;
+  rotatedAt?: Date;
+  replacedByJti?: string;
   expiresAt: Date;
   ip?: string;
   userAgent?: string;
@@ -553,6 +575,8 @@ export const RefreshSessionSchema = new Schema<IRefreshSessionDocument>(
     tokenHash: { type: String, required: true },
     revoked: { type: Boolean, default: false, index: true },
     revokedReason: String,
+    rotatedAt: Date,
+    replacedByJti: String,
     expiresAt: { type: Date, required: true, index: true },
     ip: String,
     userAgent: String,

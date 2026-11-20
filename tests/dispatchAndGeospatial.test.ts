@@ -47,7 +47,7 @@ describe('Production Hardening: Dispatch, Routing & Geospatial Systems', () => {
     });
 
     it('gracefully handles shutdown of queue system', async () => {
-      await expect(QueueManager.close()).resolves.not.toThrow();
+      await expect(QueueManager.close()).resolves.toBeUndefined();
     });
   });
 
